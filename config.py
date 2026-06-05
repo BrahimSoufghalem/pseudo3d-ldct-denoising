@@ -20,7 +20,7 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 # ═══════════════════════════════════════════
 # TRAINING HYPERPARAMETERS
 # ═══════════════════════════════════════════
-TOTAL_EPOCHS = 200
+TOTAL_EPOCHS = 50
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 TRAIN_BATCH_SIZE = 32
