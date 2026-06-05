@@ -8,7 +8,7 @@ import torch
 from torchmetrics.image import VisualInformationFidelity
 
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════ 
 # PSNR
 # ═══════════════════════════════════════════
 def psnr(pred, target, max_val=1.0):
