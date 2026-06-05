@@ -4,7 +4,7 @@ A clean, modular PyTorch pipeline for **Low-Dose CT (LDCT) denoising** using a p
 
 ## Project Structure
 
-```
+``` 
 LDCT/
 ├── config.py          # All hyperparameters, paths, and constants
 ├── download.py        # Parallel NBIA dataset downloader with resume support
