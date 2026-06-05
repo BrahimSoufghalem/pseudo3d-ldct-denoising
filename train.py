@@ -9,7 +9,7 @@ import time
  
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler 
 from torch.utils.tensorboard import SummaryWriter
 from monai.metrics import SSIMMetric
 from tqdm import tqdm
