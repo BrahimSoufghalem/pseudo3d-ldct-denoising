@@ -3,7 +3,7 @@ LDCT Project — Dataset & Data Pipeline
 =========================================
 Pseudo-3D (2.5D) data preparation with MONAI transforms and DataLoaders.
 """
- 
+  
 import os
 import random
 
