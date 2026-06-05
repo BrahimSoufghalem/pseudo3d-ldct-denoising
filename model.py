@@ -27,7 +27,7 @@ def build_model(device):
     """
     model = UNet(
         spatial_dims=2,
-        in_channels=IN_CHANNELS,      # 🔥 pseudo-3D: prev + curr + next
+        in_channels=IN_CHANNELS,     
         out_channels=OUT_CHANNELS,
         channels=CHANNELS,
         strides=STRIDES,
