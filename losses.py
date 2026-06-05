@@ -3,7 +3,7 @@ LDCT Project — Loss Functions
 ================================
 VGG Perceptual Loss, Sobel Edge Loss, and the combined Hybrid Loss.
 """
-
+ 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
