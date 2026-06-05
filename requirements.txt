@@ -1,0 +1,14 @@
+# LDCT Denoising Project — Dependencies
+
+torch>=2.0.0
+torchvision>=0.15.0
+torchmetrics>=1.0.0
+monai>=1.3.0
+pydicom>=2.4.0
+scikit-learn>=1.3.0
+tqdm>=4.65.0
+tensorboard>=2.14.0
+pandas>=2.0.0
+requests>=2.31.0
+urllib3>=2.0.0
+nbiatoolkit>=1.0.0
