@@ -7,7 +7,7 @@ Reproducibility setup and DICOM sorting helpers.
 import os
 import re
 
-import torch
+import torch 
 import pydicom
 from monai.utils import set_determinism
 
