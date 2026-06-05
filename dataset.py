@@ -88,7 +88,7 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
         LoadImaged(
             keys=["image_prev", "image", "image_next", "label"],
             reader="PydicomReader",
-        ),
+        ), 
         EnsureChannelFirstd(
             keys=["image_prev", "image", "image_next", "label"],
         ),
@@ -102,7 +102,7 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
         RandSpatialCropSamplesd(
             keys=["image", "label"],
             roi_size=spatial_size,
-            num_samples=1,
+            num_samples=4,
         ),
         ToTensord(keys=["image", "label"]),
     ])
