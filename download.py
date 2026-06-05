@@ -5,7 +5,7 @@ Downloads DICOM data from NBIA with:
   - 30 patients → dataset/ (15 Chest + 15 Abdomen)
   -  6 patients → test/    (3 Chest  + 3 Abdomen)
   - Sorted smallest → largest by total Full+Low size
-  - Parallel fast downloads with resume support
+  - Parallel fast downloads with resume support 
   - tqdm progress bars and CSV report
 """
 
