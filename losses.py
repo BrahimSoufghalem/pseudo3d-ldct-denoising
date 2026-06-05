@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 from monai.losses import SSIMLoss
 
-from config import LAMBDA_L1, LAMBDA_SSIM, LAMBDA_PERC, LAMBDA_EDGE
+from config import LAMBDA_L1, LAMBDA_SSIM, LAMBDA_PERC, LAMBDA_EDGE 
 
 
 # ═══════════════════════════════════════════
