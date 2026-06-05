@@ -80,7 +80,7 @@ All settings are centralized in [`config.py`](config.py). Key parameters:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `TOTAL_EPOCHS` | 200 | Training epochs |
+| `TOTAL_EPOCHS` | 50 | Training epochs |
 | `LEARNING_RATE` | 1e-4 | AdamW learning rate |
 | `TRAIN_BATCH_SIZE` | 32 | Training batch size |
 | `SPATIAL_SIZE` | (256, 256) | Input patch size |
