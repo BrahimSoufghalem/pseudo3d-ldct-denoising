@@ -90,7 +90,6 @@ All settings are centralized in [`config.py`](config.py). Key parameters:
 
 Uses the **LDCT-and-projection-data** collection from The Cancer Imaging Archive (TCIA). Patients are split stratified by body type (Chest / Abdomen) and selected by smallest file size first.
 
-> **Note**: You need a valid NBIA account or anonymous access may be available depending on the collection.
 
 ## Requirements
 
