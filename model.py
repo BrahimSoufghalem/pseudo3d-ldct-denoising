@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from monai.networks.nets import UNet
 
-from config import (
+from config import ( 
     IN_CHANNELS, OUT_CHANNELS, CHANNELS, STRIDES,
     NUM_RES_UNITS, DROPOUT,
 )
