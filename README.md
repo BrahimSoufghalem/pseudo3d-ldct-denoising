@@ -146,8 +146,8 @@ The model demonstrates stable convergence and significant improvements in image 
 ### Overall Metrics
 Here is the convergence of the training/validation loss alongside the primary evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
 
-<p align="center">
-  <img src="images/overall_metrics.png" width="80%" alt="Overall Evaluation Metrics">
+<p align="left">
+  <img src="images/overall_metrics.png" width="110%" alt="Overall Evaluation Metrics">
 </p>
 
 ### Loss
@@ -159,11 +159,11 @@ Here is the convergence of the training/validation loss alongside the primary ev
 The model was evaluated separately on Chest and Abdomen slices to ensure robust feature extraction across different anatomical structures and noise profiles.
 
 **Chest Metrics:**
-<p align="center">
+<p align="left">
   <img src="images/chest_metrics.png" width="80%" alt="Chest Metrics">
 </p>
 
 **Abdomen Metrics:**
-<p align="center">
+<p align="left">
   <img src="images/abdomen_metrics.png" width="80%" alt="Abdomen Metrics">
 </p>
