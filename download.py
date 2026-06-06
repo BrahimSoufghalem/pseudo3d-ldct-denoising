@@ -1,10 +1,8 @@
 """
-LDCT-and-projection-data Downloader
-======================================
-Downloads DICOM data from NBIA with:
-  - 30 patients → dataset/ (15 Chest + 15 Abdomen)
-  -  6 patients → test/    (3 Chest  + 3 Abdomen) 
-  - Sorted smallest → largest by total Full+Low size
+LDCT-and-projection-data Downloader (Specific Patients Edition)
+================================================================
+Downloads DICOM data from NBIA for specific hardcoded patients:
+  - Validates Full+Low dose availability
   - Parallel fast downloads with resume support 
   - tqdm progress bars and CSV report
 """
@@ -24,12 +22,22 @@ from nbiatoolkit import NBIAClient
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR, TEST_DIR,
-    DATASET_CHEST_LIMIT, DATASET_ABDO_LIMIT,
-    TEST_CHEST_LIMIT, TEST_ABDO_LIMIT,
+    DATA_DIR,
     DOWNLOAD_WORKERS, COLLECTION, DOWNLOAD_TIMEOUT,
     CHUNK_SIZE, NBIA_API_URL,
 )
+
+# ═══════════════════════════════════════════
+# TARGET PATIENTS (Extracted from the image)
+# ═══════════════════════════════════════════
+TARGET_PATIENTS = [
+    # Chest Patients
+    "C002", "C004", "C012", "C016", "C021", "C027", "C030", "C050",
+    "C052", "C067", "C081", "C095", "C099", "C107", "C111",
+    # Abdomen Patients
+    "L004", "L006", "L014", "L019", "L033", "L049", "L056", "L057",
+    "L058", "L064", "L071", "L072", "L075", "L077", "L081"
+]
 
 
 # ═══════════════════════════════════════════
@@ -78,7 +86,9 @@ def fetch_series_info():
     for s in all_series:
         desc = (s.get("SeriesDescription") or "").lower()
         pid = (s.get("PatientID") or "").strip()
-        if not pid:
+        
+        # Only process patients in our target list to save processing time
+        if pid not in TARGET_PATIENTS:
             continue
 
         if "full dose images" in desc:
@@ -102,47 +112,35 @@ def fetch_series_info():
 
 
 # ═══════════════════════════════════════════
-# STEP 2 — FILTER, SORT & DISTRIBUTE
+# STEP 2 — FILTER & DISTRIBUTE
 # ═══════════════════════════════════════════
 def select_patients(patient_map):
     """
-    Filter patients that have both Full+Low dose, sort by size,
-    and split into dataset / test groups.
-
-    Returns:
-        (complete, selected_pids, pid_to_dest_folder)
+    Filter selected patients ensuring they have both Full+Low dose.
     """
     complete = {
         pid: data for pid, data in patient_map.items()
         if "Full" in data and "Low" in data
     }
-    print(f"✅  Patients with Full+Low: {len(complete)}", flush=True)
+    
+    selected_pids = [pid for pid in TARGET_PATIENTS if pid in complete]
+    missing_pids = [pid for pid in TARGET_PATIENTS if pid not in complete]
+
+    if missing_pids:
+        print(f"⚠️  Warning: {len(missing_pids)} target patients are missing from NBIA or lack Full+Low dose:")
+        print(f"    {', '.join(missing_pids)}")
+
+    print(f"✅  Ready to process: {len(selected_pids)} patients", flush=True)
 
     def total_size(pid):
         d = complete[pid]
         return d["Full"]["size_mb"] + d["Low"]["size_mb"]
 
-    sorted_chest = sorted([p for p in complete if p[0].upper() == "C"], key=total_size)
-    sorted_abdomen = sorted([p for p in complete if p[0].upper() == "L"], key=total_size)
-
-    dataset_pids = sorted_chest[:DATASET_CHEST_LIMIT] + sorted_abdomen[:DATASET_ABDO_LIMIT]
-    test_pids = (
-        sorted_chest[DATASET_CHEST_LIMIT: DATASET_CHEST_LIMIT + TEST_CHEST_LIMIT]
-        + sorted_abdomen[DATASET_ABDO_LIMIT: DATASET_ABDO_LIMIT + TEST_ABDO_LIMIT]
-    )
-
-    pid_to_dest_folder = {}
-    for p in dataset_pids:
-        pid_to_dest_folder[p] = Path(DATA_DIR)
-    for p in test_pids:
-        pid_to_dest_folder[p] = Path(TEST_DIR)
-
-    selected_pids = dataset_pids + test_pids
+    # Assign all targeted patients to the main DATA_DIR
+    pid_to_dest_folder = {p: Path(DATA_DIR) for p in selected_pids}
     total_est_mb = sum(total_size(p) for p in selected_pids)
 
-    print(f"\n📊 Total Target: {len(selected_pids)} patients (~{total_est_mb:.0f} MB estimated)")
-    print(f"   📂 'dataset' folder -> {len(dataset_pids)} patients (15 Chest, 15 Abdomen)")
-    print(f"   📂 'test'    folder -> {len(test_pids)} patients (3 Chest, 3 Abdomen)\n", flush=True)
+    print(f"\n📊 Total Target: {len(selected_pids)} patients (~{total_est_mb:.0f} MB estimated)\n", flush=True)
 
     return complete, selected_pids, pid_to_dest_folder
 
@@ -161,9 +159,6 @@ def is_series_complete(folder: Path) -> bool:
 def check_resume(selected_pids, pid_to_dest_folder):
     """
     Check disk for already-downloaded patients.
-
-    Returns:
-        (already_done, to_download, prev_results)
     """
     def patient_disk_status(pid):
         target_dir = pid_to_dest_folder[pid]
@@ -265,7 +260,7 @@ def download_patient(pid, complete, pid_to_dest_folder, global_bar):
 
     if full_already and low_already:
         actual_mb = sum(f.stat().st_size for f in p_dir.rglob("*.dcm")) / (1024 * 1024)
-        log(f"⏭  [{pid}]  skipped (Folder: {target_dir.name})")
+        log(f"⏭  [{pid}]  skipped")
         return {
             "PatientID": pid, "Type": ptype, "Destination": target_dir.name,
             "Estimated_MB": round(est_mb, 2), "Downloaded_MB": round(actual_mb, 2),
@@ -274,7 +269,7 @@ def download_patient(pid, complete, pid_to_dest_folder, global_bar):
             "full_ok": True, "low_ok": True,
         }
 
-    log(f"⬇  [{pid}]  (~{est_mb:.0f} MB) [{ptype}] -> Saving to: {target_dir.name}")
+    log(f"⬇  [{pid}]  (~{est_mb:.0f} MB) [{ptype}]")
     t0 = time.time()
 
     if full_already:
@@ -295,7 +290,7 @@ def download_patient(pid, complete, pid_to_dest_folder, global_bar):
 
     status = "success" if (ok_full and ok_low) else ("partial" if (ok_full or ok_low) else "failed")
     icon = {"success": "✅", "partial": "🔄", "failed": "❌"}[status]
-    log(f"{icon}  [{pid}]  {status}  {total_dl:.1f} MB  @ {speed:.2f} MB/s ({target_dir.name})")
+    log(f"{icon}  [{pid}]  {status}  {total_dl:.1f} MB  @ {speed:.2f} MB/s")
 
     return {
         "PatientID": pid, "Type": ptype, "Destination": target_dir.name,
@@ -321,7 +316,7 @@ def run_downloads(to_download, complete, pid_to_dest_folder, prev_results):
     global_bar = tqdm(
         total=int(remaining_mb * 1024 * 1024),
         unit="B", unit_scale=True, unit_divisor=1024,
-        desc="📥 Dataset", colour="cyan", leave=True, dynamic_ncols=True,
+        desc="📥 Downloading Specific Patients", colour="cyan", leave=True, dynamic_ncols=True,
     )
 
     results = list(prev_results)
@@ -361,33 +356,28 @@ def run_downloads(to_download, complete, pid_to_dest_folder, prev_results):
     print(f"📦  Total downloaded : {overall_mb:.0f} MB")
     print(f"📊  Report  : download_report.csv\n")
 
-    print("📁 Summary by Destination Folder:")
-    for folder in ["dataset", "test"]:
-        sub_df = df[df["Destination"] == folder]
-        print(f"  📂  Folder '{folder}': {len(sub_df)} patients downloaded successfully.")
-
 
 # ═══════════════════════════════════════════
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════
 def main():
-    Path(DATA_DIR).mkdir(exist_ok=True)
-    Path(TEST_DIR).mkdir(exist_ok=True)
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     patient_map = fetch_series_info()
     complete, selected_pids, pid_to_dest_folder = select_patients(patient_map)
 
     if not selected_pids:
-        print("❌  No patients found matching criteria. Exiting.")
+        print("❌  No target patients found on NBIA or lacking criteria. Exiting.")
         return
 
     already_done, to_download, prev_results = check_resume(selected_pids, pid_to_dest_folder)
 
     if not to_download:
-        print("🎉  All patients already downloaded!")
+        print("🎉  All target patients from the image are already downloaded!")
         return
 
     run_downloads(to_download, complete, pid_to_dest_folder, prev_results)
+
 
 
 if __name__ == "__main__":
