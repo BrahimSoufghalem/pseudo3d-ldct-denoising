@@ -185,5 +185,5 @@ The following side-by-side comparisons demonstrate the model's ability to effect
   <img src="images/abdomen_comparison_10%dose.png" width="100%" alt="Abdomen CT Denoising Comparison  (10% dose)">
 </p>
 <p align="left">
-  <img src="images/abdomen_comparison_25%dose.png" width="100%" alt="Abdomen CT Denoising Comparison  (25% dose)">
+  <img src="images/abdomen_comparison_10%dose.png" width="100%" alt="Abdomen CT Denoising Comparison  (25% dose)">
 </p>
