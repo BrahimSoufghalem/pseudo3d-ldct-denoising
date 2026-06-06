@@ -102,7 +102,7 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
         RandSpatialCropSamplesd(
             keys=["image", "label"],
             roi_size=spatial_size,
-            num_samples=4,
+            num_samples=1,
         ),
         ToTensord(keys=["image", "label"]),
     ])
