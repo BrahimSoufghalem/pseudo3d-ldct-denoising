@@ -22,7 +22,7 @@ from nbiatoolkit import NBIAClient
 from tqdm import tqdm
 
 from config import (
-    DATA_DIR,
+    DATA_DIR, TEST_DIR,
     DOWNLOAD_WORKERS, COLLECTION, DOWNLOAD_TIMEOUT,
     CHUNK_SIZE, NBIA_API_URL,
 )
@@ -72,9 +72,6 @@ def log(msg):
 # STEP 1 — LOAD SERIES + SIZE INFO
 # ═══════════════════════════════════════════
 def fetch_series_info():
-    """
-    Query the NBIA API and return a dict mapping PatientID → {Full/Low dose info}.
-    """
     print("🔍  Fetching series list from NBIA …", flush=True)
 
     with NBIAClient() as client:
@@ -86,10 +83,6 @@ def fetch_series_info():
     for s in all_series:
         desc = (s.get("SeriesDescription") or "").lower()
         pid = (s.get("PatientID") or "").strip()
-        
-        # Only process patients in our target list to save processing time
-        if pid not in TARGET_PATIENTS:
-            continue
 
         if "full dose images" in desc:
             dose = "Full"
@@ -110,41 +103,62 @@ def fetch_series_info():
 
     return patient_map
 
-
 # ═══════════════════════════════════════════
 # STEP 2 — FILTER & DISTRIBUTE
 # ═══════════════════════════════════════════
 def select_patients(patient_map):
     """
-    Filter selected patients ensuring they have both Full+Low dose.
+    Filter patients with both doses available, sort them by file size in ascending order,
+    and distribute 100 patients (84 for training, 16 for testing) evenly between Chest and Abdomen.
     """
+    # Filter patients who have both Full and Low dose images available
     complete = {
         pid: data for pid, data in patient_map.items()
         if "Full" in data and "Low" in data
     }
     
-    selected_pids = [pid for pid in TARGET_PATIENTS if pid in complete]
-    missing_pids = [pid for pid in TARGET_PATIENTS if pid not in complete]
+    # Helper function to calculate the total size of a patient's data
+    def get_total_size(pid):
+        return complete[pid]["Full"]["size_mb"] + complete[pid]["Low"]["size_mb"]
 
-    if missing_pids:
-        print(f"⚠️  Warning: {len(missing_pids)} target patients are missing from NBIA or lack Full+Low dose:")
-        print(f"    {', '.join(missing_pids)}")
+    # Separate patients into Chest (starts with C) and Abdomen (starts with L)
+    all_chest = [pid for pid in complete.keys() if pid.upper().startswith('C')]
+    all_abdo = [pid for pid in complete.keys() if pid.upper().startswith('L')]
 
-    print(f"✅  Ready to process: {len(selected_pids)} patients", flush=True)
+    # Sort both groups in ascending order by size (smallest first)
+    all_chest_sorted = sorted(all_chest, key=get_total_size)
+    all_abdo_sorted = sorted(all_abdo, key=get_total_size)
 
-    def total_size(pid):
-        d = complete[pid]
-        return d["Full"]["size_mb"] + d["Low"]["size_mb"]
+    # Slice the top 50 patients from each type (Total of 100)
+    selected_chest = all_chest_sorted[:50]
+    selected_abdo = all_abdo_sorted[:50]
 
-    # Assign all targeted patients to the main DATA_DIR
-    pid_to_dest_folder = {p: Path(DATA_DIR) for p in selected_pids}
-    total_est_mb = sum(total_size(p) for p in selected_pids)
+    # Split the 50 Chest patients: 42 for training and 8 for testing
+    train_chest = selected_chest[:42]
+    test_chest = selected_chest[42:50]
 
+    # Split the 50 Abdomen patients: 42 for training and 8 for testing
+    train_abdo = selected_abdo[:42]
+    test_abdo = selected_abdo[42:50]
+
+    # Merge into the final combined lists
+    selected_pids = train_chest + test_chest + train_abdo + test_abdo
+
+    # Map each PatientID to its target destination folder
+    pid_to_dest_folder = {}
+    for pid in train_chest + train_abdo:
+        pid_to_dest_folder[pid] = Path(DATA_DIR)  # dataset
+    for pid in test_chest + test_abdo:
+        pid_to_dest_folder[pid] = Path(TEST_DIR)  # test
+
+    print(f"✅  Distribution Strategy Status:")
+    print(f"    - Training (dataset): {len(train_chest)} Chest + {len(train_abdo)} Abdomen = {len(train_chest)+len(train_abdo)} Patients.")
+    print(f"    - Testing (test)    : {len(test_chest)} Chest + {len(test_abdo)} Abdomen = {len(test_chest)+len(test_abdo)} Patients.")
+
+    total_est_mb = sum(get_total_size(p) for p in selected_pids)
     print(f"\n📊 Total Target: {len(selected_pids)} patients (~{total_est_mb:.0f} MB estimated)\n", flush=True)
 
     return complete, selected_pids, pid_to_dest_folder
-
-
 # ═══════════════════════════════════════════
 # STEP 3 — RESUME DETECTION
 # ═══════════════════════════════════════════
@@ -362,7 +376,7 @@ def run_downloads(to_download, complete, pid_to_dest_folder, prev_results):
 # ═══════════════════════════════════════════
 def main():
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-
+    Path(TEST_DIR).mkdir(parents=True, exist_ok=True) 
     patient_map = fetch_series_info()
     complete, selected_pids, pid_to_dest_folder = select_patients(patient_map)
 
@@ -373,12 +387,10 @@ def main():
     already_done, to_download, prev_results = check_resume(selected_pids, pid_to_dest_folder)
 
     if not to_download:
-        print("🎉  All target patients from the image are already downloaded!")
+        print("🎉  All target patients are already downloaded!")
         return
 
     run_downloads(to_download, complete, pid_to_dest_folder, prev_results)
-
-
 
 if __name__ == "__main__":
     main()
