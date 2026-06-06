@@ -1,98 +1,141 @@
-# LDCT Denoising — 2.5D U-Net
+# LDCT Denoising — 2.5D Pseudo-3D U-Net Pipeline
 
-A clean, modular PyTorch pipeline for **Low-Dose CT (LDCT) denoising** using a pseudo-3D (2.5D) MONAI U-Net.
+A comprehensive, modular deep learning pipeline built with **PyTorch** and **MONAI** for **Low-Dose CT (LDCT) denoising**. This project aims to enhance the quality of LDCT images to match Normal-Dose CT (NDCT) scans by utilizing a pseudo-3D (2.5D) context, capturing spatial relationships across adjacent anatomical slices.
 
-## Project Structure
+## ✨ Key Features
 
-``` 
-LDCT/
-├── config.py          # All hyperparameters, paths, and constants
-├── download.py        # Parallel NBIA dataset downloader with resume support
-├── dataset.py         # Pseudo-3D data pipeline (MONAI transforms + DataLoaders)
-├── model.py           # MONAI U-Net builder
-├── losses.py          # Hybrid loss (L1 + SSIM + Perceptual + Edge)
-├── metrics.py         # PSNR, RMSE, VIF evaluation metrics
-├── utils.py           # Reproducibility and DICOM sorting helpers
-├── train.py           # Main training script
-└── requirements.txt   # Dependencies
+* **Pseudo-3D (2.5D) Architecture**: Instead of processing independent 2D slices, the pipeline stacks three consecutive slices (`prev`, `curr`, `next`) into a single 3-channel input. The model predicts the noise residual for the central slice, preserving crucial 3D anatomical context.
+* **Custom NBIA Downloader**: An automated, multi-threaded dataset downloader fetching data directly from The Cancer Imaging Archive (TCIA). It features resume-support, progress tracking, and carefully selects exactly 100 hardcoded patients (stratified into Chest and Abdomen).
+* **Advanced Hybrid Loss Function**: A meticulously tuned combination of **L1 Loss** (pixel accuracy), **SSIM Loss** (structural similarity), **VGG Perceptual Loss** (high-level feature preservation), and **Sobel Edge Loss** (boundary sharpness).
+* **Full-Resolution Evaluation**: The evaluation script tests the model on the *full original DICOM resolution* without cropping or padding, outputting visual fidelity metrics like **VIF (Visual Information Fidelity)** alongside PSNR, SSIM, and RMSE.
+* **Automatic Mixed Precision (AMP)**: Optimized training loop using PyTorch's `autocast` and `GradScaler` for faster compute and reduced memory footprint.
+
+---
+
+## 🗂️ Project Structure
+
+```text
+LDCT-Project/
+├── config.py          # Centralized hyperparameter, paths, and constants registry
+├── dataset.py         # Pseudo-3D data pipeline (MONAI transforms, dataloaders)
+├── download.py        # Parallel NBIA dataset downloader with size estimation & resume
+├── evaluate.py        # Full-resolution testing, metric calculation (VIF, RMSE), and visualizations
+├── losses.py          # MONAI Hybrid Loss (L1 + SSIM + VGG19 Perceptual + Sobel Edge)
+├── metrics.py         # Evaluation metrics including TorchMetrics VisualInformationFidelity
+├── model.py           # MONAI U-Net builder with automatic DataParallel support
+├── train.py           # Main training loop with Checkpointing, Early Stopping, and TensorBoard
+├── utils.py           # Reproducibility constraints and DICOM metadata sorting
+└── requirements.txt   # Python dependencies
+
 ```
 
-## Method
+---
 
-The model uses **residual learning** on pseudo-3D input:
-- **Input**: 3 adjacent DICOM slices stacked as a 3-channel image `[prev, curr, next]`
-- **Target**: The residual (noise) between LDCT input and NDCT (full-dose) ground truth
-- **Output**: Denoised slice = input + predicted residual
+## 🔬 Methodology & Pipeline
 
-### Loss Function
+### 1. Data Processing
 
-| Component | Weight | Purpose |
-|---|---|---|
-| L1 Loss | 1.0 | Pixel-wise accuracy |
-| SSIM Loss | 0.5 | Structural similarity |
-| VGG Perceptual Loss | 0.1 | High-level feature preservation |
-| Sobel Edge Loss | 0.05 | Sharp edge recovery |
+* **Hounsfield Unit (HU) Windowing**: DICOM pixel arrays are clipped to a specific clinical window (`-1024` to `1600`) and normalized to `[0, 1]`.
+* **Augmentation**: During training, data undergoes `RandSpatialCropSamplesd` (256x256). Validation applies deterministic `ResizeWithPadOrCropd`.
 
-### Evaluation Metrics
+### 2. Network Architecture
 
-- **PSNR** (↑) — Peak Signal-to-Noise Ratio
-- **SSIM** (↑) — Structural Similarity Index
-- **RMSE** (↓) — Root Mean Squared Error
-- **VIF** (↑) — Visual Information Fidelity
+A MONAI `UNet` initialized with:
 
-## Setup
+* **Input**: 3 channels (Pseudo-3D).
+* **Output**: 1 channel (Predicted noise residual).
+* **Layers**: Configured with feature channels `(32, 64, 128, 256)`, strides `(2, 2, 2)`, and 2 residual units per layer.
+
+### 3. Loss Weights
+
+| Component | Weight (`λ`) | Objective |
+| --- | --- | --- |
+| **L1 Loss** | `1.0` | Exact pixel-wise reconstruction. |
+| **SSIM Loss** | `0.5` | Structural integrity and luminance preservation. |
+| **VGG Perceptual** | `0.1` | High-level texture similarity using frozen VGG-19 features. |
+| **Sobel Edge** | `0.05` | Penalization for blurred anatomical boundaries. |
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+Ensure you have Python ≥ 3.9 installed. For optimal performance, a CUDA-enabled GPU is highly recommended. *(Note for Fedora/Linux users: ensure your NVIDIA drivers and CUDA toolkit match your PyTorch wheel).*
 
 ```bash
+# Clone the repository and install dependencies
+git clone <your-repo-url>
+cd LDCT-Project
 pip install -r requirements.txt
+
 ```
 
-## Usage
+### 1. Download & Prepare the Dataset
 
-### 1. Download Data
+The custom downloader fetches exactly 100 specific patients from the [LDCT-and-projection-data](https://www.cancerimagingarchive.net/collection/ldct-and-projection-data/) collection, sorted by dataset size and stratified by anatomy:
 
-Downloads 36 patients from the [LDCT-and-projection-data](https://www.cancerimagingarchive.net/collection/ldct-and-projection-data/) collection on TCIA:
+* **Training Set**: 84 patients (42 Chest, 42 Abdomen).
+* **Testing Set**: 16 patients (8 Chest, 8 Abdomen).
 
 ```bash
 python download.py
+
 ```
 
-This creates:
-```
-dataset/   ← 30 patients for training (15 Chest + 15 Abdomen)
-test/      ← 6 patients for testing   (3 Chest  + 3 Abdomen)
-```
+*This generates a `download_report.csv` and safely skips already-downloaded files if interrupted.*
 
-### 2. Train
+### 2. Training the Model
+
+Training utilizes `ReduceLROnPlateau` scheduling, Gradient Clipping, and logs everything to TensorBoard.
 
 ```bash
 python train.py
+
 ```
 
-Training supports **automatic resume** from the last checkpoint. Logs are written to TensorBoard:
+To monitor training curves, losses, and image outputs in real-time:
 
 ```bash
 tensorboard --logdir FinalCT_2.5D-UNET-DATASET/logs
+
 ```
 
-## Configuration
+### 3. Clinical Evaluation
 
-All settings are centralized in [`config.py`](config.py). Key parameters:
+Evaluate the model's performance on the unseen `test/` directory. The evaluation runs on the **unaltered, original spatial resolution** of the DICOM files to reflect true clinical applicability.
 
-| Parameter | Default | Description |
-|---|---|---|
-| `TOTAL_EPOCHS` | 50 | Training epochs |
-| `LEARNING_RATE` | 1e-4 | AdamW learning rate |
-| `TRAIN_BATCH_SIZE` | 32 | Training batch size |
-| `SPATIAL_SIZE` | (256, 256) | Input patch size |
-| `PATIENCE` | 10 | Early stopping patience |
+```bash
+# Run evaluation and generate a CSV report
+python evaluate.py
 
-## Dataset
+# Run evaluation AND save comparative visualization images (LDCT vs NDCT vs Denoised)
+python evaluate.py --save-images
 
-Uses the **LDCT-and-projection-data** collection from The Cancer Imaging Archive (TCIA). Patients are split stratified by body type (Chest / Abdomen) and selected by smallest file size first.
+```
 
+---
 
-## Requirements
+## ⚙️ Configuration
 
-- Python ≥ 3.9
-- PyTorch ≥ 2.0 with CUDA (recommended)
-- See `requirements.txt` for the full list
+The entire behavior of the pipeline is controlled via [`config.py`](https://www.google.com/search?q=config.py). You do not need to hunt for hardcoded values.
+
+**Key Hyperparameters:**
+
+* `TOTAL_EPOCHS`: 50
+* `LEARNING_RATE`: 1e-4 (AdamW)
+* `TRAIN_BATCH_SIZE`: 32
+* `SPATIAL_SIZE`: (256, 256)
+* `CACHE_DATA`: True (Accelerates training by storing processed files in RAM)
+
+---
+
+## 📊 Evaluation Metrics
+
+The script `evaluate.py` outputs per-patient, per-body-type, and overall averages for:
+
+* **PSNR** (Peak Signal-to-Noise Ratio) - Higher is better.
+* **ΔPSNR** - Net improvement over the baseline LDCT image.
+* **SSIM** (Structural Similarity Index) - Higher is better.
+* **RMSE** (Root Mean Squared Error) - Lower is better.
+* **VIF** (Visual Information Fidelity) - Highly sensitive metric for fine medical details like nodules and sharp edges.
