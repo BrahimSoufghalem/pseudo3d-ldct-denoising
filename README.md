@@ -65,8 +65,8 @@ Ensure you have Python ≥ 3.9 installed. For optimal performance, a CUDA-enable
 
 ```bash
 # Clone the repository and install dependencies
-git clone <your-repo-url>
-cd LDCT-Project
+git clone https://github.com/BrahimSoufghalem/pseudo3d-ldct-denoising.git
+cd pseudo3d-ldct-denoising
 pip install -r requirements.txt
 
 ```
