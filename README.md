@@ -147,12 +147,12 @@ The model demonstrates stable convergence and significant improvements in image 
 Here is the convergence of the training/validation loss alongside the primary evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
 
 <p align="center">
-  <img src="images/overall_metrics.png" width="45%" alt="Overall Evaluation Metrics">
+  <img src="images/overall_metrics.png" width="80%" alt="Overall Evaluation Metrics">
 </p>
 
 ### Loss
-<p align="center">
-  <img src="images/loss_curve.png" width="45%" alt="Training and Validation Loss">
+<p align="left">
+  <img src="images/loss_curve.png" width="35%" alt="Training and Validation Loss">
 </p>
 
 ### Performance by Anatomy (Chest vs. Abdomen)
