@@ -139,3 +139,27 @@ The script `evaluate.py` outputs per-patient, per-body-type, and overall average
 * **SSIM** (Structural Similarity Index) - Higher is better.
 * **RMSE** (Root Mean Squared Error) - Lower is better.
 * **VIF** (Visual Information Fidelity) - Highly sensitive metric for fine medical details like nodules and sharp edges.
+## 📉 Training Curves & Performance
+
+The model demonstrates stable convergence and significant improvements in image quality metrics across both Chest and Abdomen datasets. The training and validation loss curves show healthy learning dynamics without severe overfitting.
+
+### Loss & Overall Metrics
+Here is the convergence of the training/validation loss alongside the primary evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
+
+<p align="center">
+  <img src="assets/loss_curve.png" width="45%" alt="Training and Validation Loss">
+  <img src="assets/overall_metrics.png" width="45%" alt="Overall Evaluation Metrics">
+</p>
+
+### Performance by Anatomy (Chest vs. Abdomen)
+The model was evaluated separately on Chest and Abdomen slices to ensure robust feature extraction across different anatomical structures and noise profiles.
+
+**Chest Metrics:**
+<p align="center">
+  <img src="assets/chest_metrics.png" width="80%" alt="Chest Metrics">
+</p>
+
+**Abdomen Metrics:**
+<p align="center">
+  <img src="assets/abdomen_metrics.png" width="80%" alt="Abdomen Metrics">
+</p>
