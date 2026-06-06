@@ -27,18 +27,6 @@ from config import (
     CHUNK_SIZE, NBIA_API_URL,
 )
 
-# ═══════════════════════════════════════════
-# TARGET PATIENTS (Extracted from the image)
-# ═══════════════════════════════════════════
-TARGET_PATIENTS = [
-    # Chest Patients
-    "C002", "C004", "C012", "C016", "C021", "C027", "C030", "C050",
-    "C052", "C067", "C081", "C095", "C099", "C107", "C111",
-    # Abdomen Patients
-    "L004", "L006", "L014", "L019", "L033", "L049", "L056", "L057",
-    "L058", "L064", "L071", "L072", "L075", "L077", "L081"
-]
-
 
 # ═══════════════════════════════════════════
 # SESSION (thread-local)
