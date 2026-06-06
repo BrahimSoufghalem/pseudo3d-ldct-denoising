@@ -62,7 +62,7 @@ LAMBDA_EDGE = 0.05
 # ═══════════════════════════════════════════
 SCHEDULER_MODE = "max"
 SCHEDULER_FACTOR = 0.5
-SCHEDULER_PATIENCE = 10
+SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR = 1e-7
 
 # ═══════════════════════════════════════════
