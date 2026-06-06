@@ -26,8 +26,7 @@ progress.json
 download_report.csv
 
 # ─── Model Outputs & Checkpoints ─────────────────────────────
-FinalCT_2.5D-UNET-DATASET/
-*.pt
+
 *.pth
 *.ckpt
 
