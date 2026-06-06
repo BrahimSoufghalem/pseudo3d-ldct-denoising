@@ -144,7 +144,7 @@ The script `evaluate.py` outputs per-patient, per-body-type, and overall average
 The model demonstrates stable convergence and significant improvements in image quality metrics across both Chest and Abdomen datasets. The training and validation loss curves show healthy learning dynamics without severe overfitting.
 
 ### Overall Metrics
-Here is the \ evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
+Here is the evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
 
 <p align="left">
   <img src="images/overall_metrics.png" width="110%" alt="Overall Evaluation Metrics">
