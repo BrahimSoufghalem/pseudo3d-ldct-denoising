@@ -13,6 +13,7 @@ from glob import glob
 import torch
 import numpy as np
 import pydicom
+from pydicom.uid import generate_uid
 from tqdm import tqdm
 from torch.cuda.amp import autocast
 
@@ -51,40 +52,50 @@ def denormalize_to_hu(tensor, a_min=A_MIN, a_max=A_MAX):
 # ═══════════════════════════════════════════
 # DICOM SAVING HELPER
 # ═══════════════════════════════════════════
-def save_as_dicom(ref_dicom_path, output_path, denoised_hu_tensor):
+def save_as_dicom(ref_dicom_path, output_path, denoised_hu_tensor, series_uid):
     """
-    Take the enhanced Tensor and rewrite it into a new DICOM file 
+    Take the enhanced Tensor and rewrite it into a new DICOM file
     using the original file to preserve the Metadata.
     """
     ds = pydicom.dcmread(ref_dicom_path)
-    
+
     # Convert the Tensor to a 2D Numpy array
     denoised_hu = denoised_hu_tensor.squeeze().cpu().numpy()
-    
+
     # Retrieve original pixel values based on the equation: HU = pixel * slope + intercept
     slope = float(getattr(ds, "RescaleSlope", 1.0))
     intercept = float(getattr(ds, "RescaleIntercept", 0.0))
-    
+
     pixel_array = (denoised_hu - intercept) / slope
-    
+
     # Revert the array to its original data type (usually int16 for CT scans)
     orig_dtype = ds.pixel_array.dtype
-    
+
     # Ensure pixel values do not exceed the allowed data type boundaries
     dtype_min = np.iinfo(orig_dtype).min
     dtype_max = np.iinfo(orig_dtype).max
     pixel_array = np.clip(pixel_array, dtype_min, dtype_max).astype(orig_dtype)
-    
+
     # Update pixel data in the DICOM object
     ds.PixelData = pixel_array.tobytes()
-    
-    # Update the series description to distinguish it from the original
-    old_desc = getattr(ds, 'SeriesDescription', 'LDCT')
-    ds.SeriesDescription = f" Denoised (AI)"
-    
+
+    # Create a new DICOM Series
+    ds.SeriesInstanceUID = series_uid
+    ds.SeriesDescription = "Denoised (AI)"
+
+    if hasattr(ds, "SeriesNumber"):
+        ds.SeriesNumber = int(ds.SeriesNumber) + 1000
+    else:
+        ds.SeriesNumber = 1000
+
+    # Create a unique SOP UID for each slice
+    ds.SOPInstanceUID = generate_uid()
+
+    if hasattr(ds, "file_meta"):
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+
     # Save the file
     ds.save_as(output_path)
-
 
 # ═══════════════════════════════════════════
 # INFERENCE PIPELINE
@@ -102,6 +113,8 @@ def process_patient(pid, patient_dir, output_dir, model, device):
     if n == 0:
         print(f"  ⚠ No images found for patient {pid}.")
         return
+    
+    series_uid = generate_uid()
 
     for i in tqdm(range(n), desc=f"  Processing Patient [{pid}]", leave=False, unit="slice"):
         # 2.5D technique (previous, current, and next slice)
@@ -130,7 +143,7 @@ def process_patient(pid, patient_dir, output_dir, model, device):
         out_path = out_patient_dir / filename
 
         # Save the file
-        save_as_dicom(low_imgs[i], out_path, pred_hu)
+        save_as_dicom(low_imgs[i], out_path, pred_hu, series_uid)
 
 
 # ═══════════════════════════════════════════
