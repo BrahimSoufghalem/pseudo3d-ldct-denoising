@@ -6,7 +6,7 @@ without any cropping or padding. Reports PSNR, SSIM, RMSE, and VIF.
 
 Usage:
     python evaluate.py
-    python evaluate.py --model FinalCT_2.5D-UNET-DATASET/best_model.pt
+    python evaluate.py --model FinalCT_2.5D-UNET-DATASET/best_model.pt 
     python evaluate.py --save-images
 """
 
