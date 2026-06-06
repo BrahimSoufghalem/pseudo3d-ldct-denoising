@@ -9,7 +9,7 @@ import time
  
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler 
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from monai.metrics import SSIMMetric
 from tqdm import tqdm
@@ -51,10 +51,9 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast():
+        with autocast("cuda"):
             pred_res = model(images)
             loss, loss_info = loss_fn(pred_res, residual_target)
-            preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -111,7 +110,7 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
         mid_slice = images[:, 1:2, :, :]
         residual_target = labels - mid_slice
 
-        with autocast():
+        with autocast("cuda"):
             pred_res = model(images)
             preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
             loss, _ = loss_fn(pred_res, residual_target)
@@ -294,7 +293,7 @@ def main():
     train_loader, val_loader = prepareCT2D()
 
     # ── GradScaler ──
-    scaler = GradScaler()
+    scaler = GradScaler("cuda")
 
     training_start = time.time()
 
@@ -330,9 +329,6 @@ def main():
         # Log to TensorBoard
         log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time)
 
-        # Save checkpoint (every epoch)
-        save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter)
-
         # Check for best model
         if metrics["avg_psnr"] > best_psnr:
             best_psnr = metrics["avg_psnr"]
@@ -350,9 +346,13 @@ def main():
             )
         else:
             patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(f"⏹️ Early stopping at epoch {epoch + 1}")
-                break
+
+        # Save checkpoint (every epoch)
+        save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter)
+
+        if patience_counter >= PATIENCE:
+            print(f"⏹️ Early stopping at epoch {epoch + 1}")
+            break
 
     # ── Final Summary ──
     total_time = time.strftime("%H:%M:%S", time.gmtime(time.time() - training_start))
