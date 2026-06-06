@@ -182,7 +182,7 @@ The following side-by-side comparisons demonstrate the model's ability to effect
 
 ### Abdomen CT Scans
 <p align="left">
-  <img src="images/abdomen_comparison_10%dose.png" width="100%" alt="Abdomen CT Denoising Comparison  (10% dose)">
+  <img src="abdomen_comparison_10%dose.jpg" width="100%" alt="Abdomen CT Denoising Comparison  (10% dose)">
 </p>
 <p align="left">
   <img src="images/abdomen_comparison_10%dose.png" width="100%" alt="Abdomen CT Denoising Comparison  (25% dose)">
