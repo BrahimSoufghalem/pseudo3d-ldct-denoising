@@ -156,7 +156,7 @@ Here is the convergence of the training/validation loss :
   <img src="images/loss_curve.png" width="35%" alt="Training and Validation Loss">
 </p>
 
-### Performance by Anatomy (Chest vs. Abdomen)
+### Performance by Anatomy (Chest (10% dose) vs. Abdomen (25% dose))
 The model was evaluated separately on Chest and Abdomen slices to ensure robust feature extraction across different anatomical structures and noise profiles.
 
 **Chest Metrics:**
@@ -167,4 +167,23 @@ The model was evaluated separately on Chest and Abdomen slices to ensure robust 
 **Abdomen Metrics:**
 <p align="left">
   <img src="images/abdomen_metrics.png" width="80%" alt="Abdomen Metrics">
+</p>
+
+## 👁️ Qualitative Results (Visual Comparisons)
+
+The following side-by-side comparisons demonstrate the model's ability to effectively suppress noise and artifacts in Low-Dose CT (LDCT) scans while faithfully preserving fine anatomical details, edges, and soft tissue structures compared to the Full-Dose (NDCT) ground truth.
+
+**Display Order:** `[ Left: Full Dose (NDCT) | Middle: AI Denoised | Right: Low Dose (LDCT) ]`
+
+### Chest CT Scan
+<p align="left">
+  <img src="images/chest_comparison.jpg" width="100%" alt="Chest CT Denoising Comparison (10% dose)">
+</p>
+
+### Abdomen CT Scans
+<p align="left">
+  <img src="images/abdomen_comparison_1.jpg" width="100%" alt="Abdomen CT Denoising Comparison  (10% dose)">
+</p>
+<p align="left">
+  <img src="images/abdomen_comparison_2.jpg" width="100%" alt="Abdomen CT Denoising Comparison  (25% dose)">
 </p>
