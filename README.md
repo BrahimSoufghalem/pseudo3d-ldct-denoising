@@ -143,12 +143,16 @@ The script `evaluate.py` outputs per-patient, per-body-type, and overall average
 
 The model demonstrates stable convergence and significant improvements in image quality metrics across both Chest and Abdomen datasets. The training and validation loss curves show healthy learning dynamics without severe overfitting.
 
-### Loss & Overall Metrics
+### Overall Metrics
 Here is the convergence of the training/validation loss alongside the primary evaluation metrics (PSNR, SSIM, VIF, RMSE, and Delta PSNR) over the training epochs:
 
 <p align="center">
-  <img src="images/loss_curve.png" width="45%" alt="Training and Validation Loss">
   <img src="images/overall_metrics.png" width="45%" alt="Overall Evaluation Metrics">
+</p>
+
+### Loss
+<p align="center">
+  <img src="images/loss_curve.png" width="45%" alt="Training and Validation Loss">
 </p>
 
 ### Performance by Anatomy (Chest vs. Abdomen)
