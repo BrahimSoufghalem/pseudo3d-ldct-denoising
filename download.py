@@ -3,7 +3,7 @@ LDCT-and-projection-data Downloader (Specific Patients Edition)
 ================================================================
 Downloads DICOM data from NBIA for specific hardcoded patients:
   - Validates Full+Low dose availability 
-  - Parallel fast downloads with resume support 
+  - Parallel fast downloads with resume support  
   - tqdm progress bars and CSV report
 """
 
