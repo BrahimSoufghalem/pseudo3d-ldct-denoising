@@ -19,9 +19,13 @@ A comprehensive, modular deep learning pipeline built with **PyTorch** and **MON
 ## 🗂️ Project Structure
 
 ```text
-LDCT-Project/
+pseudo3d-ldct-denoising/
 ├── FinalCT_2.5D-UNET-DATASET/
 │   └── best_model.pt      # ✅ Pre-trained model weights (included out-of-the-box!)
+├── images/                # README images and qualitative visual results
+├── .gitignore             # Ignored files and cache directories
+├── LICENSE                # MIT License for open-source distribution
+├── README.md              # Project documentation
 ├── config.py              # Centralized hyperparameter, paths, and constants registry
 ├── dataset.py             # Pseudo-3D data pipeline (MONAI transforms, dataloaders)
 ├── download.py            # Parallel NBIA dataset downloader with size estimation & resume
@@ -30,9 +34,9 @@ LDCT-Project/
 ├── losses.py              # MONAI Hybrid Loss (L1 + SSIM + VGG19 Perceptual + Sobel Edge)
 ├── metrics.py             # Evaluation metrics including TorchMetrics VisualInformationFidelity
 ├── model.py               # MONAI U-Net builder with automatic DataParallel support
+├── requirements.txt       # Python dependencies
 ├── train.py               # Main training loop with Checkpointing, Early Stopping, and TensorBoard
-├── utils.py               # Reproducibility constraints and DICOM metadata sorting
-└── requirements.txt       # Python dependencies
+└── utils.py               # Reproducibility constraints and DICOM metadata sorting
 ```
 
 ---
