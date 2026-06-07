@@ -284,6 +284,7 @@ Side-by-side comparisons demonstrate the model's ability to suppress noise while
 <p align="left">
   <img src="images/abdomen_comparison_10_percent_dose.png" width="100%" alt="Abdomen CT Denoising Comparison (10% dose)">
 </p>
+Note: This abdominal slice is extracted from a Chest (C) patient scan acquired at a 10% dose. It demonstrates the model's robust denoising performance on abdominal soft tissues even under extreme quantum noise conditions.*
 
 ### Abdomen CT — 25% Dose
 <p align="left">
