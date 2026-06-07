@@ -5,7 +5,7 @@ Reproducibility setup and DICOM sorting helpers.
 """
 
 import os
-import re
+import re 
 
 import torch 
 import pydicom
