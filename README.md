@@ -1,8 +1,51 @@
 # LDCT Denoising — 2.5D Pseudo-3D Residual U-Net Pipeline
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&height=300&color=gradient&customColorList=12,20,24,30,36&text=LDCT%20Denoising&fontSize=58&fontColor=ffffff&fontAlignY=38&desc=Pseudo-3D%20Residual%20UNet%20for%20Low-Dose%20CT%20Enhancement&descAlignY=58&animation=fadeIn"/>
+</p>
 
-A comprehensive, modular deep learning pipeline built with **PyTorch** and **MONAI** for **Low-Dose CT (LDCT) denoising**. This project enhances degraded LDCT images toward Full-Dose CT (NDCT) quality by leveraging a pseudo-3D (2.5D) context that captures spatial continuity across adjacent anatomical slices.
- 
+<p align="center">
+  <img src="https://readme-typing-svg.herokuapp.com?font=JetBrains+Mono&weight=600&size=28&duration=3000&pause=1000&color=8B5CF6&center=true&vCenter=true&width=1000&lines=Medical+Imaging+Research;Low-Dose+CT+Denoising;Pseudo-3D+Deep+Learning+Pipeline;Clinical+DICOM+Processing;PyTorch+%7C+MONAI+%7C+Computer+Vision"/>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Medical_Physics-Research-6D28D9?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Medical_Imaging-CT_Enhancement-7C3AED?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Deep_Learning-PyTorch-E11D48?style=for-the-badge&logo=pytorch&logoColor=white" />
+  <img src="https://img.shields.io/badge/MONAI-Medical_AI-4F46E5?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/DICOM-PACS_Ready-2563EB?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/License-MIT-10B981?style=for-the-badge" />
+</p>
+
+<p align="center">
+  <a href="mailto:ibrahimsoufghalm@gmail.com">
+    <img src="https://img.shields.io/badge/Email-Contact_Me-8B5CF6?style=for-the-badge&logo=gmail&logoColor=white" />
+  </a>
+
+  <a href="https://github.com/BrahimSoufghalem">
+    <img src="https://img.shields.io/badge/GitHub-BrahimSoufghalem-181717?style=for-the-badge&logo=github&logoColor=white" />
+  </a>
+
+  <a href="https://github.com/BrahimSoufghalem/pseudo3d-ldct-denoising">
+    <img src="https://img.shields.io/badge/Repository-View_Project-4F46E5?style=for-the-badge&logo=github" />
+  </a>
+</p>
+
+<p align="center">
+  <img src="https://komarev.com/ghpvc/?username=BrahimSoufghalem&style=for-the-badge&color=6D28D9" />
+  <img src="https://img.shields.io/github/stars/BrahimSoufghalem/pseudo3d-ldct-denoising?style=for-the-badge" />
+  <img src="https://img.shields.io/github/forks/BrahimSoufghalem/pseudo3d-ldct-denoising?style=for-the-badge" />
+</p>
+
+<p align="center">
+  <b>Low-Dose CT Denoising • Medical Imaging • Deep Learning • Clinical DICOM Workflow</b>
+</p>
+
 ---
+
+# Overview
+<p align="center">
+A comprehensive, modular deep learning pipeline built with <b>PyTorch</b> and <b>MONAI</b> for <b>Low-Dose CT (LDCT) denoising</b>. The model leverages a pseudo-3D (2.5D) context to enhance degraded LDCT scans toward Full-Dose CT quality while preserving anatomical structures.
+</p>
 
 ## ✨ Key Features
 
