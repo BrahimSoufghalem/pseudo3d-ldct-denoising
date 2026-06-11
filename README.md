@@ -29,7 +29,7 @@
 A comprehensive, modular deep learning pipeline built with <b>PyTorch</b> and <b>MONAI</b> for <b>Low-Dose CT (LDCT) denoising</b>. The model leverages a pseudo-3D (2.5D) context to enhance degraded LDCT scans toward Full-Dose CT quality while preserving anatomical structures.
 </p>
 
-## ✨ Key Features
+## Key Features: 
 
 - **Pseudo-3D (2.5D) Architecture** — Instead of processing independent 2D slices, the pipeline stacks three consecutive slices (`prev`, `curr`, `next`) into a single 3-channel input. The model predicts the **noise residual** of the central slice, preserving crucial inter-slice anatomical context.
 - **Custom NBIA Downloader** — Automated, multi-threaded dataset downloader fetching data directly from The Cancer Imaging Archive (TCIA). Features resume-support, progress tracking, and selects exactly 100 hardcoded patients stratified by anatomy (Chest / Abdomen).
@@ -41,7 +41,7 @@ A comprehensive, modular deep learning pipeline built with <b>PyTorch</b> and <b
 
 ---
 
-## 🗂️ Project Structure
+## Project Structure: 
 
 ```text
 pseudo3d-ldct-denoising/
@@ -66,7 +66,7 @@ pseudo3d-ldct-denoising/
 
 ---
 
-## 🔬 Methodology & Pipeline
+## Methodology & Pipeline: 
 
 ### 1. Data Processing
 
@@ -96,7 +96,7 @@ A MONAI `UNet` initialized with:
 
 ---
 
-## 🚀 Getting Started
+## Getting Started: 
 
 ### Prerequisites
 
@@ -108,7 +108,7 @@ cd pseudo3d-ldct-denoising
 pip install -r requirements.txt
 ```
 
-> 🔥 **Quick Start with Pre-trained Weights**
+> → **Quick Start with Pre-trained Weights**
 > This repository includes the pre-trained weights (`FinalCT_2.5D-UNET-DATASET/best_model.pt`).
 > You can **skip Steps 1 and 2 entirely** — just download the test set and jump straight to
 > **[Step 3 (Evaluation)](#3-evaluation)** or **[Step 4 (Inference & DICOM Export)](#4-inference--dicom-export)**.
@@ -160,7 +160,7 @@ The output directory mirrors the input structure, with each enhanced slice saved
 
 ---
 
-## ⚙️ Key Hyperparameters
+##  Key Hyperparameters: 
 
 | Parameter | Value |
 |---|---|
@@ -172,7 +172,7 @@ The output directory mirrors the input structure, with each enhanced slice saved
 
 ---
 
-## 📊 Evaluation Results
+## Evaluation Results: 
 
 ### Per-Patient Breakdown (16 Test Patients)
 
@@ -210,7 +210,7 @@ The output directory mirrors the input structure, with each enhanced slice saved
 
 ---
 
-## 🔍 Analysis: Why Chest and Abdomen Metrics Differ
+##  Analysis: Why Chest and Abdomen Metrics Differ 
 
 The substantial gap between Chest and Abdomen results is **not a modeling failure** — it is a well-grounded, scientifically expected consequence of two confounding variables that are intrinsic to the TCIA dataset itself: **dose level** and **anatomical complexity**.
 
@@ -268,13 +268,13 @@ Within Abdomen, **L277 achieves the highest ΔPSNR (+2.26 dB)** despite a modera
 
 ---
 
-## 📉 Training Curves & Performance
+## Training Curves & Performance: 
 
 The model demonstrates stable convergence with healthy learning dynamics and no severe overfitting across both anatomy types.
 
 ### Overall Metrics Over Epochs
 <p align="left">
-  <img src="images/overall_metrics.png" width="110%" alt="Overall Evaluation Metrics">
+  <img src="images/overall_metrics.png" width="100%" alt="Overall Evaluation Metrics">
 </p>
 
 ### Loss Curve
@@ -294,7 +294,7 @@ The model demonstrates stable convergence with healthy learning dynamics and no 
 
 ---
 
-## 👁️ Qualitative Results
+## Qualitative Results: 
 
 Side-by-side comparisons demonstrate the model's ability to suppress noise while preserving fine anatomical edges, soft tissue structures, and diagnostic detail.
 
@@ -318,7 +318,7 @@ Note: This abdominal slice is extracted from a Chest (C) patient scan acquired a
 
 ---
 
-## 📦 Evaluation Metrics Reference
+## Evaluation Metrics Reference: 
 
 | Metric | Direction | Description |
 |---|---|---|
@@ -330,6 +330,6 @@ Note: This abdominal slice is extracted from a Chest (C) patient scan acquired a
 
 ---
 
-## 📄 License
+## License: 
 
 This project is released for research and educational purposes. See `LICENSE` for details.
