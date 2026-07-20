@@ -20,9 +20,9 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 # ═══════════════════════════════════════════
 # TRAINING HYPERPARAMETERS
 # ═══════════════════════════════════════════
-TOTAL_EPOCHS = 50
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-5
+TOTAL_EPOCHS = 70
+LEARNING_RATE = 5e-5
+WEIGHT_DECAY = 5e-6
 TRAIN_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 64
 NUM_WORKERS = 8
@@ -44,8 +44,8 @@ CACHE_DATA = True
 # ═══════════════════════════════════════════
 IN_CHANNELS = 3       # pseudo-3D: prev + curr + next
 OUT_CHANNELS = 1
-CHANNELS = (32, 64, 128, 256)
-STRIDES = (2, 2, 2)
+CHANNELS = (32, 64, 128, 256, 512)
+STRIDES = (2, 2, 2, 2)
 NUM_RES_UNITS = 2
 DROPOUT = 0.1
 
@@ -54,8 +54,8 @@ DROPOUT = 0.1
 # ═══════════════════════════════════════════
 LAMBDA_L1 = 1.0
 LAMBDA_SSIM = 0.5
-LAMBDA_PERC = 0.1
-LAMBDA_EDGE = 0.05
+LAMBDA_PERC = 0.2
+LAMBDA_EDGE = 0.1
 
 # ═══════════════════════════════════════════
 # SCHEDULER

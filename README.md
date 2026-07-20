@@ -81,8 +81,8 @@ A MONAI `UNet` initialized with:
 |---|---|
 | **Input channels** | 3 (Pseudo-3D: prev / curr / next slice) |
 | **Output channels** | 1 (Predicted noise residual) |
-| **Feature maps** | `(32, 64, 128, 256)` |
-| **Strides** | `(2, 2, 2)` |
+| **Feature maps** | `(32, 64, 128, 256, 512)` |
+| **Strides** | `(2, 2, 2, 2)` |
 | **Residual units** | 2 per layer |
 
 ### 3. Hybrid Loss Weights
@@ -91,8 +91,8 @@ A MONAI `UNet` initialized with:
 |---|---|---|
 | **L1 Loss** | `1.0` | Exact pixel-wise reconstruction |
 | **SSIM Loss** | `0.5` | Structural integrity and luminance preservation |
-| **VGG-19 Perceptual** | `0.1` | High-level texture similarity (frozen features) |
-| **Sobel Edge** | `0.05` | Penalization for blurred anatomical boundaries |
+| **VGG-19 Perceptual** | `0.2` | High-level texture similarity (frozen features) |
+| **Sobel Edge** | `0.1` | Penalization for blurred anatomical boundaries |
 
 ---
 
@@ -164,8 +164,8 @@ The output directory mirrors the input structure, with each enhanced slice saved
 
 | Parameter | Value |
 |---|---|
-| `TOTAL_EPOCHS` | 50 |
-| `LEARNING_RATE` | 1e-4 (AdamW) |
+| `TOTAL_EPOCHS` | 70 |
+| `LEARNING_RATE` | 5e-5 (AdamW) |
 | `TRAIN_BATCH_SIZE` | 32 |
 | `SPATIAL_SIZE` | (256, 256) |
 | `CACHE_DATA` | True |
