@@ -52,13 +52,13 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
         labels = batch["label"].to(device)
 
         mid_slice = images[:, 1:2, :, :]
-        residual_target = labels - mid_slice
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast("cuda"):
             pred_res = model(images)
-            loss, loss_info = loss_fn(pred_res, residual_target)
+            pred_img = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
+            loss, loss_info = loss_fn(pred_img, labels)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -113,13 +113,10 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
-        mid_slice = images[:, 1:2, :, :]
-        residual_target = labels - mid_slice
-
         with autocast("cuda"):
             pred_res = model(images)
             preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
-            loss, _ = loss_fn(pred_res, residual_target)
+            loss, _ = loss_fn(preds, labels)
 
         val_loss += loss.item()
         body_types = batch.get("body_type", None)

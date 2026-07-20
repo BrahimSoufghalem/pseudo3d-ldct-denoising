@@ -54,11 +54,15 @@ class MultiWindowWaveletUNet(nn.Module):
                 if hasattr(sub, "submodule") and isinstance(sub.submodule, nn.Sequential) and len(sub.submodule) > 1:
                     sub = sub.submodule[1]
 
-            if hasattr(sub, "submodule"):
-                sub.submodule = nn.Sequential(
-                    sub.submodule,
-                    self.wavelet_attn,
-                )
+            assert hasattr(sub, "submodule"), (
+                "MONAI UNet architecture mismatch: Could not locate 'submodule' "
+                "for Wavelet Attention injection!"
+            )
+
+            sub.submodule = nn.Sequential(
+                sub.submodule,
+                self.wavelet_attn,
+            )
 
     def forward(self, x):
         return self.unet(x)
