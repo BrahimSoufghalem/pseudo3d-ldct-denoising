@@ -1,8 +1,13 @@
 """
-LDCT Project — Evaluation Script (Full Image Resolution)
-=========================================================
+LDCT Project — Evaluation Script (Full Image Resolution & ldct-benchmark Physics Standard)
+==========================================================================================
 Runs the trained model on the `test/` folder using FULL original resolution
-without any cropping or padding. Reports PSNR, SSIM, RMSE, and VIF.
+without any cropping or padding.
+
+Calculates physically & clinically accurate metrics using the exact ldct-benchmark standard:
+- RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
+- PSNR & SSIM: Measured on Clinical Diagnostic Windows (Lung Window for Chest, Soft Tissue Window for Abdomen).
+- VIF: Measured on physical HU scale.
 
 Usage:
     python evaluate.py
@@ -21,7 +26,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from torch.cuda.amp import autocast
-from monai.metrics import SSIMMetric
 from tqdm import tqdm
 
 from config import (
@@ -30,10 +34,13 @@ from config import (
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number
 from model import build_model
-from metrics import psnr, rmse, VIFMetric
+from metrics import (
+    compute_psnr_windowed, compute_ssim_windowed,
+    compute_rmse_hu, compute_vif_hu,
+    denormalize_to_hu_offset, apply_center_width, CW
+)
 
 import pydicom
-import torch.nn.functional as F
 
 
 # ═══════════════════════════════════════════
@@ -66,7 +73,7 @@ def normalize(tensor, a_min=A_MIN, a_max=A_MAX):
 def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_dir=None):
     """
     Evaluate one patient — runs the model on every slice using FULL resolution
-    and returns a dict with average metrics.
+    and returns a dict with average benchmark-aligned metrics.
     """
     low_dir = patient_dir / "Low_Dose"
     full_dir = patient_dir / "Full_Dose"
@@ -82,9 +89,6 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
 
     psnr_scores, ssim_scores, rmse_scores, vif_scores = [], [], [], []
     baseline_psnr_scores = []
-
-    ssim_metric = SSIMMetric(spatial_dims=2, data_range=1.0, reduction="mean")
-    vif_metric = VIFMetric(device=device)
 
     # Save one visualization per patient (middle slice)
     viz_slice_idx = n // 2
@@ -109,17 +113,17 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
             pred_res = model(inp)
             pred = torch.clamp(mid + pred_res, 0.0, 1.0)
 
-        p_val = psnr(pred.float(), lbl.float()).item()
-        r_val = rmse(pred.float(), lbl.float()).item()
-        b_val = psnr(mid.float(), lbl.float()).item()
+        # ── 1. Convert tensors to HU + 1024 offset domain (ldct-benchmark standard) ──
+        pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
+        lbl_hu_offset  = denormalize_to_hu_offset(lbl.squeeze(),  A_MIN, A_MAX)
+        mid_hu_offset  = denormalize_to_hu_offset(mid.squeeze(),  A_MIN, A_MAX)
 
-        ssim_metric.reset()
-        ssim_metric(pred.float(), lbl.float())
-        s_val = ssim_metric.aggregate().item()
-
-        vif_m = VIFMetric(device=device)
-        vif_m.update(pred.float(), lbl.float())
-        v_val = vif_m.aggregate()
+        # ── 2. Compute ldct-benchmark metrics ──
+        p_val = compute_psnr_windowed(pred_hu_offset, lbl_hu_offset, body_type)
+        b_val = compute_psnr_windowed(mid_hu_offset,  lbl_hu_offset, body_type)
+        s_val = compute_ssim_windowed(pred_hu_offset, lbl_hu_offset, body_type)
+        r_val = compute_rmse_hu(pred_hu_offset, lbl_hu_offset)
+        v_val = compute_vif_hu(pred_hu_offset, lbl_hu_offset)
 
         psnr_scores.append(p_val)
         ssim_scores.append(s_val)
@@ -128,10 +132,11 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         baseline_psnr_scores.append(b_val)
 
         if i == viz_slice_idx:
+            center, width = CW.get(body_type, CW["Abdomen"])
             viz_triplet = (
-                mid.squeeze().cpu().numpy(),
-                lbl.squeeze().cpu().numpy(),
-                pred.squeeze().cpu().numpy(),
+                apply_center_width(mid_hu_offset, center, width),
+                apply_center_width(lbl_hu_offset, center, width),
+                apply_center_width(pred_hu_offset, center, width),
             )
 
     avg = lambda lst: sum(lst) / max(len(lst), 1)
@@ -144,7 +149,7 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         "Baseline_PSNR":  round(avg(baseline_psnr_scores), 4),
         "Delta_PSNR":     round(avg(psnr_scores) - avg(baseline_psnr_scores), 4),
         "SSIM":           round(avg(ssim_scores), 4),
-        "RMSE":           round(avg(rmse_scores), 6),
+        "RMSE_HU":        round(avg(rmse_scores), 4),
         "VIF":            round(avg(vif_scores), 4),
     }
 
@@ -159,15 +164,17 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
 # VISUALIZATION HELPER
 # ═══════════════════════════════════════════
 def save_patient_viz(pid, body_type, viz_triplet, metrics, output_dir):
-    """Save a side-by-side triplet: LDCT | NDCT | Denoised."""
+    """Save a side-by-side triplet: LDCT | NDCT | Denoised (using clinical window)."""
     ldct, ndct, denoised = viz_triplet
     fig = plt.figure(figsize=(15, 5))
     gs = gridspec.GridSpec(1, 3, wspace=0.05)
 
+    window_name = "Lung Window (C=-600, W=1500)" if body_type == "Chest" else "Soft Tissue Window (C=50, W=400)"
+
     titles = [
         f"LDCT (Input)\nBaseline PSNR: {metrics['Baseline_PSNR']:.2f} dB",
-        "NDCT (Ground Truth)",
-        f"Denoised (Output)\nPSNR: {metrics['PSNR']:.2f} dB | SSIM: {metrics['SSIM']:.4f}",
+        f"NDCT (Ground Truth)\n{window_name}",
+        f"Denoised (Output)\nPSNR: {metrics['PSNR']:.2f} dB | SSIM: {metrics['SSIM']:.4f} | RMSE: {metrics['RMSE_HU']:.2f} HU",
     ]
     imgs = [ldct, ndct, denoised]
     cmap = "gray"
@@ -189,20 +196,20 @@ def save_patient_viz(pid, body_type, viz_triplet, metrics, output_dir):
 # ═══════════════════════════════════════════
 def print_summary(df):
     """Print per-body-type and overall average metrics."""
-    print("\n" + "=" * 70)
-    print("📊  EVALUATION RESULTS")
-    print("=" * 70)
-    print(f"\n{'Patient':<14} {'Type':<9} {'Slices':>6}  {'ΔPSNR':>8}  {'PSNR':>8}  {'SSIM':>8}  {'RMSE':>8}  {'VIF':>8}")
-    print("-" * 70)
+    print("\n" + "=" * 75)
+    print("📊  EVALUATION RESULTS (ldct-benchmark Physical Standard)")
+    print("=" * 75)
+    print(f"\n{'Patient':<14} {'Type':<9} {'Slices':>6}  {'ΔPSNR':>8}  {'PSNR':>8}  {'SSIM':>8}  {'RMSE(HU)':>10}  {'VIF':>8}")
+    print("-" * 75)
 
     for _, row in df.iterrows():
         print(
             f"{row['PatientID']:<14} {row['BodyType']:<9} {row['NumSlices']:>6}  "
             f"{row['Delta_PSNR']:>+8.2f}  {row['PSNR']:>8.2f}  "
-            f"{row['SSIM']:>8.4f}  {row['RMSE']:>8.4f}  {row['VIF']:>8.4f}"
+            f"{row['SSIM']:>8.4f}  {row['RMSE_HU']:>10.2f}  {row['VIF']:>8.4f}"
         )
 
-    print("=" * 70)
+    print("=" * 75)
 
     for body_type in ["Chest", "Abdomen", "Overall"]:
         sub = df if body_type == "Overall" else df[df["BodyType"] == body_type]
@@ -214,18 +221,18 @@ def print_summary(df):
             f"ΔPSNR: {sub['Delta_PSNR'].mean():>+6.2f} dB  |  "
             f"PSNR: {sub['PSNR'].mean():>6.2f} dB  |  "
             f"SSIM: {sub['SSIM'].mean():>6.4f}  |  "
-            f"RMSE: {sub['RMSE'].mean():>6.4f}  |  "
+            f"RMSE: {sub['RMSE_HU'].mean():>6.2f} HU  |  "
             f"VIF: {sub['VIF'].mean():>6.4f}"
         )
 
-    print("=" * 70)
+    print("=" * 75)
 
 
 # ═══════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate LDCT denoising model on test set.")
+    parser = argparse.ArgumentParser(description="Evaluate LDCT denoising model on test set using ldct-benchmark physical metrics.")
     parser.add_argument("--model", type=str, default=BEST_MODEL_PATH,
                         help="Path to the trained model weights (.pt file)")
     parser.add_argument("--test-dir", type=str, default=TEST_DIR,
