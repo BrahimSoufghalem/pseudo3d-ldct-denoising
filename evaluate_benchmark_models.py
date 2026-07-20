@@ -2,10 +2,12 @@
 LDCT Project — Benchmark Models Evaluation & Comparison Script
 ================================================================
 Evaluates state-of-the-art benchmark models from `ldct-benchmark`
-(RED-CNN, WGAN-VGG, DU-GAN, TransCT, QAE, ResNet, CNN10) on your `test/` dataset.
+(RED-CNN, WGAN-VGG, DU-GAN, TransCT, QAE, ResNet, CNN10) on your `test/` dataset
+using the exact physical & clinical metric standards (ldct-benchmark standard):
 
-All metrics (PSNR, SSIM, RMSE, VIF) are computed using YOUR exact normalization
-and evaluation formulas, enabling a 100% fair side-by-side comparison.
+- RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
+- PSNR & SSIM: Measured on Clinical Diagnostic Windows (Lung Window for Chest, Soft Tissue Window for Abdomen).
+- VIF: Measured on physical HU scale.
 
 Usage:
     python evaluate_benchmark_models.py
@@ -22,7 +24,6 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.cuda.amp import autocast
-from monai.metrics import SSIMMetric
 from tqdm import tqdm
 import pydicom
 
@@ -32,9 +33,13 @@ from config import (
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number
 from model import build_model
-from metrics import psnr, rmse, VIFMetric
+from metrics import (
+    compute_psnr_windowed, compute_ssim_windowed,
+    compute_rmse_hu, compute_vif_hu,
+    denormalize_to_hu_offset
+)
 
-# Import benchmark loader with clear error message if missing
+# Import benchmark loader with clear error handling
 try:
     from ldctbench.hub import load_model as load_benchmark_model
     from ldctbench.evaluate.utils import DATA_INFO
@@ -48,47 +53,42 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════
-# PREPROCESSING HELPER FOR BENCHMARK MODELS
+# DICOM & HU PREPROCESSING HELPERS
 # ═══════════════════════════════════════════
 MEAN_HU_OFFSET = float(DATA_INFO["mean"])
 STD_HU_OFFSET  = float(DATA_INFO["std"])
 
-def load_dicom_raw_hu(path):
-    """Read DICOM and return raw Hounsfield Units (HU)."""
+def load_dicom_raw_hu_offset(path):
+    """Read DICOM and return Hounsfield Units + 1024 offset as float32 numpy array."""
     ds = pydicom.dcmread(path)
     arr = ds.pixel_array.astype(np.float32)
     slope = float(getattr(ds, "RescaleSlope", 1.0))
     intercept = float(getattr(ds, "RescaleIntercept", 0.0))
-    return arr * slope + intercept
+    hu = arr * slope + intercept
+    return (hu + 1024.0).astype(np.float32)
 
 
-def hu_to_user_norm(hu_tensor):
-    """Convert raw HU tensor to user's [0, 1] normalized scale."""
-    tensor = hu_tensor.clamp(A_MIN, A_MAX)
-    return (tensor - A_MIN) / (A_MAX - A_MIN)
+def hu_offset_to_user_norm(hu_offset_tensor):
+    """Convert HU + 1024 offset tensor to user's [0, 1] normalized scale."""
+    hu = hu_offset_tensor - 1024.0
+    hu_clamped = hu.clamp(A_MIN, A_MAX)
+    return (hu_clamped - A_MIN) / (A_MAX - A_MIN)
 
 
 @torch.no_grad()
-def run_benchmark_model_slice(model, slice_hu_tensor, device):
+def run_benchmark_model_slice(model, slice_hu_offset_np, device):
     """
-    Run 2D single-slice benchmark model on raw HU tensor.
-    `slice_hu_tensor` is in HU scale.
-    Returns predicted slice in user's [0, 1] normalized domain.
+    Run 2D single-slice benchmark model on HU + 1024 numpy array.
+    Returns predicted slice in HU + 1024 offset numpy array domain.
     """
-    # ldctbench models expect input as (HU + 1024) normalized by (mean, std)
-    hu_offset = slice_hu_tensor + 1024.0
-    inp_norm = (hu_offset - MEAN_HU_OFFSET) / STD_HU_OFFSET
-    inp_t = inp_norm.unsqueeze(0).unsqueeze(0).to(device)   # [1, 1, H, W]
+    inp_norm = (slice_hu_offset_np - MEAN_HU_OFFSET) / STD_HU_OFFSET
+    inp_t = torch.from_numpy(inp_norm).unsqueeze(0).unsqueeze(0).to(device)   # [1, 1, H, W]
 
     with autocast():
-        out_norm = model(inp_t)                             # [1, 1, H, W]
+        out_norm = model(inp_t)                                                # [1, 1, H, W]
 
-    # Denormalize output back to HU
-    out_hu_offset = out_norm.squeeze() * STD_HU_OFFSET + MEAN_HU_OFFSET
-    out_hu = out_hu_offset - 1024.0
-
-    # Scale to user's [0, 1] range
-    return hu_to_user_norm(out_hu).to(device)
+    out_hu_offset = out_norm.squeeze().detach().cpu().numpy() * STD_HU_OFFSET + MEAN_HU_OFFSET
+    return out_hu_offset.astype(np.float32)
 
 
 # ═══════════════════════════════════════════
@@ -105,29 +105,18 @@ def evaluate_patient_benchmark(model, model_name, pid, patient_dir, device):
     body_type = "Chest" if pid[0].upper() == "C" else "Abdomen"
 
     psnr_scores, ssim_scores, rmse_scores, vif_scores = [], [], [], []
-    ssim_metric = SSIMMetric(spatial_dims=2, data_range=1.0, reduction="mean")
 
     for i in range(n):
-        low_hu = torch.from_numpy(load_dicom_raw_hu(low_imgs[i]))
-        full_hu = torch.from_numpy(load_dicom_raw_hu(full_imgs[i]))
+        low_hu_offset = load_dicom_raw_hu_offset(low_imgs[i])
+        full_hu_offset = load_dicom_raw_hu_offset(full_imgs[i])
 
-        # User normalized target [1, 1, H, W]
-        lbl = hu_to_user_norm(full_hu).unsqueeze(0).unsqueeze(0).to(device)
+        # Predicted slice in HU + 1024 domain
+        pred_hu_offset = run_benchmark_model_slice(model, low_hu_offset, device)
 
-        # Predicted slice in user [1, 1, H, W] domain
-        pred_2d = run_benchmark_model_slice(model, low_hu, device)
-        pred = pred_2d.unsqueeze(0).unsqueeze(0)
-
-        p_val = psnr(pred.float(), lbl.float()).item()
-        r_val = rmse(pred.float(), lbl.float()).item()
-
-        ssim_metric.reset()
-        ssim_metric(pred.float(), lbl.float())
-        s_val = ssim_metric.aggregate().item()
-
-        vif_m = VIFMetric(device=device)
-        vif_m.update(pred.float(), lbl.float())
-        v_val = vif_m.aggregate()
+        p_val = compute_psnr_windowed(pred_hu_offset, full_hu_offset, body_type)
+        s_val = compute_ssim_windowed(pred_hu_offset, full_hu_offset, body_type)
+        r_val = compute_rmse_hu(pred_hu_offset, full_hu_offset)
+        v_val = compute_vif_hu(pred_hu_offset, full_hu_offset)
 
         psnr_scores.append(p_val)
         ssim_scores.append(s_val)
@@ -143,7 +132,7 @@ def evaluate_patient_benchmark(model, model_name, pid, patient_dir, device):
         "NumSlices":      n,
         "PSNR":           round(avg(psnr_scores), 4),
         "SSIM":           round(avg(ssim_scores), 4),
-        "RMSE":           round(avg(rmse_scores), 6),
+        "RMSE_HU":        round(avg(rmse_scores), 4),
         "VIF":            round(avg(vif_scores), 4),
     }
 
@@ -162,16 +151,20 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
     body_type = "Chest" if pid[0].upper() == "C" else "Abdomen"
 
     psnr_scores, ssim_scores, rmse_scores, vif_scores = [], [], [], []
-    ssim_metric = SSIMMetric(spatial_dims=2, data_range=1.0, reduction="mean")
 
     for i in range(n):
         prev_i = max(i - 1, 0)
         next_i = min(i + 1, n - 1)
 
-        t_prev = hu_to_user_norm(torch.from_numpy(load_dicom_raw_hu(low_imgs[prev_i])))
-        t_curr = hu_to_user_norm(torch.from_numpy(load_dicom_raw_hu(low_imgs[i])))
-        t_next = hu_to_user_norm(torch.from_numpy(load_dicom_raw_hu(low_imgs[next_i])))
-        t_full = hu_to_user_norm(torch.from_numpy(load_dicom_raw_hu(full_imgs[i])))
+        low_prev_hu = torch.from_numpy(load_dicom_raw_hu_offset(low_imgs[prev_i]) - 1024.0)
+        low_curr_hu = torch.from_numpy(load_dicom_raw_hu_offset(low_imgs[i]) - 1024.0)
+        low_next_hu = torch.from_numpy(load_dicom_raw_hu_offset(low_imgs[next_i]) - 1024.0)
+        full_curr_hu = torch.from_numpy(load_dicom_raw_hu_offset(full_imgs[i]) - 1024.0)
+
+        t_prev = hu_offset_to_user_norm(low_prev_hu + 1024.0)
+        t_curr = hu_offset_to_user_norm(low_curr_hu + 1024.0)
+        t_next = hu_offset_to_user_norm(low_next_hu + 1024.0)
+        t_full = hu_offset_to_user_norm(full_curr_hu + 1024.0)
 
         inp = torch.stack([t_prev, t_curr, t_next], dim=0).unsqueeze(0).to(device)
         lbl = t_full.unsqueeze(0).unsqueeze(0).to(device)
@@ -181,16 +174,13 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
             pred_res = user_model(inp)
             pred = torch.clamp(mid + pred_res, 0.0, 1.0)
 
-        p_val = psnr(pred.float(), lbl.float()).item()
-        r_val = rmse(pred.float(), lbl.float()).item()
+        pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
+        lbl_hu_offset  = denormalize_to_hu_offset(lbl.squeeze(),  A_MIN, A_MAX)
 
-        ssim_metric.reset()
-        ssim_metric(pred.float(), lbl.float())
-        s_val = ssim_metric.aggregate().item()
-
-        vif_m = VIFMetric(device=device)
-        vif_m.update(pred.float(), lbl.float())
-        v_val = vif_m.aggregate()
+        p_val = compute_psnr_windowed(pred_hu_offset, lbl_hu_offset, body_type)
+        s_val = compute_ssim_windowed(pred_hu_offset, lbl_hu_offset, body_type)
+        r_val = compute_rmse_hu(pred_hu_offset, lbl_hu_offset)
+        v_val = compute_vif_hu(pred_hu_offset, lbl_hu_offset)
 
         psnr_scores.append(p_val)
         ssim_scores.append(s_val)
@@ -206,7 +196,7 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
         "NumSlices":      n,
         "PSNR":           round(avg(psnr_scores), 4),
         "SSIM":           round(avg(ssim_scores), 4),
-        "RMSE":           round(avg(rmse_scores), 6),
+        "RMSE_HU":        round(avg(rmse_scores), 4),
         "VIF":            round(avg(vif_scores), 4),
     }
 
@@ -217,7 +207,7 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
 BENCHMARK_MODELS = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet", "cnn10"]
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare Benchmark Models with Pseudo-3D UNet using your metrics.")
+    parser = argparse.ArgumentParser(description="Compare Benchmark Models with Pseudo-3D UNet using ldct-benchmark physical metrics.")
     parser.add_argument("--test-dir", type=str, default=TEST_DIR, help="Path to test directory")
     parser.add_argument("--user-model", type=str, default=BEST_MODEL_PATH, help="Path to your best_model.pt")
     parser.add_argument("--models", nargs="+", default=BENCHMARK_MODELS, help="List of benchmark models to test")
@@ -282,17 +272,17 @@ def main():
     df.to_csv(csv_path, index=False)
 
     print("\n" + "=" * 80)
-    print("🏆  MODEL COMPARISON SUMMARY TABLE (User Metric Standard)")
+    print("🏆  MODEL COMPARISON SUMMARY TABLE (ldct-benchmark Physical Standard)")
     print("=" * 80)
     
-    summary_df = df.groupby("Model")[["PSNR", "SSIM", "RMSE", "VIF"]].mean().reset_index()
+    summary_df = df.groupby("Model")[["PSNR", "SSIM", "RMSE_HU", "VIF"]].mean().reset_index()
     summary_df = summary_df.sort_values(by="PSNR", ascending=False)
 
-    print(f"{'Model Name':<28} {'PSNR (dB) ↑':>12} {'SSIM ↑':>12} {'RMSE ↓':>12} {'VIF ↑':>12}")
+    print(f"{'Model Name':<28} {'PSNR (dB) ↑':>12} {'SSIM ↑':>12} {'RMSE (HU) ↓':>14} {'VIF ↑':>12}")
     print("-" * 80)
     for _, row in summary_df.iterrows():
         name_str = f"⭐ {row['Model']}" if "Ours" in row['Model'] else row['Model']
-        print(f"{name_str:<28} {row['PSNR']:>12.2f} {row['SSIM']:>12.4f} {row['RMSE']:>12.6f} {row['VIF']:>12.4f}")
+        print(f"{name_str:<28} {row['PSNR']:>12.2f} {row['SSIM']:>12.4f} {row['RMSE_HU']:>14.2f} {row['VIF']:>12.4f}")
     print("=" * 80)
     print(f"\n📄  Full detailed report saved → {csv_path}")
 
