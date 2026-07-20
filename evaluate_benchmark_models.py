@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import sys
 import argparse
 from pathlib import Path
 from glob import glob
@@ -33,9 +34,17 @@ from utils import setup_reproducibility, get_device, sort_by_instance_number
 from model import build_model
 from metrics import psnr, rmse, VIFMetric
 
-# Import benchmark loader
-from ldctbench.hub import load_model as load_benchmark_model
-from ldctbench.evaluate.utils import DATA_INFO
+# Import benchmark loader with clear error message if missing
+try:
+    from ldctbench.hub import load_model as load_benchmark_model
+    from ldctbench.evaluate.utils import DATA_INFO
+except ImportError:
+    print("\n" + "!" * 75)
+    print("❌  'ldctbench' package is not installed.")
+    print("💡  To install ldct-benchmark without dependency conflicts, run:")
+    print("    pip install ldct-benchmark --no-deps")
+    print("!" * 75 + "\n")
+    sys.exit(1)
 
 
 # ═══════════════════════════════════════════
