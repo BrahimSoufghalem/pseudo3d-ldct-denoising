@@ -1,6 +1,7 @@
 """
 LDCT Project — Evaluation Script (Full Image Resolution & ldct-benchmark Physics Standard)
 ==========================================================================================
+All parameters, paths, clinical windows, and evaluation settings are imported from `config.py`.
 Runs the trained model on the `test/` folder using FULL original resolution
 without any cropping or padding.
 
@@ -29,7 +30,7 @@ from torch.cuda.amp import autocast
 from tqdm import tqdm
 
 from config import (
-    TEST_DIR, BEST_MODEL_PATH,
+    TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     A_MIN, A_MAX, B_MIN, B_MAX,
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number
@@ -239,7 +240,7 @@ def main():
                         help="Path to test patients directory")
     parser.add_argument("--save-images", action="store_true",
                         help="Save sample LDCT/NDCT/Denoised triplet images")
-    parser.add_argument("--output", type=str, default="eval_results",
+    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR,
                         help="Output folder for CSV report and images")
     args = parser.parse_args()
 

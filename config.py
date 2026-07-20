@@ -5,13 +5,14 @@ All paths, hyperparameters, and constants in one place.
 """
 
 import os  
- 
+
 # ═══════════════════════════════════════════ 
 # PATHS
 # ═══════════════════════════════════════════
 DATA_DIR = "dataset"
 TEST_DIR = "test"
 MODEL_DIR = "FinalCT_2.5D-UNET-DATASET"
+EVAL_OUTPUT_DIR = "eval_results"
 
 CHECKPOINT_PATH = os.path.join(MODEL_DIR, "checkpoint.pt")
 BEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pt")
@@ -38,6 +39,19 @@ A_MAX = 1600   # HU window max
 B_MIN = 0.0
 B_MAX = 1.0
 CACHE_DATA = True
+
+# ═══════════════════════════════════════════
+# EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
+# ═══════════════════════════════════════════
+EVAL_DATA_RANGE = 2924.0  # Maximum HU of bone (1900) + DICOM offset (1024) -> 2924
+
+# Clinical Diagnostic Windows in (HU + 1024 offset) domain
+CLINICAL_WINDOWS = {
+    "Chest": (1024 - 600, 1500),    # Lung window: C=-600 HU, W=1500 HU
+    "Abdomen": (1024 + 50, 400),    # Soft tissue window: C=50 HU, W=400 HU
+}
+
+BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet", "cnn10"]
 
 # ═══════════════════════════════════════════
 # MODEL ARCHITECTURE

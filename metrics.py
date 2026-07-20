@@ -1,6 +1,7 @@
 """
 LDCT Project — Physically Accurate Benchmark Evaluation Metrics (ldct-benchmark Standard)
 ========================================================================================
+All constants, diagnostic windows, and evaluation settings are imported directly from `config.py`.
 - RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
 - PSNR & SSIM: Measured after applying Clinical Diagnostic Windowing (Chest: Lung Window, Abdomen: Soft Tissue Window).
 - VIF: Measured on physical HU scale.
@@ -11,16 +12,13 @@ import torch
 from skimage.metrics import mean_squared_error, structural_similarity
 from torchmetrics.functional.image import visual_information_fidelity
 
-# ═══════════════════════════════════════════
-# CONSTANTS & CLINICAL WINDOW DEFINITIONS
-# ═══════════════════════════════════════════
-DATA_RANGE = 2924.0  # Maximum HU of bone (1900) + DICOM offset (1024) -> 2924
+from config import EVAL_DATA_RANGE, CLINICAL_WINDOWS, A_MIN, A_MAX
 
-# Center and Width in HU + 1024 offset domain
-CW = {
-    "Chest": (1024 - 600, 1500),    # Lung window: C=-600 HU, W=1500 HU
-    "Abdomen": (1024 + 50, 400),    # Soft tissue window: C=50 HU, W=400 HU
-}
+# ═══════════════════════════════════════════
+# CONSTANTS & CLINICAL WINDOW DEFINITIONS FROM CONFIG
+# ═══════════════════════════════════════════
+DATA_RANGE = EVAL_DATA_RANGE
+CW = CLINICAL_WINDOWS
 
 
 def apply_center_width(x: np.ndarray, center: float, width: float, out_range=(0.0, 1.0)) -> np.ndarray:
@@ -40,7 +38,7 @@ def apply_center_width(x: np.ndarray, center: float, width: float, out_range=(0.
     return res
 
 
-def denormalize_to_hu_offset(norm_tensor, a_min=-1024.0, a_max=1600.0):
+def denormalize_to_hu_offset(norm_tensor, a_min=A_MIN, a_max=A_MAX):
     """
     Convert model output normalized in [0, 1] back to HU + 1024 offset domain (float32 numpy).
     """

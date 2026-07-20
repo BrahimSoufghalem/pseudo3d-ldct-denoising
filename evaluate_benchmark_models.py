@@ -1,6 +1,7 @@
 """
 LDCT Project — Benchmark Models Evaluation & Comparison Script
 ================================================================
+All constants, default paths, clinical windows, and evaluation settings are imported from `config.py`.
 Evaluates state-of-the-art benchmark models from `ldct-benchmark`
 (RED-CNN, WGAN-VGG, DU-GAN, TransCT, QAE, ResNet, CNN10) on your `test/` dataset
 using the exact physical & clinical metric standards (ldct-benchmark standard):
@@ -28,8 +29,8 @@ from tqdm import tqdm
 import pydicom
 
 from config import (
-    TEST_DIR, BEST_MODEL_PATH,
-    A_MIN, A_MAX,
+    TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
+    BENCHMARK_MODELS_LIST, A_MIN, A_MAX,
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number
 from model import build_model
@@ -204,14 +205,12 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
 # ═══════════════════════════════════════════
 # MAIN COMPARISON LOOP
 # ═══════════════════════════════════════════
-BENCHMARK_MODELS = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet", "cnn10"]
-
 def main():
     parser = argparse.ArgumentParser(description="Compare Benchmark Models with Pseudo-3D UNet using ldct-benchmark physical metrics.")
     parser.add_argument("--test-dir", type=str, default=TEST_DIR, help="Path to test directory")
     parser.add_argument("--user-model", type=str, default=BEST_MODEL_PATH, help="Path to your best_model.pt")
-    parser.add_argument("--models", nargs="+", default=BENCHMARK_MODELS, help="List of benchmark models to test")
-    parser.add_argument("--output", type=str, default="eval_results", help="Output directory")
+    parser.add_argument("--models", nargs="+", default=BENCHMARK_MODELS_LIST, help="List of benchmark models to test")
+    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR, help="Output directory")
     args = parser.parse_args()
 
     setup_reproducibility()
