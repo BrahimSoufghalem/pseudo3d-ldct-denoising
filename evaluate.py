@@ -32,8 +32,10 @@ from tqdm import tqdm
 from config import (
     TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     A_MIN, A_MAX, B_MIN, B_MAX,
+    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
+    WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number
+from utils import setup_reproducibility, get_device, sort_by_instance_number, build_multi_window_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
@@ -99,16 +101,22 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         prev_i = max(i - 1, 0)
         next_i = min(i + 1, n - 1)
 
-        # Load + normalize 3 slices (using original dimensions)
-        t_prev = normalize(load_dicom_tensor(low_imgs[prev_i]))
-        t_curr = normalize(load_dicom_tensor(low_imgs[i]))
-        t_next = normalize(load_dicom_tensor(low_imgs[next_i]))
-        t_full = normalize(load_dicom_tensor(full_imgs[i]))
+        # Load raw HU tensors
+        raw_prev = load_dicom_tensor(low_imgs[prev_i])
+        raw_curr = load_dicom_tensor(low_imgs[i])
+        raw_next = load_dicom_tensor(low_imgs[next_i])
+        raw_full = load_dicom_tensor(full_imgs[i])
 
-        # Build input [1, 3, H, W] and label [1, 1, H, W] directly from original sizes
-        inp = torch.stack([t_prev, t_curr, t_next], dim=0).unsqueeze(0).to(device)
-        lbl = t_full.unsqueeze(0).unsqueeze(0).to(device)   
-        mid = inp[:, 1:2, :, :]                              # current low-dose slice
+        # Build 9-channel Multi-Window input [1, 9, H, W]
+        inp = build_multi_window_input(
+            raw_prev, raw_curr, raw_next,
+            a_min=A_MIN, a_max=A_MAX,
+            lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
+            soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH
+        ).to(device)
+
+        lbl = normalize(raw_full).unsqueeze(0).unsqueeze(0).to(device)
+        mid = inp[:, 1:2, :, :]                              # current low-dose slice in full HU range [0, 1]
 
         with autocast():
             pred_res = model(inp)

@@ -22,27 +22,89 @@ from config import (
     DATA_DIR, SPATIAL_SIZE, A_MIN, A_MAX, B_MIN, B_MAX,
     CACHE_DATA, TRAIN_BATCH_SIZE, VAL_BATCH_SIZE, NUM_WORKERS,
     SEED, SPLIT_RANDOM_STATE, SPLIT_TEST_SIZE,
+    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH, WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
+    EXPECTED_VAL, EXPECTED_TRAIN,
 )
 from utils import sort_by_instance_number
 
 
+def apply_window_tensor(img_tensor, center, width):
+    """Apply clinical windowing C/W to a raw HU PyTorch tensor and scale to [0, 1]."""
+    lower = center - 0.5 - (width - 1.0) / 2.0
+    upper = center - 0.5 + (width - 1.0) / 2.0
+    return torch.clamp((img_tensor - lower) / (upper - lower), 0.0, 1.0)
+
+
 # ═══════════════════════════════════════════
-# STACK SLICES (Pseudo-3D Transform)
+# STACK SLICES (Multi-Window Pseudo-3D Transform)
 # ═══════════════════════════════════════════
-class StackSlicesd:
+class StackMultiWindowSlicesd:
     """
     Custom MONAI-style dictionary transform.
-    Stacks three adjacent slices (prev, curr, next) into a single
-    3-channel tensor to provide pseudo-3D context to 2D models.
+    Stacks three adjacent slices (prev, curr, next) under three clinical diagnostic windows:
+      1. Full HU range [-1024, 1600]
+      2. Lung Window (C=-600, W=1500)
+      3. Soft Tissue Window (C=50, W=400)
+    Outputs a single 9-channel tensor [9, H, W].
     """
+    def __init__(
+        self,
+        a_min=A_MIN, a_max=A_MAX,
+        lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
+        soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH,
+    ):
+        self.a_min = a_min
+        self.a_max = a_max
+        self.lung_center = lung_center
+        self.lung_width = lung_width
+        self.soft_center = soft_center
+        self.soft_width = soft_width
+
     def __call__(self, data):
-        prev = data["image_prev"]
-        curr = data["image"]
-        nxt = data["image_next"]
-        data["image"] = torch.cat([prev, curr, nxt], dim=0)  # → [3, H, W]
+        # Convert raw HU inputs if needed
+        prev_hu = data["image_prev"]
+        curr_hu = data["image"]
+        next_hu = data["image_next"]
+        label_hu = data["label"]
+
+        if not isinstance(prev_hu, torch.Tensor):
+            prev_hu = torch.as_tensor(prev_hu, dtype=torch.float32)
+            curr_hu = torch.as_tensor(curr_hu, dtype=torch.float32)
+            next_hu = torch.as_tensor(next_hu, dtype=torch.float32)
+            label_hu = torch.as_tensor(label_hu, dtype=torch.float32)
+
+        # 1. Full Range Window [0, 1]
+        prev_full = torch.clamp((prev_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
+        curr_full = torch.clamp((curr_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
+        next_full = torch.clamp((next_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
+
+        # 2. Lung Window [0, 1]
+        prev_lung = apply_window_tensor(prev_hu, self.lung_center, self.lung_width)
+        curr_lung = apply_window_tensor(curr_hu, self.lung_center, self.lung_width)
+        next_lung = apply_window_tensor(next_hu, self.lung_center, self.lung_width)
+
+        # 3. Soft Tissue Window [0, 1]
+        prev_soft = apply_window_tensor(prev_hu, self.soft_center, self.soft_width)
+        curr_soft = apply_window_tensor(curr_hu, self.soft_center, self.soft_width)
+        next_soft = apply_window_tensor(next_hu, self.soft_center, self.soft_width)
+
+        # Concatenate 9 channels [9, H, W]
+        data["image"] = torch.cat([
+            prev_full, curr_full, next_full,
+            prev_lung, curr_lung, next_lung,
+            prev_soft, curr_soft, next_soft
+        ], dim=0)
+
+        # Full-dose label in Full Range HU scale [0, 1]
+        data["label"] = torch.clamp((label_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
+
         del data["image_prev"]
         del data["image_next"]
         return data
+
+
+# Alias for backward compatibility
+StackSlicesd = StackMultiWindowSlicesd
 
 
 # ═══════════════════════════════════════════
@@ -92,13 +154,7 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
         EnsureChannelFirstd(
             keys=["image_prev", "image", "image_next", "label"],
         ),
-        StackSlicesd(),
-        ScaleIntensityRanged(
-            keys=["image", "label"],
-            a_min=A_MIN, a_max=A_MAX,
-            b_min=B_MIN, b_max=B_MAX,
-            clip=True,
-        ),
+        StackMultiWindowSlicesd(),
         RandSpatialCropSamplesd(
             keys=["image", "label"],
             roi_size=spatial_size,
@@ -118,13 +174,7 @@ def get_val_transforms(spatial_size=SPATIAL_SIZE):
         EnsureChannelFirstd(
             keys=["image_prev", "image", "image_next", "label"],
         ),
-        StackSlicesd(),
-        ScaleIntensityRanged(
-            keys=["image", "label"],
-            a_min=A_MIN, a_max=A_MAX,
-            b_min=B_MIN, b_max=B_MAX,
-            clip=True,
-        ),
+        StackMultiWindowSlicesd(),
         ResizeWithPadOrCropd(
             keys=["image", "label"],
             spatial_size=spatial_size,
@@ -158,18 +208,26 @@ def prepareCT2D(
         if os.path.isdir(os.path.join(in_dir, p))
     ])
 
-    chest_patients = [p for p in all_patients if p.lower().startswith("c")]
-    abdomen_patients = [p for p in all_patients if p.lower().startswith("l")]
+    train_patients = [p for p in all_patients if p in EXPECTED_TRAIN]
+    val_patients = [p for p in all_patients if p in EXPECTED_VAL]
 
-    chest_train, chest_val = train_test_split(
-        chest_patients, test_size=SPLIT_TEST_SIZE, random_state=SPLIT_RANDOM_STATE
-    )
-    abdomen_train, abdomen_val = train_test_split(
-        abdomen_patients, test_size=SPLIT_TEST_SIZE, random_state=SPLIT_RANDOM_STATE
-    )
+    # Fallback if dataset hasn't been split explicitly yet
+    if not train_patients or not val_patients:
+        chest_patients = [p for p in all_patients if p.lower().startswith("c")]
+        abdomen_patients = [p for p in all_patients if p.lower().startswith("l")]
+        chest_train, chest_val = train_test_split(
+            chest_patients, test_size=SPLIT_TEST_SIZE, random_state=SPLIT_RANDOM_STATE
+        )
+        abdomen_train, abdomen_val = train_test_split(
+            abdomen_patients, test_size=SPLIT_TEST_SIZE, random_state=SPLIT_RANDOM_STATE
+        )
+        train_patients = chest_train + abdomen_train
+        val_patients = chest_val + abdomen_val
 
-    train_patients = chest_train + abdomen_train
-    val_patients = chest_val + abdomen_val
+    chest_train = [p for p in train_patients if p.lower().startswith("c")]
+    abdomen_train = [p for p in train_patients if p.lower().startswith("l")]
+    chest_val = [p for p in val_patients if p.lower().startswith("c")]
+    abdomen_val = [p for p in val_patients if p.lower().startswith("l")]
 
     random.shuffle(train_patients)
     random.shuffle(val_patients)

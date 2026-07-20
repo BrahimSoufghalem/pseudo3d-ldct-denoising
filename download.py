@@ -25,6 +25,7 @@ from config import (
     DATA_DIR, TEST_DIR,
     DOWNLOAD_WORKERS, COLLECTION, DOWNLOAD_TIMEOUT,
     CHUNK_SIZE, NBIA_API_URL,
+    EXPECTED_TEST, EXPECTED_VAL, EXPECTED_TRAIN,
 )
 
 
@@ -96,52 +97,41 @@ def fetch_series_info():
 # ═══════════════════════════════════════════
 def select_patients(patient_map):
     """
-    Filter patients with both doses available, sort them by file size in ascending order,
-    and distribute 100 patients (84 for training, 16 for testing) evenly between Chest and Abdomen.
+    Filter patients with both doses available and distribute the exact 100 specified patients:
+      - 90 patients (70 Train + 20 Val) to 'dataset/'
+      - 10 patients to 'test/'
     """
-    # Filter patients who have both Full and Low dose images available
     complete = {
         pid: data for pid, data in patient_map.items()
         if "Full" in data and "Low" in data
     }
     
-    # Helper function to calculate the total size of a patient's data
     def get_total_size(pid):
-        return complete[pid]["Full"]["size_mb"] + complete[pid]["Low"]["size_mb"]
+        if pid in complete:
+            return complete[pid]["Full"]["size_mb"] + complete[pid]["Low"]["size_mb"]
+        return 0.0
 
-    # Separate patients into Chest (starts with C) and Abdomen (starts with L)
-    all_chest = [pid for pid in complete.keys() if pid.upper().startswith('C')]
-    all_abdo = [pid for pid in complete.keys() if pid.upper().startswith('L')]
+    dataset_pids = sorted(list(EXPECTED_TRAIN | EXPECTED_VAL))
+    test_pids = sorted(list(EXPECTED_TEST))
+    selected_pids = dataset_pids + test_pids
 
-    # Sort both groups in ascending order by size (smallest first)
-    all_chest_sorted = sorted(all_chest, key=get_total_size)
-    all_abdo_sorted = sorted(all_abdo, key=get_total_size)
-
-    # Slice the top 50 patients from each type (Total of 100)
-    selected_chest = all_chest_sorted[:50]
-    selected_abdo = all_abdo_sorted[:50]
-
-    # Split the 50 Chest patients: 42 for training and 8 for testing
-    train_chest = selected_chest[:42]
-    test_chest = selected_chest[42:50]
-
-    # Split the 50 Abdomen patients: 42 for training and 8 for testing
-    train_abdo = selected_abdo[:42]
-    test_abdo = selected_abdo[42:50]
-
-    # Merge into the final combined lists
-    selected_pids = train_chest + test_chest + train_abdo + test_abdo
-
-    # Map each PatientID to its target destination folder
     pid_to_dest_folder = {}
-    for pid in train_chest + train_abdo:
-        pid_to_dest_folder[pid] = Path(DATA_DIR)  # dataset
-    for pid in test_chest + test_abdo:
+    for pid in dataset_pids:
+        pid_to_dest_folder[pid] = Path(DATA_DIR)  # dataset (train + val)
+    for pid in test_pids:
         pid_to_dest_folder[pid] = Path(TEST_DIR)  # test
 
-    print(f"✅  Distribution Strategy Status:")
-    print(f"    - Training (dataset): {len(train_chest)} Chest + {len(train_abdo)} Abdomen = {len(train_chest)+len(train_abdo)} Patients.")
-    print(f"    - Testing (test)    : {len(test_chest)} Chest + {len(test_abdo)} Abdomen = {len(test_chest)+len(test_abdo)} Patients.")
+    train_chest = [p for p in EXPECTED_TRAIN if p.startswith('C')]
+    train_abdo = [p for p in EXPECTED_TRAIN if p.startswith('L')]
+    val_chest = [p for p in EXPECTED_VAL if p.startswith('C')]
+    val_abdo = [p for p in EXPECTED_VAL if p.startswith('L')]
+    test_chest = [p for p in EXPECTED_TEST if p.startswith('C')]
+    test_abdo = [p for p in EXPECTED_TEST if p.startswith('L')]
+
+    print(f"✅  Explicit Distribution Strategy Status:")
+    print(f"    - Dataset (train)   : {len(train_chest)} Chest + {len(train_abdo)} Abdomen = {len(EXPECTED_TRAIN)} Patients.")
+    print(f"    - Dataset (val)     : {len(val_chest)} Chest + {len(val_abdo)} Abdomen = {len(EXPECTED_VAL)} Patients.")
+    print(f"    - Testing (test)    : {len(test_chest)} Chest + {len(test_abdo)} Abdomen = {len(EXPECTED_TEST)} Patients.")
 
     total_est_mb = sum(get_total_size(p) for p in selected_pids)
     print(f"\n📊 Total Target: {len(selected_pids)} patients (~{total_est_mb:.0f} MB estimated)\n", flush=True)

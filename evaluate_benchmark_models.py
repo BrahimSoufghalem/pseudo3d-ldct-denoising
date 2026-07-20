@@ -31,8 +31,10 @@ import pydicom
 from config import (
     TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     BENCHMARK_MODELS_LIST, A_MIN, A_MAX,
+    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
+    WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number
+from utils import setup_reproducibility, get_device, sort_by_instance_number, build_multi_window_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
@@ -162,13 +164,15 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
         low_next_hu = torch.from_numpy(load_dicom_raw_hu_offset(low_imgs[next_i]) - 1024.0)
         full_curr_hu = torch.from_numpy(load_dicom_raw_hu_offset(full_imgs[i]) - 1024.0)
 
-        t_prev = hu_offset_to_user_norm(low_prev_hu + 1024.0)
-        t_curr = hu_offset_to_user_norm(low_curr_hu + 1024.0)
-        t_next = hu_offset_to_user_norm(low_next_hu + 1024.0)
-        t_full = hu_offset_to_user_norm(full_curr_hu + 1024.0)
+        # Build 9-channel Multi-Window input [1, 9, H, W]
+        inp = build_multi_window_input(
+            low_prev_hu, low_curr_hu, low_next_hu,
+            a_min=A_MIN, a_max=A_MAX,
+            lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
+            soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH
+        ).to(device)
 
-        inp = torch.stack([t_prev, t_curr, t_next], dim=0).unsqueeze(0).to(device)
-        lbl = t_full.unsqueeze(0).unsqueeze(0).to(device)
+        lbl = hu_offset_to_user_norm(full_curr_hu + 1024.0).unsqueeze(0).unsqueeze(0).to(device)
         mid = inp[:, 1:2, :, :]
 
         with autocast():

@@ -17,8 +17,12 @@ from pydicom.uid import generate_uid
 from tqdm import tqdm
 from torch.cuda.amp import autocast
 
-from config import TEST_DIR, BEST_MODEL_PATH, A_MIN, A_MAX
-from utils import setup_reproducibility, get_device, sort_by_instance_number
+from config import (
+    TEST_DIR, BEST_MODEL_PATH, A_MIN, A_MAX,
+    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
+    WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
+)
+from utils import setup_reproducibility, get_device, sort_by_instance_number, build_multi_window_input
 from model import build_model
 
 
@@ -121,14 +125,19 @@ def process_patient(pid, patient_dir, output_dir, model, device):
         prev_i = max(i - 1, 0)
         next_i = min(i + 1, n - 1)
 
-        # Load and normalize slices
-        t_prev = normalize(load_dicom_tensor(low_imgs[prev_i]))
-        t_curr = normalize(load_dicom_tensor(low_imgs[i]))
-        t_next = normalize(load_dicom_tensor(low_imgs[next_i]))
+        # Load raw HU slice tensors
+        raw_prev = load_dicom_tensor(low_imgs[prev_i])
+        raw_curr = load_dicom_tensor(low_imgs[i])
+        raw_next = load_dicom_tensor(low_imgs[next_i])
 
-        # Prepare input for the model [1, 3, H, W]
-        inp = torch.stack([t_prev, t_curr, t_next], dim=0).unsqueeze(0).to(device)
-        mid = inp[:, 1:2, :, :]
+        # Prepare 9-channel Multi-Window input for the model [1, 9, H, W]
+        inp = build_multi_window_input(
+            raw_prev, raw_curr, raw_next,
+            a_min=A_MIN, a_max=A_MAX,
+            lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
+            soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH
+        ).to(device)
+        mid = inp[:, 1:2, :, :]                              # current slice in full HU range [0, 1]
 
         # Apply model to get the enhanced slice (output is between 0 and 1)
         with autocast():
