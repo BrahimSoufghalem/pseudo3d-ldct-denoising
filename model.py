@@ -48,12 +48,17 @@ class MultiWindowWaveletUNet(nn.Module):
             bottleneck_channels = channels[-1]  # 512
             self.wavelet_attn = WaveletHFAttention(bottleneck_channels)
 
-            # Integrate Wavelet High-Frequency Attention at MONAI UNet bottleneck layer
-            orig_bottleneck = self.unet.model[1]
-            self.unet.model[1] = nn.Sequential(
-                orig_bottleneck,
-                self.wavelet_attn,
-            )
+            # Traversal to the deepest bottleneck inside MONAI UNet SkipConnection structure
+            sub = self.unet.model[1]
+            for _ in range(len(channels) - 2):
+                if hasattr(sub, "submodule") and isinstance(sub.submodule, nn.Sequential) and len(sub.submodule) > 1:
+                    sub = sub.submodule[1]
+
+            if hasattr(sub, "submodule"):
+                sub.submodule = nn.Sequential(
+                    sub.submodule,
+                    self.wavelet_attn,
+                )
 
     def forward(self, x):
         return self.unet(x)
