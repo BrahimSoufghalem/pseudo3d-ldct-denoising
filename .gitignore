@@ -40,3 +40,4 @@ logs/
 *.swp
 .DS_Store
 Thumbs.db
+reorganize_dataset.py

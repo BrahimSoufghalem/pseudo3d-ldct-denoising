@@ -68,6 +68,7 @@ CHANNELS = (32, 64, 128, 256, 512)
 STRIDES = (2, 2, 2, 2)
 NUM_RES_UNITS = 2
 DROPOUT = 0.1
+USE_WAVELET = True    # Enable High-Frequency Wavelet Attention at Bottleneck
 
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
