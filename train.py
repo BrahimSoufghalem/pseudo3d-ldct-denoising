@@ -20,12 +20,17 @@ from config import (
     PATIENCE, GRAD_CLIP_MAX_NORM,
     LAMBDA_L1, LAMBDA_SSIM, LAMBDA_PERC, LAMBDA_EDGE,
     SCHEDULER_MODE, SCHEDULER_FACTOR, SCHEDULER_PATIENCE, SCHEDULER_MIN_LR,
+    A_MIN, A_MAX,
 )
 from utils import setup_reproducibility, get_device
 from dataset import prepareCT2D
 from model import build_model
 from losses import MONAIHybridLoss
-from metrics import psnr, rmse, VIFMetric
+from metrics import (
+    compute_psnr_windowed, compute_ssim_windowed,
+    compute_rmse_hu, compute_vif_hu,
+    denormalize_to_hu_offset, psnr, rmse, VIFMetric
+)
 
 
 # ═══════════════════════════════════════════
@@ -80,21 +85,22 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 @torch.no_grad()
 def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, device, epoch, total_epochs):
     """
-    Run one validation epoch.
+    Run one validation epoch using exact ldct-benchmark physical HU metrics.
     Returns a dict containing all averaged metrics and visualization tensors.
     """
     model.eval()
     val_loss = 0.0
     val_psnr_sum = 0.0
+    val_ssim_sum = 0.0
     val_rmse_sum = 0.0
+    val_vif_sum = 0.0
     baseline_psnr_sum = 0.0
+    total_samples = 0
 
     psnr_chest, psnr_abd = [], []
     ssim_chest, ssim_abd = [], []
     vif_chest, vif_abd = [], []
 
-    ssim_metric.reset()
-    vif_metric.reset()
     viz_images = None
 
     val_bar = tqdm(
@@ -116,41 +122,39 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
             loss, _ = loss_fn(pred_res, residual_target)
 
         val_loss += loss.item()
-
-        p = psnr(preds.float(), labels.float()).item()
-        val_psnr_sum += p
-        val_rmse_sum += rmse(preds.float(), labels.float()).item()
-        baseline_psnr_sum += psnr(mid_slice.float(), labels.float()).item()
-
-        ssim_metric(preds.float(), labels.float())
-        vif_metric.update(preds.float(), labels.float())
-
-        # Per-body-type metrics
         body_types = batch.get("body_type", None)
-        if body_types is not None:
-            for b_idx in range(preds.shape[0]):
-                p_b = preds[b_idx:b_idx + 1].float()
-                l_b = labels[b_idx:b_idx + 1].float()
-                bt = body_types[b_idx] if isinstance(body_types, (list, tuple)) else body_types
 
-                p_val = psnr(p_b, l_b).item()
+        for b_idx in range(preds.shape[0]):
+            pred_hu = denormalize_to_hu_offset(preds[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
+            lbl_hu = denormalize_to_hu_offset(labels[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
+            mid_hu = denormalize_to_hu_offset(mid_slice[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
 
-                ssim_single = SSIMMetric(spatial_dims=2, data_range=1.0, reduction="mean")
-                ssim_single(p_b, l_b)
-                s_val = ssim_single.aggregate().item()
+            bt = "Abdomen"
+            if body_types is not None:
+                bt_raw = body_types[b_idx] if isinstance(body_types, (list, tuple)) else body_types
+                bt = "Chest" if str(bt_raw).lower().startswith("c") else "Abdomen"
 
-                vif_single = VIFMetric(device=device)
-                vif_single.update(p_b, l_b)
-                v_val = vif_single.aggregate()
+            p_val = compute_psnr_windowed(pred_hu, lbl_hu, bt)
+            b_val = compute_psnr_windowed(mid_hu, lbl_hu, bt)
+            s_val = compute_ssim_windowed(pred_hu, lbl_hu, bt)
+            r_val = compute_rmse_hu(pred_hu, lbl_hu)
+            v_val = compute_vif_hu(pred_hu, lbl_hu)
 
-                if str(bt).lower().startswith("c"):
-                    psnr_chest.append(p_val)
-                    ssim_chest.append(s_val)
-                    vif_chest.append(v_val)
-                else:
-                    psnr_abd.append(p_val)
-                    ssim_abd.append(s_val)
-                    vif_abd.append(v_val)
+            val_psnr_sum += p_val
+            baseline_psnr_sum += b_val
+            val_ssim_sum += s_val
+            val_rmse_sum += r_val
+            val_vif_sum += v_val
+            total_samples += 1
+
+            if bt == "Chest":
+                psnr_chest.append(p_val)
+                ssim_chest.append(s_val)
+                vif_chest.append(v_val)
+            else:
+                psnr_abd.append(p_val)
+                ssim_abd.append(s_val)
+                vif_abd.append(v_val)
 
         if i == 0:
             viz_images = (
@@ -162,14 +166,15 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
         val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
     n_val = max(1, len(val_loader))
+    n_samples = max(1, total_samples)
 
     return {
         "avg_val": val_loss / n_val,
-        "avg_psnr": val_psnr_sum / n_val,
-        "avg_rmse": val_rmse_sum / n_val,
-        "avg_baseline": baseline_psnr_sum / n_val,
-        "avg_ssim": ssim_metric.aggregate().item(),
-        "avg_vif": vif_metric.aggregate(),
+        "avg_psnr": val_psnr_sum / n_samples,
+        "avg_rmse": val_rmse_sum / n_samples,
+        "avg_baseline": baseline_psnr_sum / n_samples,
+        "avg_ssim": val_ssim_sum / n_samples,
+        "avg_vif": val_vif_sum / n_samples,
         "avg_psnr_chest": sum(psnr_chest) / max(1, len(psnr_chest)),
         "avg_psnr_abd": sum(psnr_abd) / max(1, len(psnr_abd)),
         "avg_ssim_chest": sum(ssim_chest) / max(1, len(ssim_chest)),
