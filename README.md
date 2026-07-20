@@ -34,7 +34,8 @@ A comprehensive, modular deep learning pipeline built with <b>PyTorch</b> and <b
 - **Pseudo-3D (2.5D) Architecture** — Instead of processing independent 2D slices, the pipeline stacks three consecutive slices (`prev`, `curr`, `next`) into a single 3-channel input. The model predicts the **noise residual** of the central slice, preserving crucial inter-slice anatomical context.
 - **Custom NBIA Downloader** — Automated, multi-threaded dataset downloader fetching data directly from The Cancer Imaging Archive (TCIA). Features resume-support, progress tracking, and selects exactly 100 hardcoded patients stratified by anatomy (Chest / Abdomen).
 - **Advanced Hybrid Loss Function** — A meticulously tuned combination of **L1 Loss** (pixel accuracy), **SSIM Loss** (structural similarity), **VGG-19 Perceptual Loss** (high-level feature preservation), and **Sobel Edge Loss** (boundary sharpness).
-- **Full-Resolution Evaluation** — The evaluation script tests the model on the *full, unaltered original DICOM resolution* without cropping or padding, yielding clinically meaningful metrics.
+- **Full-Resolution Evaluation & Benchmark Alignment** — Metrics follow the international `ldct-benchmark` physical standard: RMSE in Hounsfield Units (HU), and PSNR/SSIM after anatomy-specific clinical windowing (Lung Window for Chest, Soft Tissue Window for Abdomen).
+- **Benchmarking Against 7 SOTA Models** — Ships with `evaluate_benchmark_models.py` to evaluate your model alongside RED-CNN, WGAN-VGG, DU-GAN, TransCT, QAE, ResNet, and CNN10 on the exact same test dataset.
 - **Automatic Mixed Precision (AMP)** — Optimized training loop using PyTorch `autocast` and `GradScaler` for faster compute and reduced memory footprint.
 - **Pre-trained Weights Included** — The repository ships with `best_model.pt` so you can run evaluation and inference immediately — no training required.
 - **PACS-Ready DICOM Export** — `inference_dicom.py` reverses HU normalization and copies all original patient metadata, producing output files that can be directly ingested by clinical PACS systems.
@@ -54,7 +55,8 @@ pseudo3d-ldct-denoising/
 ├── config.py              # Centralized hyperparameter, paths, and constants registry
 ├── dataset.py             # Pseudo-3D data pipeline (MONAI transforms, dataloaders)
 ├── download.py            # Parallel NBIA dataset downloader with size estimation & resume
-├── evaluate.py            # Full-resolution testing, metric calculation (VIF, RMSE), and visualizations
+├── evaluate.py            # Full-resolution testing & ldct-benchmark physical metric report
+├── evaluate_benchmark_models.py # Comparative evaluation against 7 pretrained SOTA models (ldct-benchmark)
 ├── inference_dicom.py     # End-to-end inference & PACS-ready DICOM export script
 ├── losses.py              # MONAI Hybrid Loss (L1 + SSIM + VGG19 Perceptual + Sobel Edge)
 ├── metrics.py             # Evaluation metrics including TorchMetrics VisualInformationFidelity
@@ -138,11 +140,14 @@ tensorboard --logdir FinalCT_2.5D-UNET-DATASET/logs
 
 Training uses `ReduceLROnPlateau` scheduling, gradient clipping, and logs losses and sample images to TensorBoard in real time.
 
-### 3. Evaluation
+### 3. Evaluation & SOTA Model Benchmarking
 
 ```bash
-python evaluate.py              # Generate CSV metrics report
+python evaluate.py              # Generate CSV metrics report for Pseudo-3D UNet
 python evaluate.py --save-images  # Also save LDCT | Denoised | NDCT comparisons
+
+# Compare Pseudo-3D UNet against 7 pretrained SOTA models (RED-CNN, WGAN-VGG, TransCT, etc.)
+python evaluate_benchmark_models.py
 ```
 
 ### 4. Inference & DICOM Export
@@ -322,11 +327,11 @@ Note: This abdominal slice is extracted from a Chest (C) patient scan acquired a
 
 | Metric | Direction | Description |
 |---|---|---|
-| **PSNR** | ↑ Higher is better | Peak Signal-to-Noise Ratio — overall fidelity |
-| **ΔPSNR** | ↑ Higher is better | Net gain over the raw LDCT baseline |
-| **SSIM** | ↑ Higher is better | Structural Similarity — luminance, contrast, structure |
-| **RMSE** | ↓ Lower is better | Root Mean Squared Error — pixel-level deviation |
-| **VIF** | ↑ Higher is better | Visual Information Fidelity — sensitive to fine clinical details |
+| **PSNR** | ↑ Higher is better | Peak Signal-to-Noise Ratio — evaluated on clinical diagnostic windows ($C/W$) |
+| **ΔPSNR** | ↑ Higher is better | Net gain over raw LDCT baseline |
+| **SSIM** | ↑ Higher is better | Structural Similarity — evaluated on clinical diagnostic windows ($C/W$) |
+| **RMSE (HU)** | ↓ Lower is better | Root Mean Squared Error — measured in physical Hounsfield Units ($\text{HU}$) |
+| **VIF** | ↑ Higher is better | Visual Information Fidelity — sensitive to fine clinical details on HU scale |
 
 ---
 
