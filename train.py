@@ -112,6 +112,7 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
     for i, batch in enumerate(val_bar):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
+        mid_slice = images[:, 1:2, :, :]
 
         with autocast("cuda"):
             pred_res = model(images)
