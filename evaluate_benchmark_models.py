@@ -172,8 +172,7 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
         mid = inp[:, 1:2, :, :]
 
         with autocast():
-            pred_res = user_model(inp)
-            pred = torch.clamp(mid + pred_res, 0.0, 1.0)
+            pred = user_model(inp)
 
         pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
         lbl_hu_offset  = denormalize_to_hu_offset(lbl.squeeze(),  A_MIN, A_MAX)

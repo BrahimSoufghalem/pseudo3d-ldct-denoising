@@ -1,15 +1,14 @@
 """
 LDCT Project — Model Definition (MS-NAFMambaNet)
 =================================================
-Multi-Scale Non-Linear Activation-Free Mamba Network (MS-NAFMambaNet).
-Combines NAF-Blocks, Anatomy-Guided Attention Gates on Skip Connections,
-a 2D Selective State-Space Bottleneck (Mamba 2D-SSM), and Multi-Scale Spatial Fusion.
+Multi-Scale Non-Linear Activation-Free Mamba Network (MS-NAFMambaNet)
+with Mathematically Rigorous 4-Way Selective Scan S6 and Self-Contained Output.
 
 Supports 4 Modular Ablation Modes via `mamba_mode`:
-  1. "basic"      : NAF-Encoder + Anatomy AG Skips + Single Mamba (1/16) + NAF-Decoder
+  1. "basic"      : NAF-Encoder + Multiplicative AG Skips + SS2D Mamba (1/16) + NAF-Decoder
   2. "residual"   : Stage 1 + Residual Dual-Mamba Bottleneck (Mamba -> Add -> Mamba)
-  3. "multiscale" : Stage 1 + Multi-Scale Spatial Fusion (1/16 <-> 1/8)
-  4. "full"       : Full MS-NAFMambaNet (Dual-Mamba + Multi-Scale Fusion + AG Skips)
+  3. "multiscale" : Stage 1 + Adaptive Gated Multi-Scale Fusion (1/16 <-> 1/8)
+  4. "full"       : Full MS-NAFMambaNet (Dual-Mamba + Adaptive Gated Fusion + AG Skips)
 """
 
 import torch
@@ -19,7 +18,7 @@ import torch.nn.functional as F
 from config import IN_CHANNELS, OUT_CHANNELS, CHANNELS, DROPOUT, MAMBA_MODE
 from naf_mamba_blocks import (
     LayerNorm2d, NAFBlock, AnatomyAttentionGate2D,
-    Mamba2DSSM, ResidualMambaBottleneck, MultiScaleSpatialFusion
+    Mamba2DSSM, ResidualMambaBottleneck, AdaptiveGatedFusion
 )
 
 
@@ -56,21 +55,21 @@ class MSNAFMambaNet(nn.Module):
         self.enc4 = NAFBlock(c4, drop_out=dropout)
         self.down4 = nn.Conv2d(c4, c5, kernel_size=2, stride=2)
 
-        # ── 3. Anatomy Attention Gates for Skip Connections ──
+        # ── 3. Multiplicative Residual Anatomy Attention Gates ──
         self.ag1 = AnatomyAttentionGate2D(gate_channels=c2, skip_channels=c1)
         self.ag2 = AnatomyAttentionGate2D(gate_channels=c3, skip_channels=c2)
         self.ag3 = AnatomyAttentionGate2D(gate_channels=c4, skip_channels=c3)
         self.ag4 = AnatomyAttentionGate2D(gate_channels=c5, skip_channels=c4)
 
-        # ── 4. Selective State-Space Bottleneck (1/16 Resolution) ──
+        # ── 4. True Selective State-Space Bottleneck (1/16 Resolution) ──
         if self.mamba_mode in ["residual", "full"]:
             self.bottleneck = ResidualMambaBottleneck(c5)
         else:
             self.bottleneck = Mamba2DSSM(c5)
 
-        # ── 5. Multi-Scale Spatial-State Space Fusion (1/16 <-> 1/8) ──
+        # ── 5. Adaptive Gated Spatial-State Space Fusion (1/16 <-> 1/8) ──
         if self.mamba_mode in ["multiscale", "full"]:
-            self.ms_fusion = MultiScaleSpatialFusion(low_res_channels=c5, high_res_channels=c4)
+            self.ms_fusion = AdaptiveGatedFusion(low_res_channels=c5, high_res_channels=c4)
         else:
             self.ms_fusion = None
 
@@ -87,13 +86,16 @@ class MSNAFMambaNet(nn.Module):
         self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
         self.dec1 = NAFBlock(c1, drop_out=dropout)
 
-        # ── 7. Final Residual Output Projection ──
+        # ── 7. Final Output Projection ──
         self.final_conv = nn.Sequential(
             LayerNorm2d(c1),
             nn.Conv2d(c1, out_channels, kernel_size=3, padding=1),
         )
 
     def forward(self, x):
+        # Extract central input slice for residual reconstruction
+        mid_slice = x[:, 1:2, :, :] if x.shape[1] >= 3 else x[:, 0:1, :, :]
+
         # Initial Embedding
         x_in = self.init_conv(x)  # [B, 32, H, W]
 
@@ -121,7 +123,7 @@ class MSNAFMambaNet(nn.Module):
         u4 = self.up4(b_feat) + g4
         d4_out = self.dec4(u4)    # [B, 256, H/8, W/8]
 
-        # Multi-Scale Fusion (Stage 3/4)
+        # Adaptive Gated Multi-Scale Fusion (Stage 3/4)
         if self.ms_fusion is not None:
             d4_out = self.ms_fusion(b_feat, d4_out)
 
@@ -140,9 +142,10 @@ class MSNAFMambaNet(nn.Module):
         u1 = self.up1(d2_out) + g1
         d1_out = self.dec1(u1)    # [B, 32, H, W]
 
-        # Final Predicted Residual Map
+        # Predicted Noise Residual + Central Input Slice -> Self-Contained Output
         out_res = self.final_conv(d1_out)
-        return out_res
+        pred_img = torch.clamp(mid_slice + out_res, 0.0, 1.0)
+        return pred_img
 
 
 def build_model(device, mamba_mode=MAMBA_MODE):

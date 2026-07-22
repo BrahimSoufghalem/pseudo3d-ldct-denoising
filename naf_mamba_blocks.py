@@ -1,13 +1,13 @@
 """
-LDCT Project — NAF & Mamba Architectural Blocks
-=================================================
-Pure PyTorch implementation of:
+LDCT Project — Mathematically Rigorous NAF & Mamba Architectural Blocks
+=========================================================================
+Implementation aligned with official literature (Mamba/VMamba/MedMamba & NAFNet CVPR 2022):
 1. SimpleGate & Simplified Channel Attention (SCA)
 2. Non-Linear Activation-Free Residual Blocks (NAFBlock)
-3. Anatomy-Guided Attention Gates (AnatomyAttentionGate2D)
-4. 2D Selective State-Space Bottleneck (Mamba2DSSM)
-5. Residual Mamba Bottleneck (ResidualMambaBottleneck)
-6. Multi-Scale Spatial-State Space Fusion (MultiScaleSpatialFusion)
+3. Multiplicative Residual Anatomy Attention Gates (AnatomyAttentionGate2D)
+4. True 4-Way 2D Selective State-Space Scan (SS2DSelectScan & Mamba2DSSM)
+5. Residual Mamba Bottleneck with Explicit Skips (ResidualMambaBottleneck)
+6. Adaptive Gated Spatial-State Space Fusion (AdaptiveGatedFusion)
 """
 
 import math
@@ -35,7 +35,7 @@ class LayerNorm2d(nn.Module):
 
 
 # ═══════════════════════════════════════════
-# 2. SIMPLE GATE & SIMPLIFIED CHANNEL ATTENTION (NAF)
+# 2. SIMPLE GATE & SIMPLIFIED CHANNEL ATTENTION (NAFNet CVPR 2022)
 # ═══════════════════════════════════════════
 class SimpleGate(nn.Module):
     """
@@ -64,8 +64,8 @@ class SimplifiedChannelAttention(nn.Module):
 # ═══════════════════════════════════════════
 class NAFBlock(nn.Module):
     """
-    Activation-Free Residual Block for high-precision CT feature extraction.
-    Combines Depthwise Convolution, SimpleGate, and Simplified Channel Attention.
+    Exact NAFNet Residual Block (Chen et al. CVPR 2022).
+    Combines Depthwise Convolution, SimpleGate, SCA, and learnable scale factors (beta, gamma).
     """
     def __init__(self, channels, drop_out=0.0):
         super().__init__()
@@ -84,7 +84,7 @@ class NAFBlock(nn.Module):
 
         self.dropout = nn.Dropout(drop_out) if drop_out > 0.0 else nn.Identity()
 
-        # Learnable scale factors for residual paths
+        # Learnable scale parameters for residual stability
         self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
@@ -109,12 +109,12 @@ class NAFBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════
-# 4. ANATOMY ATTENTION GATE (For Skip Connections)
+# 4. MULTIPLICATIVE RESIDUAL ANATOMY ATTENTION GATE
 # ═══════════════════════════════════════════
 class AnatomyAttentionGate2D(nn.Module):
     """
-    Filters low-level encoder features using high-level decoder context.
-    Suppresses quantum noise while preserving true anatomical structures.
+    Multiplicative Residual Attention Gate: Output = x * (1 + AttnMask).
+    Ensures 100% preservation of structural features even when attention is small.
     """
     def __init__(self, gate_channels, skip_channels, inter_channels=None):
         super().__init__()
@@ -136,43 +136,122 @@ class AnatomyAttentionGate2D(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, g, x):
-        # Upsample gate context if spatial resolutions differ
         if g.shape[2:] != x.shape[2:]:
             g = F.interpolate(g, size=x.shape[2:], mode="bilinear", align_corners=False)
 
         g1 = self.w_g(g)
         x1 = self.w_x(x)
         attn = self.psi(self.relu(g1 + x1))
-        return x * attn
+        # Multiplicative residual bypass: prevents signal drop
+        return x * (1.0 + attn)
 
 
 # ═══════════════════════════════════════════
-# 5. MAMBA 2D SELECTIVE STATE-SPACE MODEL (2D-SSM)
+# 5. TRUE 4-WAY 2D SELECTIVE STATE-SPACE SCAN (SS2D / S6)
 # ═══════════════════════════════════════════
-class Mamba2DSSM(nn.Module):
+class SS2DSelectScan(nn.Module):
     """
-    Pure PyTorch 2D Selective State-Space Bottleneck.
-    Performs bidirectional horizontal and vertical spatial scanning to model
-    long-range dependencies and eliminate streak artifacts in CT scans.
+    Pure PyTorch 4-Way 2D Selective State-Space Scan (SS2D / S6).
+    Discretizes state space parameters via Softplus:
+        Delta = Softplus(Linear(x))
+        A_bar = exp(Delta * A), B_bar = Delta * B(x)
+    Scans 2D feature maps along 4 spatial directions to eliminate streak artifacts.
     """
     def __init__(self, channels, d_state=16):
         super().__init__()
         self.channels = channels
         self.d_state = d_state
 
-        self.norm = LayerNorm2d(channels)
-        self.in_proj = nn.Conv2d(channels, channels * 2, kernel_size=1)
-
-        # Depthwise 2D Conv for local context
-        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
-
-        # State Space Projection Matrices
-        self.x_proj = nn.Conv2d(channels, d_state * 2, kernel_size=1)
+        # Projections for Selective Parameters (Delta, B, C)
+        self.x_proj = nn.Conv2d(channels, (d_state * 2 + channels), kernel_size=1)
         self.dt_proj = nn.Conv2d(channels, channels, kernel_size=1)
 
-        # State decay parameter
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32).repeat(channels, 1)))
+        # State matrix A initialization
+        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(channels, 1)
+        self.A_log = nn.Parameter(torch.log(A_init))
 
+        # 4 directional output fusion
+        self.out_fusion = nn.Conv2d(channels * 4, channels, kernel_size=1)
+
+    def _selective_scan_1d(self, x_seq, delta_seq, B_seq, C_seq):
+        """
+        Recurrent 1D Selective Scan:
+        h_t = A_bar * h_{t-1} + B_bar * x_t
+        y_t = C_t * h_t
+        """
+        b, c, l = x_seq.shape
+        A = -torch.exp(self.A_log).view(1, c, self.d_state, 1)  # [1, C, N, 1]
+
+        delta = F.softplus(delta_seq).unsqueeze(2)              # [B, C, 1, L]
+        A_bar = torch.exp(A * delta)                             # [B, C, N, L]
+        B_bar = delta * B_seq.unsqueeze(1)                       # [B, C, N, L]
+
+        # Recurrent state accumulation over sequence
+        h = torch.zeros(b, c, self.d_state, device=x_seq.device)
+        ys = []
+        for t in range(l):
+            h = A_bar[:, :, :, t] * h + B_bar[:, :, :, t] * x_seq[:, :, t:t+1]
+            C_t = C_seq[:, :, t].unsqueeze(1)                   # [B, 1, N]
+            y_t = (h * C_t).sum(dim=-1)                         # [B, C]
+            ys.append(y_t)
+
+        return torch.stack(ys, dim=-1)  # [B, C, L]
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        # Compute Selective Parameters
+        dt = self.dt_proj(x)
+        proj = self.x_proj(x)
+        B_proj, C_proj, _ = proj.split([self.d_state, self.d_state, c], dim=1)
+
+        # 4 Directional Scans:
+        # 1. Forward Horizontal
+        x_s1 = x.view(b, c, h * w)
+        dt_s1 = dt.view(b, c, h * w)
+        B_s1 = B_proj.view(b, self.d_state, h * w)
+        C_s1 = C_proj.view(b, self.d_state, h * w)
+        y1 = self._selective_scan_1d(x_s1, dt_s1, B_s1, C_s1).view(b, c, h, w)
+
+        # 2. Backward Horizontal
+        x_s2 = torch.flip(x, dims=[-1]).view(b, c, h * w)
+        dt_s2 = torch.flip(dt, dims=[-1]).view(b, c, h * w)
+        B_s2 = torch.flip(B_proj, dims=[-1]).view(b, self.d_state, h * w)
+        C_s2 = torch.flip(C_proj, dims=[-1]).view(b, self.d_state, h * w)
+        y2 = torch.flip(self._selective_scan_1d(x_s2, dt_s2, B_s2, C_s2).view(b, c, h, w), dims=[-1])
+
+        # 3. Forward Vertical
+        x_trans = x.transpose(-2, -1)
+        x_s3 = x_trans.reshape(b, c, h * w)
+        dt_s3 = dt.transpose(-2, -1).reshape(b, c, h * w)
+        B_s3 = B_proj.transpose(-2, -1).reshape(b, self.d_state, h * w)
+        C_s3 = C_proj.transpose(-2, -1).reshape(b, self.d_state, h * w)
+        y3 = self._selective_scan_1d(x_s3, dt_s3, B_s3, C_s3).view(b, c, w, h).transpose(-2, -1)
+
+        # 4. Backward Vertical
+        x_vflip = torch.flip(x_trans, dims=[-1])
+        x_s4 = x_vflip.reshape(b, c, h * w)
+        dt_s4 = torch.flip(dt.transpose(-2, -1), dims=[-1]).reshape(b, c, h * w)
+        B_s4 = torch.flip(B_proj.transpose(-2, -1), dims=[-1]).reshape(b, self.d_state, h * w)
+        C_s4 = torch.flip(C_proj.transpose(-2, -1), dims=[-1]).reshape(b, self.d_state, h * w)
+        y4_rec = self._selective_scan_1d(x_s4, dt_s4, B_s4, C_s4).view(b, c, w, h)
+        y4 = torch.flip(y4_rec, dims=[-1]).transpose(-2, -1)
+
+        # Combine 4 directional scan representations
+        y_concat = torch.cat([y1, y2, y3, y4], dim=1)
+        return self.out_fusion(y_concat)
+
+
+class Mamba2DSSM(nn.Module):
+    """
+    2D Selective State-Space Bottleneck Layer using SS2DSelectScan.
+    """
+    def __init__(self, channels, d_state=16):
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.in_proj = nn.Conv2d(channels, channels * 2, kernel_size=1)
+        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
+        self.ss2d = SS2DSelectScan(channels, d_state=d_state)
         self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
         self.sg = SimpleGate()
 
@@ -182,29 +261,18 @@ class Mamba2DSSM(nn.Module):
         proj = self.in_proj(x_norm)
         x_p, z_p = proj.chunk(2, dim=1)
 
-        # Local depthwise convolution
         x_p = self.dw_conv(x_p)
+        y_ssm = self.ss2d(x_p)
+        out = self.out_proj(y_ssm * torch.sigmoid(z_p))
 
-        # 2D Bidirectional Spatial State-Space Scanning
-        b, c, h, w = x_p.shape
-        dt = torch.sigmoid(self.dt_proj(x_p))
-        dt_x = x_p * dt
-
-        # State update along horizontal & vertical directions
-        A = -torch.exp(self.A_log).view(c, self.d_state, 1, 1)
-        decay = torch.exp(A * dt.unsqueeze(2))  # [B, C, d_state, H, W]
-
-        # Gated state aggregation
-        state = decay.mean(dim=2) * dt_x
-        y = self.out_proj(state * torch.sigmoid(z_p))
-
-        return res + y
+        return res + out
 
 
 class ResidualMambaBottleneck(nn.Module):
     """
-    Dual Mamba 2D-SSM block with residual connection:
-    Mamba Block 1 -> Residual Add -> Mamba Block 2.
+    Dual Mamba 2D-SSM bottleneck with explicit residual skips:
+    h1 = Mamba1(x) + x
+    out = Mamba2(h1) + h1
     """
     def __init__(self, channels):
         super().__init__()
@@ -212,17 +280,20 @@ class ResidualMambaBottleneck(nn.Module):
         self.mamba2 = Mamba2DSSM(channels)
 
     def forward(self, x):
-        h = self.mamba1(x)
-        out = self.mamba2(h)
+        h1 = self.mamba1(x) + x
+        out = self.mamba2(h1) + h1
         return out
 
 
 # ═══════════════════════════════════════════
-# 6. MULTI-SCALE SPATIAL-STATE SPACE FUSION
+# 6. ADAPTIVE GATED MULTI-SCALE SPATIAL-STATE FUSION
 # ═══════════════════════════════════════════
-class MultiScaleSpatialFusion(nn.Module):
+class AdaptiveGatedFusion(nn.Module):
     """
-    Fuses upsampled 1/16 Mamba bottleneck features with 1/8 NAF spatial features.
+    Adaptive Gated Spatial-State Space Fusion:
+        alpha = Sigmoid(Conv1x1(Concat(F_1/16_up, F_1/8)))
+        Fused = alpha * F_1/16_up + (1 - alpha) * F_1/8
+    Dynamically balances global state-space context with high-resolution spatial details.
     """
     def __init__(self, low_res_channels, high_res_channels):
         super().__init__()
@@ -231,8 +302,16 @@ class MultiScaleSpatialFusion(nn.Module):
             nn.Conv2d(low_res_channels, high_res_channels, kernel_size=1),
             LayerNorm2d(high_res_channels),
         )
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(high_res_channels * 2, high_res_channels, kernel_size=3, padding=1),
+
+        # Dynamic gating generator
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(high_res_channels * 2, high_res_channels, kernel_size=1),
+            LayerNorm2d(high_res_channels),
+            nn.Sigmoid(),
+        )
+
+        self.refine_conv = nn.Sequential(
+            nn.Conv2d(high_res_channels, high_res_channels, kernel_size=3, padding=1),
             LayerNorm2d(high_res_channels),
             SimplifiedChannelAttention(high_res_channels),
         )
@@ -243,4 +322,8 @@ class MultiScaleSpatialFusion(nn.Module):
             low_res_up = F.interpolate(low_res_up, size=high_res_feat.shape[2:], mode="bilinear", align_corners=False)
 
         cat_feat = torch.cat([low_res_up, high_res_feat], dim=1)
-        return self.fusion_conv(cat_feat)
+        alpha = self.gate_conv(cat_feat)
+
+        # Convex combination of low-res global state-space and high-res spatial features
+        fused = alpha * low_res_up + (1.0 - alpha) * high_res_feat
+        return self.refine_conv(fused)
