@@ -62,13 +62,12 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 # ═══════════════════════════════════════════
 # MODEL ARCHITECTURE
 # ═══════════════════════════════════════════
-IN_CHANNELS = 9       # Multi-Window Pseudo-3D: (prev, curr, next) x (Full, Lung, Soft)
+IN_CHANNELS = 3       # Standard Pseudo-3D (2.5D): (prev, curr, next)
 OUT_CHANNELS = 1
 CHANNELS = (32, 64, 128, 256, 512)
 STRIDES = (2, 2, 2, 2)
 NUM_RES_UNITS = 2
 DROPOUT = 0.1
-USE_WAVELET = True    # Enable High-Frequency Wavelet Attention at Bottleneck
 
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS

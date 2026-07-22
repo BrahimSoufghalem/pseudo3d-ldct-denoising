@@ -31,7 +31,7 @@ A comprehensive, modular deep learning pipeline built with <b>PyTorch</b> and <b
 
 ## Key Features: 
 
-- **Multi-Window Pseudo-3D (2.5D) Architecture** — Combines inter-slice spatial context with radiologist-inspired multi-window contrast. The pipeline processes three consecutive slices (`prev`, `curr`, `next`) across three clinical diagnostic windows (Full Range HU, Lung Window, and Soft Tissue Window) forming a **9-channel input tensor**. The model predicts the **noise residual** of the central slice.
+- **Pseudo-3D (2.5D) Architecture** — Combines inter-slice spatial context by processing three consecutive slices (`prev`, `curr`, `next`) forming a **3-channel input tensor**. The model predicts the **noise residual** of the central slice.
 - **Custom NBIA Downloader** — Automated, multi-threaded dataset downloader fetching data directly from The Cancer Imaging Archive (TCIA). Features resume-support, progress tracking, and selects exactly 100 hardcoded patients stratified by anatomy (Chest / Abdomen).
 - **Advanced Hybrid Loss Function** — A meticulously tuned combination of **L1 Loss** (pixel accuracy), **SSIM Loss** (structural similarity), **VGG-19 Perceptual Loss** (high-level feature preservation), and **Sobel Edge Loss** (boundary sharpness).
 - **Full-Resolution Evaluation & Benchmark Alignment** — Metrics follow the international `ldct-benchmark` physical standard: RMSE in Hounsfield Units (HU), and PSNR/SSIM after anatomy-specific clinical windowing (Lung Window for Chest, Soft Tissue Window for Abdomen).
@@ -53,7 +53,7 @@ pseudo3d-ldct-denoising/
 ├── LICENSE                # MIT License for open-source distribution
 ├── README.md              # Project documentation
 ├── config.py              # Centralized hyperparameter, paths, and constants registry
-├── dataset.py             # Multi-Window Pseudo-3D data pipeline (MONAI transforms, dataloaders)
+├── dataset.py             # Pseudo-3D data pipeline (MONAI transforms, dataloaders)
 ├── download.py            # Parallel NBIA dataset downloader with size estimation & resume
 ├── evaluate.py            # Full-resolution testing & ldct-benchmark physical metric report
 ├── evaluate_benchmark_models.py # Comparative evaluation against 7 pretrained SOTA models (ldct-benchmark)
@@ -70,12 +70,9 @@ pseudo3d-ldct-denoising/
 
 ## Methodology & Pipeline: 
 
-### 1. Data Processing & Multi-Window Learning
+### 1. Data Processing
 
-- **Multi-Window Clinical Extraction** — Raw DICOM Hounsfield Unit (HU) pixel arrays are processed through 3 parallel clinical windows:
-  1. **Full HU Range**: Clipped to `[-1024, 1600]` HU $\rightarrow$ normalized to `[0, 1]`.
-  2. **Lung Window**: $C = -600$ HU, $W = 1500$ HU (`[-1350, 150]` HU) $\rightarrow$ normalized to `[0, 1]`.
-  3. **Soft Tissue Window**: $C = 50$ HU, $W = 400$ HU (`[-150, 250]` HU) $\rightarrow$ normalized to `[0, 1]`.
+- **HU Windowing & Normalization** — Raw DICOM Hounsfield Unit (HU) pixel arrays are clipped to `[-1024, 1600]` HU and normalized to `[0, 1]`.
 - **Augmentation** — During training, data undergoes `RandSpatialCropSamplesd` (256×256). Validation applies deterministic `ResizeWithPadOrCropd`.
 
 ### 2. Network Architecture
@@ -84,7 +81,7 @@ A MONAI `UNet` initialized with:
 
 | Parameter | Value |
 |---|---|
-| **Input channels** | 9 (Multi-Window Pseudo-3D: 3 slices $\times$ 3 clinical windows) |
+| **Input channels** | 3 (Pseudo-3D: 3 consecutive slices `prev`, `curr`, `next`) |
 | **Output channels** | 1 (Predicted noise residual) |
 | **Feature maps** | `(32, 64, 128, 256, 512)` |
 | **Strides** | `(2, 2, 2, 2)` |

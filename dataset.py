@@ -36,32 +36,19 @@ def apply_window_tensor(img_tensor, center, width):
 
 
 # ═══════════════════════════════════════════
-# STACK SLICES (Multi-Window Pseudo-3D Transform)
+# STACK SLICES (Standard Pseudo-3D Transform)
 # ═══════════════════════════════════════════
-class StackMultiWindowSlicesd:
+class StackSlicesd:
     """
     Custom MONAI-style dictionary transform.
-    Stacks three adjacent slices (prev, curr, next) under three clinical diagnostic windows:
-      1. Full HU range [-1024, 1600]
-      2. Lung Window (C=-600, W=1500)
-      3. Soft Tissue Window (C=50, W=400)
-    Outputs a single 9-channel tensor [9, H, W].
+    Stacks three adjacent slices (prev, curr, next) into a single 3-channel tensor [3, H, W]
+    normalized to range [0, 1] using A_MIN and A_MAX.
     """
-    def __init__(
-        self,
-        a_min=A_MIN, a_max=A_MAX,
-        lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
-        soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH,
-    ):
+    def __init__(self, a_min=A_MIN, a_max=A_MAX):
         self.a_min = a_min
         self.a_max = a_max
-        self.lung_center = lung_center
-        self.lung_width = lung_width
-        self.soft_center = soft_center
-        self.soft_width = soft_width
 
     def __call__(self, data):
-        # Convert raw HU inputs if needed
         prev_hu = data["image_prev"]
         curr_hu = data["image"]
         next_hu = data["image_next"]
@@ -73,38 +60,16 @@ class StackMultiWindowSlicesd:
             next_hu = torch.as_tensor(next_hu, dtype=torch.float32)
             label_hu = torch.as_tensor(label_hu, dtype=torch.float32)
 
-        # 1. Full Range Window [0, 1]
         prev_full = torch.clamp((prev_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
         curr_full = torch.clamp((curr_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
         next_full = torch.clamp((next_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
 
-        # 2. Lung Window [0, 1]
-        prev_lung = apply_window_tensor(prev_hu, self.lung_center, self.lung_width)
-        curr_lung = apply_window_tensor(curr_hu, self.lung_center, self.lung_width)
-        next_lung = apply_window_tensor(next_hu, self.lung_center, self.lung_width)
-
-        # 3. Soft Tissue Window [0, 1]
-        prev_soft = apply_window_tensor(prev_hu, self.soft_center, self.soft_width)
-        curr_soft = apply_window_tensor(curr_hu, self.soft_center, self.soft_width)
-        next_soft = apply_window_tensor(next_hu, self.soft_center, self.soft_width)
-
-        # Concatenate 9 channels [9, H, W]
-        data["image"] = torch.cat([
-            prev_full, curr_full, next_full,
-            prev_lung, curr_lung, next_lung,
-            prev_soft, curr_soft, next_soft
-        ], dim=0)
-
-        # Full-dose label in Full Range HU scale [0, 1]
+        data["image"] = torch.cat([prev_full, curr_full, next_full], dim=0)
         data["label"] = torch.clamp((label_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
 
         del data["image_prev"]
         del data["image_next"]
         return data
-
-
-# Alias for backward compatibility
-StackSlicesd = StackMultiWindowSlicesd
 
 
 # ═══════════════════════════════════════════
@@ -154,7 +119,7 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
         EnsureChannelFirstd(
             keys=["image_prev", "image", "image_next", "label"],
         ),
-        StackMultiWindowSlicesd(),
+        StackSlicesd(),
         RandSpatialCropSamplesd(
             keys=["image", "label"],
             roi_size=spatial_size,
@@ -174,7 +139,7 @@ def get_val_transforms(spatial_size=SPATIAL_SIZE):
         EnsureChannelFirstd(
             keys=["image_prev", "image", "image_next", "label"],
         ),
-        StackMultiWindowSlicesd(),
+        StackSlicesd(),
         ResizeWithPadOrCropd(
             keys=["image", "label"],
             spatial_size=spatial_size,

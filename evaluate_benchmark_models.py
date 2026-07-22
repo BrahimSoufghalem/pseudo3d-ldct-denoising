@@ -164,12 +164,10 @@ def evaluate_patient_user_model(user_model, pid, patient_dir, device):
         low_next_hu = torch.from_numpy(load_dicom_raw_hu_offset(low_imgs[next_i]) - 1024.0)
         full_curr_hu = torch.from_numpy(load_dicom_raw_hu_offset(full_imgs[i]) - 1024.0)
 
-        # Build 9-channel Multi-Window input [1, 9, H, W]
-        inp = build_multi_window_input(
+        # Build 3-channel Pseudo-3D input [1, 3, H, W]
+        inp = build_pseudo3d_input(
             low_prev_hu, low_curr_hu, low_next_hu,
-            a_min=A_MIN, a_max=A_MAX,
-            lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
-            soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH
+            a_min=A_MIN, a_max=A_MAX
         ).to(device)
 
         lbl = hu_offset_to_user_norm(full_curr_hu + 1024.0).unsqueeze(0).unsqueeze(0).to(device)

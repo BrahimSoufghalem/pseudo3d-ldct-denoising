@@ -35,7 +35,7 @@ from config import (
     WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
     WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number, build_multi_window_input
+from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
@@ -107,12 +107,10 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         raw_next = load_dicom_tensor(low_imgs[next_i])
         raw_full = load_dicom_tensor(full_imgs[i])
 
-        # Build 9-channel Multi-Window input [1, 9, H, W]
-        inp = build_multi_window_input(
+        # Build 3-channel Pseudo-3D input [1, 3, H, W]
+        inp = build_pseudo3d_input(
             raw_prev, raw_curr, raw_next,
-            a_min=A_MIN, a_max=A_MAX,
-            lung_center=WINDOW_LUNG_CENTER, lung_width=WINDOW_LUNG_WIDTH,
-            soft_center=WINDOW_SOFT_CENTER, soft_width=WINDOW_SOFT_WIDTH
+            a_min=A_MIN, a_max=A_MAX
         ).to(device)
 
         lbl = normalize(raw_full).unsqueeze(0).unsqueeze(0).to(device)
