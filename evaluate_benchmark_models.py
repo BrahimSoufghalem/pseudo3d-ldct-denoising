@@ -31,10 +31,8 @@ import pydicom
 from config import (
     TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     BENCHMARK_MODELS_LIST, A_MIN, A_MAX,
-    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
-    WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number, build_multi_window_input
+from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,

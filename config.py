@@ -51,12 +51,6 @@ CLINICAL_WINDOWS = {
     "Abdomen": (1024 + 50, 400),    # Soft tissue window: C=50 HU, W=400 HU
 }
 
-# Clinical Diagnostic Windows for Multi-Window Preprocessing (in raw HU)
-WINDOW_LUNG_CENTER = -600.0
-WINDOW_LUNG_WIDTH = 1500.0
-WINDOW_SOFT_CENTER = 50.0
-WINDOW_SOFT_WIDTH = 400.0
-
 BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet", "cnn10"]
 
 # ═══════════════════════════════════════════

@@ -14,25 +14,16 @@ from monai.utils import set_determinism
 from monai.data import CacheDataset, Dataset, DataLoader
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd,
-    ScaleIntensityRanged, RandSpatialCropSamplesd,
-    ResizeWithPadOrCropd, ToTensord,
+    RandSpatialCropSamplesd, ResizeWithPadOrCropd, ToTensord,
 )
 
 from config import (
     DATA_DIR, SPATIAL_SIZE, A_MIN, A_MAX, B_MIN, B_MAX,
     CACHE_DATA, TRAIN_BATCH_SIZE, VAL_BATCH_SIZE, NUM_WORKERS,
     SEED, SPLIT_RANDOM_STATE, SPLIT_TEST_SIZE,
-    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH, WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
     EXPECTED_VAL, EXPECTED_TRAIN,
 )
 from utils import sort_by_instance_number
-
-
-def apply_window_tensor(img_tensor, center, width):
-    """Apply clinical windowing C/W to a raw HU PyTorch tensor and scale to [0, 1]."""
-    lower = center - 0.5 - (width - 1.0) / 2.0
-    upper = center - 0.5 + (width - 1.0) / 2.0
-    return torch.clamp((img_tensor - lower) / (upper - lower), 0.0, 1.0)
 
 
 # ═══════════════════════════════════════════

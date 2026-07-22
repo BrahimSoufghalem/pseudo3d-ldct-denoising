@@ -32,8 +32,6 @@ from tqdm import tqdm
 from config import (
     TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     A_MIN, A_MAX, B_MIN, B_MAX,
-    WINDOW_LUNG_CENTER, WINDOW_LUNG_WIDTH,
-    WINDOW_SOFT_CENTER, WINDOW_SOFT_WIDTH,
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
