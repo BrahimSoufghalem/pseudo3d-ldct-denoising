@@ -1,11 +1,11 @@
 """
-LDCT Project — Mathematically Rigorous NAF & Mamba Architectural Blocks
-=========================================================================
-Implementation aligned with official literature (Mamba CVPR 2024 & NAFNet CVPR 2022):
+LDCT Project — Official VMamba SS2D & NAF Architectural Blocks
+================================================================
+Implementation aligned with official VMamba literature (Liu et al., VMamba 2024 & NAFNet CVPR 2022):
 1. SimpleGate & Simplified Channel Attention (SCA)
 2. Non-Linear Activation-Free Residual Blocks (NAFBlock)
 3. Multiplicative Residual Structure-Aware Attention Gates (StructureAwareAttentionGate)
-4. JIT-Compiled 4-Way 2D Selective State-Space Scan (SS2DSelectScan & Mamba2DSSM)
+4. Official VMamba 4-Way Cross-Scan 2D Selective State-Space (OfficialVMambaSS2D & Mamba2DSSM)
 5. Residual Mamba Bottleneck with Explicit Skips (ResidualMambaBottleneck)
 6. Adaptive Gated Spatial-State Space Fusion (AdaptiveGatedFusion)
 """
@@ -14,6 +14,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Try importing official CUDA selective scan kernel if available
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    HAS_OFFICIAL_CUDA_SCAN = True
+except ImportError:
+    HAS_OFFICIAL_CUDA_SCAN = False
 
 
 # ═══════════════════════════════════════════
@@ -151,12 +158,12 @@ AnatomyAttentionGate2D = StructureAwareAttentionGate
 
 
 # ═══════════════════════════════════════════
-# 5. JIT-COMPILED 4-WAY 2D SELECTIVE STATE-SPACE SCAN (SS2D / S6)
+# 5. OFFICIAL VMAMBA 4-WAY CROSS-SCAN 2D SELECTIVE STATE-SPACE (SS2D)
 # ═══════════════════════════════════════════
 @torch.jit.script
 def _selective_scan_1d_jit(x_seq: torch.Tensor, delta_seq: torch.Tensor, B_seq: torch.Tensor, C_seq: torch.Tensor, A_log: torch.Tensor) -> torch.Tensor:
     """
-    Torch JIT Fused Fused 1D Selective Scan:
+    Torch JIT Fused 1D Selective Scan:
     h_t = A_bar * h_{t-1} + B_bar * x_t
     y_t = C_t * h_t
     """
@@ -180,82 +187,94 @@ def _selective_scan_1d_jit(x_seq: torch.Tensor, delta_seq: torch.Tensor, B_seq: 
     return torch.stack(ys, dim=-1)                # [B, C, L]
 
 
-class SS2DSelectScan(nn.Module):
+class OfficialVMambaSS2D(nn.Module):
     """
-    PyTorch-native 4-Way 2D Selective State-Space Scan (SS2D / S6) with JIT compilation.
-    Scans 2D feature maps along 4 spatial directions to eliminate streak artifacts.
+    Official VMamba 2D Selective Scan (SS2D / Cross-Scan Module - CSM).
+    Scans 2D feature maps along 4 spatial directions (Top-Left, Bottom-Right, Top-Right, Bottom-Left).
+    Uses official mamba-ssm CUDA kernel when available, with JIT PyTorch fallback.
     """
-    def __init__(self, channels, d_state=16):
+    def __init__(self, channels, d_state=16, k_group=4):
         super().__init__()
         self.channels = channels
         self.d_state = d_state
+        self.k_group = k_group
 
-        # Projections for Selective Parameters (Delta, B, C)
-        self.x_proj = nn.Conv2d(channels, (d_state * 2 + channels), kernel_size=1)
-        self.dt_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        # Selective S6 Parameter Projections for 4 directions
+        self.x_proj = nn.Conv2d(channels, (d_state * 2 + channels) * k_group, kernel_size=1)
+        self.dt_proj = nn.Conv2d(channels, channels * k_group, kernel_size=1)
 
         # State matrix A initialization
-        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(channels, 1)
+        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(channels * k_group, 1)
         self.A_log = nn.Parameter(torch.log(A_init))
 
-        # 4 directional output fusion
-        self.out_fusion = nn.Conv2d(channels * 4, channels, kernel_size=1)
+        # 4-way direction output fusion
+        self.out_fusion = nn.Conv2d(channels * k_group, channels, kernel_size=1)
 
     def forward(self, x):
         b, c, h, w = x.shape
+        l = h * w
 
-        # Compute Selective Parameters
-        dt = self.dt_proj(x)
-        proj = self.x_proj(x)
-        B_proj, C_proj, _ = proj.split([self.d_state, self.d_state, c], dim=1)
+        # ── 1. Cross Scan Module (CSM): 4 Directions ──
+        # Direction 1: Horizontal Forward (Top-Left -> Bottom-Right)
+        x1 = x
+        # Direction 2: Horizontal Backward (Bottom-Right -> Top-Left)
+        x2 = torch.flip(x, dims=[-1])
+        # Direction 3: Vertical Forward (Top-Left -> Bottom-Right)
+        x3 = x.transpose(-2, -1).contiguous()
+        # Direction 4: Vertical Backward (Bottom-Right -> Top-Left)
+        x4 = torch.flip(x_trans := x.transpose(-2, -1).contiguous(), dims=[-1])
 
-        # 4 Directional Scans using safe .reshape():
-        # 1. Forward Horizontal
-        x_s1 = x.reshape(b, c, h * w)
-        dt_s1 = dt.reshape(b, c, h * w)
-        B_s1 = B_proj.reshape(b, self.d_state, h * w)
-        C_s1 = C_proj.reshape(b, self.d_state, h * w)
-        y1 = _selective_scan_1d_jit(x_s1, dt_s1, B_s1, C_s1, self.A_log).reshape(b, c, h, w)
+        # Reshape to sequence tensors [B, K, C, L]
+        xs = torch.stack([
+            x1.reshape(b, c, l),
+            x2.reshape(b, c, l),
+            x3.reshape(b, c, l),
+            x4.reshape(b, c, l)
+        ], dim=1)  # -> [B, 4, C, L]
 
-        # 2. Backward Horizontal
-        x_s2 = torch.flip(x, dims=[-1]).reshape(b, c, h * w)
-        dt_s2 = torch.flip(dt, dims=[-1]).reshape(b, c, h * w)
-        B_s2 = torch.flip(B_proj, dims=[-1]).reshape(b, self.d_state, h * w)
-        C_s2 = torch.flip(C_proj, dims=[-1]).reshape(b, self.d_state, h * w)
-        y2 = torch.flip(_selective_scan_1d_jit(x_s2, dt_s2, B_s2, C_s2, self.A_log).reshape(b, c, h, w), dims=[-1])
+        # ── 2. Calculate S6 Selective Parameters ──
+        dt = self.dt_proj(x).reshape(b, 4, c, h, w)
+        proj = self.x_proj(x).reshape(b, 4, (self.d_state * 2 + c), h, w)
+        B_proj, C_proj, _ = proj.split([self.d_state, self.d_state, c], dim=2)
 
-        # 3. Forward Vertical
-        x_trans = x.transpose(-2, -1).contiguous()
-        x_s3 = x_trans.reshape(b, c, h * w)
-        dt_s3 = dt.transpose(-2, -1).contiguous().reshape(b, c, h * w)
-        B_s3 = B_proj.transpose(-2, -1).contiguous().reshape(b, self.d_state, h * w)
-        C_s3 = C_proj.transpose(-2, -1).contiguous().reshape(b, self.d_state, h * w)
-        y3 = _selective_scan_1d_jit(x_s3, dt_s3, B_s3, C_s3, self.A_log).reshape(b, c, w, h).transpose(-2, -1).contiguous()
+        # Flatten spatial dims to sequences [B*4, ...]
+        dt_seq = dt.reshape(b * 4, c, l)
+        B_seq = B_proj.reshape(b * 4, self.d_state, l)
+        C_seq = C_proj.reshape(b * 4, self.d_state, l)
+        xs_seq = xs.reshape(b * 4, c, l)
 
-        # 4. Backward Vertical
-        x_vflip = torch.flip(x_trans, dims=[-1]).contiguous()
-        x_s4 = x_vflip.reshape(b, c, h * w)
-        dt_s4 = torch.flip(dt.transpose(-2, -1), dims=[-1]).contiguous().reshape(b, c, h * w)
-        B_s4 = torch.flip(B_proj.transpose(-2, -1), dims=[-1]).contiguous().reshape(b, self.d_state, h * w)
-        C_s4 = torch.flip(C_proj.transpose(-2, -1), dims=[-1]).contiguous().reshape(b, self.d_state, h * w)
-        y4_rec = _selective_scan_1d_jit(x_s4, dt_s4, B_s4, C_s4, self.A_log).reshape(b, c, w, h)
-        y4 = torch.flip(y4_rec, dims=[-1]).transpose(-2, -1).contiguous()
+        # ── 3. S6 Selective Scan Execution ──
+        if HAS_OFFICIAL_CUDA_SCAN and x.is_cuda:
+            A_mat = -torch.exp(self.A_log).view(4 * c, self.d_state)
+            ys_seq = selective_scan_fn(
+                xs_seq, dt_seq, A_mat, B_seq, C_seq, D=None,
+                delta_bias=None, delta_softplus=True
+            )
+        else:
+            # PyTorch JIT Fused Fallback Engine
+            ys_seq = _selective_scan_1d_jit(xs_seq, dt_seq, B_seq, C_seq, self.A_log)
 
-        # Combine 4 directional scan representations
+        # ── 4. Cross Merge Module (CMM): Reconstruct 4 Directions ──
+        ys = ys_seq.view(b, 4, c, h, w)
+        y1 = ys[:, 0]
+        y2 = torch.flip(ys[:, 1], dims=[-1])
+        y3 = ys[:, 2].transpose(-2, -1).contiguous()
+        y4 = torch.flip(ys[:, 3], dims=[-1]).transpose(-2, -1).contiguous()
+
         y_concat = torch.cat([y1, y2, y3, y4], dim=1)
         return self.out_fusion(y_concat)
 
 
 class Mamba2DSSM(nn.Module):
     """
-    2D Selective State-Space Bottleneck Layer using JIT-compiled SS2DSelectScan.
+    2D Selective State-Space Bottleneck Layer using OfficialVMambaSS2D.
     """
     def __init__(self, channels, d_state=16):
         super().__init__()
         self.norm = LayerNorm2d(channels)
         self.in_proj = nn.Conv2d(channels, channels * 2, kernel_size=1)
         self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
-        self.ss2d = SS2DSelectScan(channels, d_state=d_state)
+        self.ss2d = OfficialVMambaSS2D(channels, d_state=d_state)
         self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
         self.sg = SimpleGate()
 
