@@ -161,30 +161,36 @@ AnatomyAttentionGate2D = StructureAwareAttentionGate
 # 5. OFFICIAL VMAMBA 4-WAY CROSS-SCAN 2D SELECTIVE STATE-SPACE (SS2D)
 # ═══════════════════════════════════════════
 @torch.jit.script
-def _selective_scan_1d_jit(x_seq: torch.Tensor, delta_seq: torch.Tensor, B_seq: torch.Tensor, C_seq: torch.Tensor, A_log: torch.Tensor) -> torch.Tensor:
+def _selective_scan_4way_jit(
+    xs: torch.Tensor,       # [B, 4, C, L]
+    dt: torch.Tensor,       # [B, 4, C, L]
+    B_proj: torch.Tensor,   # [B, 4, N, L]
+    C_proj: torch.Tensor,   # [B, 4, N, L]
+    A_log: torch.Tensor,    # [4*C, N]
+) -> torch.Tensor:
     """
-    Torch JIT Fused 1D Selective Scan:
+    Torch JIT Fused 4-Way 1D Selective Scan Engine:
     h_t = A_bar * h_{t-1} + B_bar * x_t
     y_t = C_t * h_t
     """
-    b, c, l = x_seq.shape
-    d_state = B_seq.shape[1]
-    A = -torch.exp(A_log).view(1, c, d_state, 1)  # [1, C, N, 1]
+    b, k, c, l = xs.shape
+    d_state = B_proj.shape[2]
 
-    delta = F.softplus(delta_seq).unsqueeze(2)    # [B, C, 1, L]
-    A_bar = torch.exp(A * delta)                   # [B, C, N, L]
-    B_bar = delta * B_seq.unsqueeze(1)             # [B, C, N, L]
+    A = -torch.exp(A_log).view(1, k, c, d_state, 1)  # [1, 4, C, N, 1]
+    delta = F.softplus(dt).unsqueeze(3)              # [B, 4, C, 1, L]
+    A_bar = torch.exp(A * delta)                      # [B, 4, C, N, L]
+    B_bar = delta * B_proj.unsqueeze(2)               # [B, 4, C, N, L]
 
     # Recurrent state accumulation over sequence
-    h = torch.zeros(b, c, d_state, device=x_seq.device)
+    h = torch.zeros(b, k, c, d_state, device=xs.device)
     ys = []
     for t in range(l):
-        h = A_bar[:, :, :, t] * h + B_bar[:, :, :, t] * x_seq[:, :, t:t+1]
-        C_t = C_seq[:, :, t].unsqueeze(1)         # [B, 1, N]
-        y_t = (h * C_t).sum(dim=-1)               # [B, C]
+        h = A_bar[:, :, :, :, t] * h + B_bar[:, :, :, :, t] * xs[:, :, :, t:t+1]
+        C_t = C_proj[:, :, :, t].unsqueeze(2)         # [B, 4, 1, N]
+        y_t = (h * C_t).sum(dim=-1)                   # [B, 4, C]
         ys.append(y_t)
 
-    return torch.stack(ys, dim=-1)                # [B, C, L]
+    return torch.stack(ys, dim=-1)                    # [B, 4, C, L]
 
 
 class OfficialVMambaSS2D(nn.Module):
@@ -215,16 +221,12 @@ class OfficialVMambaSS2D(nn.Module):
         l = h * w
 
         # ── 1. Cross Scan Module (CSM): 4 Directions ──
-        # Direction 1: Horizontal Forward (Top-Left -> Bottom-Right)
         x1 = x
-        # Direction 2: Horizontal Backward (Bottom-Right -> Top-Left)
         x2 = torch.flip(x, dims=[-1])
-        # Direction 3: Vertical Forward (Top-Left -> Bottom-Right)
-        x3 = x.transpose(-2, -1).contiguous()
-        # Direction 4: Vertical Backward (Bottom-Right -> Top-Left)
-        x4 = torch.flip(x_trans := x.transpose(-2, -1).contiguous(), dims=[-1])
+        x_trans = x.transpose(-2, -1).contiguous()
+        x3 = x_trans
+        x4 = torch.flip(x_trans, dims=[-1])
 
-        # Reshape to sequence tensors [B, K, C, L]
         xs = torch.stack([
             x1.reshape(b, c, l),
             x2.reshape(b, c, l),
@@ -237,22 +239,26 @@ class OfficialVMambaSS2D(nn.Module):
         proj = self.x_proj(x).reshape(b, 4, (self.d_state * 2 + c), h, w)
         B_proj, C_proj, _ = proj.split([self.d_state, self.d_state, c], dim=2)
 
-        # Flatten spatial dims to sequences [B*4, ...]
-        dt_seq = dt.reshape(b * 4, c, l)
-        B_seq = B_proj.reshape(b * 4, self.d_state, l)
-        C_seq = C_proj.reshape(b * 4, self.d_state, l)
-        xs_seq = xs.reshape(b * 4, c, l)
+        dt_seq = dt.reshape(b, 4, c, l)
+        B_seq = B_proj.reshape(b, 4, self.d_state, l)
+        C_seq = C_proj.reshape(b, 4, self.d_state, l)
 
         # ── 3. S6 Selective Scan Execution ──
         if HAS_OFFICIAL_CUDA_SCAN and x.is_cuda:
             A_mat = -torch.exp(self.A_log).view(4 * c, self.d_state)
             ys_seq = selective_scan_fn(
-                xs_seq, dt_seq, A_mat, B_seq, C_seq, D=None,
-                delta_bias=None, delta_softplus=True
-            )
+                xs.reshape(b * 4, c, l),
+                dt_seq.reshape(b * 4, c, l),
+                A_mat,
+                B_seq.reshape(b * 4, self.d_state, l),
+                C_seq.reshape(b * 4, self.d_state, l),
+                D=None,
+                delta_bias=None,
+                delta_softplus=True
+            ).view(b, 4, c, l)
         else:
-            # PyTorch JIT Fused Fallback Engine
-            ys_seq = _selective_scan_1d_jit(xs_seq, dt_seq, B_seq, C_seq, self.A_log)
+            # PyTorch JIT Vectorized 4-Way Fallback Engine
+            ys_seq = _selective_scan_4way_jit(xs, dt_seq, B_seq, C_seq, self.A_log)
 
         # ── 4. Cross Merge Module (CMM): Reconstruct 4 Directions ──
         ys = ys_seq.view(b, 4, c, h, w)
