@@ -56,7 +56,8 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
         optimizer.zero_grad(set_to_none=True)
 
         with autocast("cuda"):
-            pred_img = model(images)
+            pred_res = model(images)
+            pred_img = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
             loss, loss_info = loss_fn(pred_img, labels)
 
         scaler.scale(loss).backward()
@@ -114,7 +115,8 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
         mid_slice = images[:, 1:2, :, :]
 
         with autocast("cuda"):
-            preds = model(images)
+            pred_res = model(images)
+            preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
             loss, _ = loss_fn(preds, labels)
 
         val_loss += loss.item()

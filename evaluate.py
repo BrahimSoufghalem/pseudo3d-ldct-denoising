@@ -115,7 +115,8 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         mid = inp[:, 1:2, :, :]                              # current low-dose slice in full HU range [0, 1]
 
         with autocast():
-            pred = model(inp)
+            pred_res = model(inp)
+            pred = torch.clamp(mid + pred_res, 0.0, 1.0)
 
         # ── 1. Convert tensors to HU + 1024 offset domain (ldct-benchmark standard) ──
         pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)

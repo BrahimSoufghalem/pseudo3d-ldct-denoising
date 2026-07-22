@@ -137,7 +137,8 @@ def process_patient(pid, patient_dir, output_dir, model, device):
 
         # Apply model to get the enhanced slice (output is between 0 and 1)
         with autocast():
-            pred_normalized = model(inp)
+            pred_res = model(inp)
+            pred_normalized = torch.clamp(mid + pred_res, 0.0, 1.0)
 
         # Revert values back to Hounsfield Units
         pred_hu = denormalize_to_hu(pred_normalized)
