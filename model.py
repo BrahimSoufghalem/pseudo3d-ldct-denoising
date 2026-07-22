@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from config import IN_CHANNELS, OUT_CHANNELS, CHANNELS, DROPOUT, MAMBA_MODE
 from naf_mamba_blocks import (
-    LayerNorm2d, NAFBlock, AnatomyAttentionGate2D,
+    LayerNorm2d, NAFBlock, StructureAwareAttentionGate,
     Mamba2DSSM, ResidualMambaBottleneck, AdaptiveGatedFusion
 )
 
@@ -55,11 +55,11 @@ class MSNAFMambaNet(nn.Module):
         self.enc4 = NAFBlock(c4, drop_out=dropout)
         self.down4 = nn.Conv2d(c4, c5, kernel_size=2, stride=2)
 
-        # ── 3. Multiplicative Residual Anatomy Attention Gates ──
-        self.ag1 = AnatomyAttentionGate2D(gate_channels=c2, skip_channels=c1)
-        self.ag2 = AnatomyAttentionGate2D(gate_channels=c3, skip_channels=c2)
-        self.ag3 = AnatomyAttentionGate2D(gate_channels=c4, skip_channels=c3)
-        self.ag4 = AnatomyAttentionGate2D(gate_channels=c5, skip_channels=c4)
+        # ── 3. Multiplicative Residual Structure-Aware Attention Gates ──
+        self.ag1 = StructureAwareAttentionGate(gate_channels=c2, skip_channels=c1)
+        self.ag2 = StructureAwareAttentionGate(gate_channels=c3, skip_channels=c2)
+        self.ag3 = StructureAwareAttentionGate(gate_channels=c4, skip_channels=c3)
+        self.ag4 = StructureAwareAttentionGate(gate_channels=c5, skip_channels=c4)
 
         # ── 4. True Selective State-Space Bottleneck (1/16 Resolution) ──
         if self.mamba_mode in ["residual", "full"]:
