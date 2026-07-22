@@ -63,6 +63,9 @@ STRIDES = (2, 2, 2, 2)
 NUM_RES_UNITS = 2
 DROPOUT = 0.1
 
+# Ablation Framework Mode Options: "basic", "residual", "multiscale", "full"
+MAMBA_MODE = "full"
+
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
