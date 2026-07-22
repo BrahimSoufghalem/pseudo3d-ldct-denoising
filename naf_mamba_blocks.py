@@ -1,10 +1,10 @@
 """
-NAF-MambaUNet Building Blocks
-================================
-Derived directly from published official repositories:
-  1. NAFBlock, SimpleGate, SCA, LayerNorm2d from Megvii NAFNet (Megvii-Research/NAFNet)
-  2. 2D Vision State-Space Model (Mamba2D) from NVIDIA MambaVision (NVlabs/MambaVision)
-  3. Anatomy-Guided Attention Skip Gates (AG-Skip) for noise suppression.
+NAF-MambaUNet Building Blocks (Refined SS2D & NAF Architecture)
+================================================================
+Derived from:
+  1. Megvii NAFNet (Megvii-Research/NAFNet): NAFBlock, SimpleGate, SCA, LayerNorm2d
+  2. VMamba / Vision Mamba (HustVL / VMamba): True 4-Way Cross-Scan Selective State-Space (SS2D)
+  3. Anatomy Attention Skip Gates: Noise suppression with 1 + alpha anatomy preservation.
 """
 
 import math
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 1. OFFICIAL MEGVII NAFNET COMPONENTS (Activation-Free Restoration)
+# 1. MEGVII NAFNET COMPONENTS (Activation-Free Restoration)
 # ═════════════════════════════════════════════════════════════════════
 
 class LayerNormFunction(torch.autograd.Function):
@@ -122,13 +122,13 @@ class NAFBlock(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 2. ANATOMY-GUIDED ATTENTION SKIP GATE (Noise Suppression)
+# 2. ANATOMY-GUIDED ATTENTION SKIP GATE (1 + alpha Preservation)
 # ═════════════════════════════════════════════════════════════════════
 
 class AnatomyAttentionGate2D(nn.Module):
     """
-    Context-guided Attention Gate on skip connections.
-    Filters out encoder quantum noise while passing reliable anatomical structures.
+    Context-guided Attention Gate on skip connections with 1 + alpha scaling.
+    Guarantees zero attenuation of baseline anatomical details while additively boosting clean features.
     """
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -151,17 +151,113 @@ class AnatomyAttentionGate2D(nn.Module):
         if g1.shape[2:] != x1.shape[2:]:
             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
         alpha = self.psi(F.gelu(g1 + x1))
-        return x * alpha
+        # 1 + alpha guarantees preservation of anatomical detail
+        return x * (1.0 + alpha)
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 3. 2D VISION STATE-SPACE MAMBA BLOCK (NVIDIA MambaVision Derived)
+# 3. AUTHENTIC 2D CROSS-SCAN SELECTIVE STATE-SPACE (SS2D MAMBA BLOCK)
 # ═════════════════════════════════════════════════════════════════════
 
-class MambaVision2DBottleneck(nn.Module):
+class CrossScan2D(nn.Module):
     """
-    2D Selective State-Space (Mamba) Bottleneck derived from NVIDIA MambaVision.
-    Performs 2D spatial scanning (Horizontal & Vertical) for long-range streak artifact removal.
+    4-Way Cross Scan mechanism for 2D Spatial Feature Maps (VMamba SS2D).
+    Directions:
+      1. Horizontal Forward (top-left -> bottom-right)
+      2. Horizontal Backward (bottom-right -> top-left)
+      3. Vertical Forward (top-left -> bottom-right vertical)
+      4. Vertical Backward (bottom-right -> top-left vertical)
+    """
+    def forward(self, x):
+        B, C, H, W = x.shape
+        L = H * W
+        x1 = x.flatten(2)
+        x2 = torch.flip(x1, dims=[-1])
+        x3 = x.transpose(2, 3).flatten(2)
+        x4 = torch.flip(x3, dims=[-1])
+        return torch.stack([x1, x2, x3, x4], dim=0)  # [4, B, C, L]
+
+
+class CrossMerge2D(nn.Module):
+    """Merges 4 directional scan sequences back into a single 2D spatial feature map [B, C, H, W]."""
+    def forward(self, ys, H, W):
+        y1, y2, y3, y4 = ys[0], ys[1], ys[2], ys[3]
+        y2 = torch.flip(y2, dims=[-1])
+        y3 = y3.view(y3.shape[0], y3.shape[1], W, H).transpose(2, 3).flatten(2)
+        y4 = torch.flip(y4, dims=[-1]).view(y4.shape[0], y4.shape[1], W, H).transpose(2, 3).flatten(2)
+        y = y1 + y2 + y3 + y4
+        return y.view(y.shape[0], y.shape[1], H, W)
+
+
+class SelectiveStateRecurrenceS6(nn.Module):
+    """
+    True S6 Selective State Recurrence Kernel.
+    Discretizes continuous state matrices A, B with step size dt and computes recurrence:
+      h_t = exp(dt * A) * h_{t-1} + (dt * B) * x_t
+      y_t = C * h_t + D * x_t
+    """
+    def __init__(self, d_inner, d_state=16, dt_rank=16):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.dt_rank = dt_rank
+
+        # Continuous S6 parameters
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_inner))
+
+        # Dynamic S6 parameters projections
+        self.x_proj = nn.Linear(d_inner, dt_rank + d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
+
+    def forward(self, xs):
+        # xs: [4, B, C, L]
+        K, B, C, L = xs.shape
+        out_scans = []
+
+        A = -torch.exp(self.A_log.float())  # [C, N]
+
+        for k in range(K):
+            x_k = xs[k].transpose(1, 2)  # [B, L, C]
+
+            # Project dt, B, C per token
+            x_dbl = self.x_proj(x_k)  # [B, L, dt_rank + 2*d_state]
+            dt, B_mat, C_mat = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+
+            dt = F.softplus(self.dt_proj(dt))  # [B, L, C]
+
+            # S6 Selective Recurrence over sequence L
+            y_seq = []
+            h = torch.zeros(B, C, self.d_state, device=xs.device)  # Recurrent hidden state
+
+            for t in range(L):
+                x_t = x_k[:, t, :]  # [B, C]
+                dt_t = dt[:, t, :]  # [B, C]
+                B_t = B_mat[:, t, :]  # [B, N]
+                C_t = C_mat[:, t, :]  # [B, N]
+
+                # Discretization: dA = exp(dt_t * A), dB = dt_t * B_t
+                dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # [B, C, N]
+                dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # [B, C, N]
+
+                # Recurrence state update: h_t = dA * h_{t-1} + dB * x_t
+                h = dA * h + dB * x_t.unsqueeze(-1)
+
+                # Output state projection: y_t = sum(C_t * h_t) + D * x_t
+                y_t = (h * C_t.unsqueeze(1)).sum(dim=-1) + self.D.unsqueeze(0) * x_t
+                y_seq.append(y_t)
+
+            y_k = torch.stack(y_seq, dim=1).transpose(1, 2)  # [B, C, L]
+            out_scans.append(y_k)
+
+        return torch.stack(out_scans, dim=0)  # [4, B, C, L]
+
+
+class SS2DMambaBottleneck(nn.Module):
+    """
+    Authentic 2D Cross-Scan Selective State-Space (SS2D) Mamba Bottleneck Block.
+    Performs 4-way cross scanning + true S6 recurrence + cross merging.
     """
     def __init__(self, d_model, d_state=16, d_conv=3, expand=2):
         super().__init__()
@@ -173,15 +269,12 @@ class MambaVision2DBottleneck(nn.Module):
         self.dw_conv = nn.Conv2d(self.d_inner, self.d_inner, kernel_size=d_conv, padding=d_conv // 2, groups=self.d_inner, bias=True)
         self.act = nn.SiLU()
 
-        # State-Space Selective Projection (Horizontal + Vertical Scan)
-        self.dt_rank = math.ceil(d_model / 16)
-        self.x_proj = nn.Conv2d(self.d_inner, self.dt_rank + d_state * 2, kernel_size=1, bias=False)
-        self.dt_proj = nn.Conv2d(self.dt_rank, self.d_inner, kernel_size=1, bias=True)
+        # 4-Way Cross Scan & Cross Merge
+        self.cross_scan = CrossScan2D()
+        self.cross_merge = CrossMerge2D()
 
-        # S6 State Matrices Initialization
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
+        # S6 Recurrence Engine
+        self.s6 = SelectiveStateRecurrenceS6(d_inner=self.d_inner, d_state=d_state, dt_rank=math.ceil(d_model / 16))
 
         self.out_proj = nn.Conv2d(self.d_inner, d_model, kernel_size=1, bias=False)
 
@@ -197,14 +290,14 @@ class MambaVision2DBottleneck(nn.Module):
         # Depthwise spatial convolution + SiLU
         x_conv = self.act(self.dw_conv(x_branch))
 
-        # Selective scan parameters projection
-        x_dbl = self.x_proj(x_conv)
-        dt, B_matrix, C_matrix = torch.split(x_dbl, [self.dt_rank, self.A_log.shape[1], self.A_log.shape[1]], dim=1)
-        dt = F.softplus(self.dt_proj(dt))
+        # 4-Way Cross Scan -> [4, B, C, L]
+        xs = self.cross_scan(x_conv)
 
-        # 2D Bidirectional Selective State-Space Gating (Horizontal & Vertical)
-        A = -torch.exp(self.A_log.float()).sum(dim=1).view(1, -1, 1, 1)
-        ssm_out = x_conv * torch.sigmoid(dt * A + self.D.view(1, -1, 1, 1))
+        # True S6 Selective Recurrence -> [4, B, C, L]
+        ys = self.s6(xs)
+
+        # Cross Merge -> [B, C, H, W]
+        ssm_out = self.cross_merge(ys, H, W)
 
         # Gated multiplicative interaction with z_branch
         out = ssm_out * self.act(z_branch)
@@ -215,13 +308,13 @@ class MambaVision2DBottleneck(nn.Module):
 
 class ResidualMambaBottleneck(nn.Module):
     """
-    Dual Residual Mamba Bottleneck: Mamba Block 1 -> Residual Add -> Mamba Block 2.
+    Dual Residual SS2D Mamba Bottleneck: SS2D Block 1 -> Residual Add -> SS2D Block 2.
     Used in MAMBA_MODE = "residual" or "full".
     """
     def __init__(self, d_model, d_state=16):
         super().__init__()
-        self.mamba1 = MambaVision2DBottleneck(d_model, d_state=d_state)
-        self.mamba2 = MambaVision2DBottleneck(d_model, d_state=d_state)
+        self.mamba1 = SS2DMambaBottleneck(d_model, d_state=d_state)
+        self.mamba2 = SS2DMambaBottleneck(d_model, d_state=d_state)
 
     def forward(self, x):
         x = self.mamba1(x)

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from config import IN_CHANNELS, OUT_CHANNELS, MAMBA_MODE
 from naf_mamba_blocks import (
     LayerNorm2d, NAFBlock, AnatomyAttentionGate2D,
-    MambaVision2DBottleneck, ResidualMambaBottleneck,
+    SS2DMambaBottleneck, ResidualMambaBottleneck,
     MultiScaleSpatialFusion
 )
 
@@ -54,11 +54,11 @@ class MSNAFMambaNet(nn.Module):
         self.ag3 = AnatomyAttentionGate2D(F_g=256, F_l=128, F_int=128)
         self.ag4 = AnatomyAttentionGate2D(F_g=512, F_l=256, F_int=256)
 
-        # Bottleneck (Mamba 2D State-Space Module)
+        # Bottleneck (SS2D Mamba 2D Selective State-Space Module)
         if self.mamba_mode in ["residual", "full"]:
             self.bottleneck = ResidualMambaBottleneck(512)
         else:
-            self.bottleneck = MambaVision2DBottleneck(512)
+            self.bottleneck = SS2DMambaBottleneck(512)
 
         # Multi-Scale Spatial Fusion (1/16 Mamba <-> 1/8 NAF)
         if self.mamba_mode in ["multiscale", "full"]:
