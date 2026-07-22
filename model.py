@@ -77,8 +77,10 @@ class MSNAFMambaNet(nn.Module):
         self.up1 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False), nn.PixelShuffle(2))
         self.dec1 = nn.Sequential(nn.Conv2d(64, 32, kernel_size=1), NAFBlock(32))
 
-        # Output Head
+        # Output Head (Zero-initialized for Identity Residual Learning)
         self.head = nn.Conv2d(32, out_channels, kernel_size=3, padding=1, bias=True)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
     def forward(self, x):
         # Stem
