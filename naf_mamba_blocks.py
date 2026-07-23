@@ -129,6 +129,7 @@ class AnatomyAttentionGate2D(nn.Module):
     """
     Context-guided Attention Gate on skip connections with 1 + alpha scaling.
     Guarantees zero attenuation of baseline anatomical details while additively boosting clean features.
+    Bias of psi is initialized to -3.0 so sigmoid(-3)≈0.047, making the gate start as near-identity (1.047x).
     """
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -140,17 +141,18 @@ class AnatomyAttentionGate2D(nn.Module):
             nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             LayerNorm2d(F_int)
         )
-        self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.Sigmoid()
-        )
+        self.psi_conv = nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        # Small weight std + bias=-3.0: sigmoid is dominated by bias≈-3 → α≈0.047 (near identity)
+        # BUT weight≠0 ensures gradients flow from decoder → skip → encoder
+        nn.init.normal_(self.psi_conv.weight, std=1e-4)
+        nn.init.constant_(self.psi_conv.bias, -3.0)
 
     def forward(self, g, x):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
         if g1.shape[2:] != x1.shape[2:]:
             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
-        alpha = self.psi(F.gelu(g1 + x1))
+        alpha = torch.sigmoid(self.psi_conv(F.gelu(g1 + x1)))
         # 1 + alpha guarantees preservation of anatomical detail
         return x * (1.0 + alpha)
 
@@ -211,8 +213,9 @@ class SelectiveStateRecurrenceS6(nn.Module):
         self.x_proj = nn.Linear(d_inner, dt_rank + d_state * 2, bias=False)
         self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
 
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(self, xs):
-        # xs: [4, B, C, L]
+        # xs: [4, B, C, L] — forced to FP32 for numerical stability in recurrence
         K, B, C, L = xs.shape
         out_scans = []
 
@@ -229,7 +232,7 @@ class SelectiveStateRecurrenceS6(nn.Module):
 
             # S6 Selective Recurrence over sequence L
             y_seq = []
-            h = torch.zeros(B, C, self.d_state, device=xs.device)  # Recurrent hidden state
+            h = torch.zeros(B, C, self.d_state, device=xs.device, dtype=torch.float32)  # Recurrent hidden state
 
             for t in range(L):
                 x_t = x_k[:, t, :]  # [B, C]
