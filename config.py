@@ -27,8 +27,9 @@ WEIGHT_DECAY = 5e-6
 TRAIN_BATCH_SIZE = 32
 VAL_BATCH_SIZE = 64
 NUM_WORKERS = 8
-PATIENCE = 10
-GRAD_CLIP_MAX_NORM = 1.0
+PATIENCE = 15
+GRAD_CLIP_MAX_NORM = 0.5
+WARMUP_EPOCHS = 5       # Linear warmup from ~0 to LEARNING_RATE over first N epochs
 
 # ═══════════════════════════════════════════
 # DATA / PREPROCESSING
@@ -75,11 +76,8 @@ LAMBDA_PERC = 0.2
 LAMBDA_EDGE = 0.1
 
 # ═══════════════════════════════════════════
-# SCHEDULER
+# SCHEDULER (Cosine Annealing with Linear Warmup)
 # ═══════════════════════════════════════════
-SCHEDULER_MODE = "max"
-SCHEDULER_FACTOR = 0.5
-SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR = 1e-7
 
 # ═══════════════════════════════════════════

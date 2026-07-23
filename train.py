@@ -17,9 +17,9 @@ from tqdm import tqdm
 from config import (
     MODEL_DIR, LOGS_DIR, CHECKPOINT_PATH, BEST_MODEL_PATH,
     TOTAL_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
-    PATIENCE, GRAD_CLIP_MAX_NORM,
+    PATIENCE, GRAD_CLIP_MAX_NORM, WARMUP_EPOCHS,
     LAMBDA_L1, LAMBDA_SSIM, LAMBDA_PERC, LAMBDA_EDGE,
-    SCHEDULER_MODE, SCHEDULER_FACTOR, SCHEDULER_PATIENCE, SCHEDULER_MIN_LR,
+    SCHEDULER_MIN_LR,
     A_MIN, A_MAX,
 )
 from utils import setup_reproducibility, get_device
@@ -273,12 +273,24 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    # Cosine Annealing with Linear Warmup
+    # Phase 1 (Epochs 0..WARMUP_EPOCHS-1): LR ramps linearly from ~0 to LEARNING_RATE
+    # Phase 2 (Epochs WARMUP_EPOCHS..TOTAL_EPOCHS): LR decays via cosine to SCHEDULER_MIN_LR
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        mode=SCHEDULER_MODE,
-        factor=SCHEDULER_FACTOR,
-        patience=SCHEDULER_PATIENCE,
-        min_lr=SCHEDULER_MIN_LR,
+        start_factor=1e-2,   # start at 1% of LEARNING_RATE
+        end_factor=1.0,      # ramp to 100% of LEARNING_RATE
+        total_iters=WARMUP_EPOCHS,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=TOTAL_EPOCHS - WARMUP_EPOCHS,
+        eta_min=SCHEDULER_MIN_LR,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[WARMUP_EPOCHS],
     )
 
     # ── Metrics ──
@@ -316,7 +328,7 @@ def main():
         elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - training_start))
         eta = time.strftime("%H:%M:%S", time.gmtime(epoch_time * (TOTAL_EPOCHS - epoch - 1)))
 
-        scheduler.step(metrics["avg_psnr"])
+        scheduler.step()  # epoch-based step (warmup -> cosine)
 
         # Print summary
         print(
