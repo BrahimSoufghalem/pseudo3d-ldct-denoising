@@ -255,7 +255,7 @@ def main():
         spatial_dims=2,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.99), weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     # Standard Cosine Annealing scheduler (1e-4 -> 1e-7 over TOTAL_EPOCHS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
