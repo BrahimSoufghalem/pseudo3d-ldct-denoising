@@ -300,9 +300,9 @@ def main():
         # Print summary
         print(
             f"Epoch [{epoch + 1:03d}/{TOTAL_EPOCHS}] "
-            f"Train: {avg_train:.4f}↓ | Val: {metrics['avg_val']:.4f}↓ | "
-            f"PSNR: {metrics['avg_psnr']:.2f} dB↑ | ΔPSNR: +{delta_psnr:.2f} dB | "
-            f"SSIM: {metrics['avg_ssim']:.4f}↑ | RMSE: {metrics['avg_rmse']:.4f}↓ | "
+            f"Train: {avg_train:.5f}↓ | Val: {metrics['avg_val']:.5f}↓ | "
+            f"PSNR: {metrics['avg_psnr']:.3f} dB↑ | ΔPSNR: +{delta_psnr:.3f} dB | "
+            f"SSIM: {metrics['avg_ssim']:.5f}↑ | RMSE: {metrics['avg_rmse']:.3f}↓ | "
             f"Chest PSNR: {metrics['avg_psnr_chest']:.2f} | Abd PSNR: {metrics['avg_psnr_abd']:.2f} | "
             f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s | Elapsed: {elapsed} | ETA: {eta}"
         )
