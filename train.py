@@ -11,14 +11,13 @@ import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from monai.metrics import SSIMMetric
 from tqdm import tqdm
 
 from config import (
     MODEL_DIR, LOGS_DIR, CHECKPOINT_PATH, BEST_MODEL_PATH,
     TOTAL_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
     PATIENCE, GRAD_CLIP_MAX_NORM, WARMUP_EPOCHS,
-    LAMBDA_L1, LAMBDA_SSIM, LAMBDA_PERC, LAMBDA_EDGE,
+    LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE,
     SCHEDULER_MIN_LR,
     A_MIN, A_MAX,
 )
@@ -28,8 +27,8 @@ from model import build_model
 from losses import MONAIHybridLoss
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
-    compute_rmse_hu, compute_vif_hu,
-    denormalize_to_hu_offset, psnr, rmse, VIFMetric
+    compute_rmse_hu,
+    denormalize_to_hu_offset, psnr, rmse
 )
 
 
@@ -83,7 +82,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 # VALIDATE ONE EPOCH
 # ═══════════════════════════════════════════
 @torch.no_grad()
-def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, device, epoch, total_epochs):
+def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
     """
     Run one validation epoch using exact ldct-benchmark physical HU metrics.
     Returns a dict containing all averaged metrics and visualization tensors.
@@ -93,13 +92,11 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
     val_psnr_sum = 0.0
     val_ssim_sum = 0.0
     val_rmse_sum = 0.0
-    val_vif_sum = 0.0
     baseline_psnr_sum = 0.0
     total_samples = 0
 
     psnr_chest, psnr_abd = [], []
     ssim_chest, ssim_abd = [], []
-    vif_chest, vif_abd = [], []
 
     viz_images = None
 
@@ -136,23 +133,19 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
             b_val = compute_psnr_windowed(mid_hu, lbl_hu, bt)
             s_val = compute_ssim_windowed(pred_hu, lbl_hu, bt)
             r_val = compute_rmse_hu(pred_hu, lbl_hu)
-            v_val = compute_vif_hu(pred_hu, lbl_hu)
 
             val_psnr_sum += p_val
             baseline_psnr_sum += b_val
             val_ssim_sum += s_val
             val_rmse_sum += r_val
-            val_vif_sum += v_val
             total_samples += 1
 
             if bt == "Chest":
                 psnr_chest.append(p_val)
                 ssim_chest.append(s_val)
-                vif_chest.append(v_val)
             else:
                 psnr_abd.append(p_val)
                 ssim_abd.append(s_val)
-                vif_abd.append(v_val)
 
         if i == 0:
             viz_images = (
@@ -172,13 +165,10 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
         "avg_rmse": val_rmse_sum / n_samples,
         "avg_baseline": baseline_psnr_sum / n_samples,
         "avg_ssim": val_ssim_sum / n_samples,
-        "avg_vif": val_vif_sum / n_samples,
         "avg_psnr_chest": sum(psnr_chest) / max(1, len(psnr_chest)),
         "avg_psnr_abd": sum(psnr_abd) / max(1, len(psnr_abd)),
         "avg_ssim_chest": sum(ssim_chest) / max(1, len(ssim_chest)),
         "avg_ssim_abd": sum(ssim_abd) / max(1, len(ssim_abd)),
-        "avg_vif_chest": sum(vif_chest) / max(1, len(vif_chest)),
-        "avg_vif_abd": sum(vif_abd) / max(1, len(vif_abd)),
         "viz_images": viz_images,
     }
 
@@ -186,7 +176,7 @@ def validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, devi
 # ═══════════════════════════════════════════
 # CHECKPOINT HELPERS
 # ═══════════════════════════════════════════
-def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter):
+def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, patience_counter):
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -195,13 +185,12 @@ def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim
         "best_val_loss": best_val_loss,
         "best_ssim": best_ssim,
         "best_psnr": best_psnr,
-        "best_vif": best_vif,
         "patience_counter": patience_counter,
     }, CHECKPOINT_PATH)
 
 
 def load_checkpoint(model, optimizer, scheduler, device):
-    """Load checkpoint if it exists. Returns (start_epoch, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter)."""
+    """Load checkpoint if it exists. Returns (start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter)."""
     if os.path.exists(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
         model.load_state_dict(checkpoint["model_state"])
@@ -211,15 +200,14 @@ def load_checkpoint(model, optimizer, scheduler, device):
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         best_ssim = checkpoint.get("best_ssim", -float("inf"))
         best_psnr = checkpoint.get("best_psnr", -float("inf"))
-        best_vif = checkpoint.get("best_vif", -float("inf"))
         patience_counter = checkpoint.get("patience_counter", 0)
         print(
             f"✅ Resumed from epoch {start_epoch} | "
             f"Best SSIM={best_ssim:.4f} | Best PSNR={best_psnr:.2f} dB"
         )
-        return start_epoch, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter
+        return start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter
 
-    return 0, float("inf"), -float("inf"), -float("inf"), -float("inf"), 0
+    return 0, float("inf"), -float("inf"), -float("inf"), 0
 
 
 # ═══════════════════════════════════════════
@@ -232,13 +220,10 @@ def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time
     writer.add_scalar("Metrics/DELTA_PSNR", metrics["avg_psnr"] - metrics["avg_baseline"], epoch + 1)
     writer.add_scalar("Metrics/SSIM", metrics["avg_ssim"], epoch + 1)
     writer.add_scalar("Metrics/RMSE", metrics["avg_rmse"], epoch + 1)
-    writer.add_scalar("Metrics/VIF", metrics["avg_vif"], epoch + 1)
     writer.add_scalar("Chest/PSNR", metrics["avg_psnr_chest"], epoch + 1)
     writer.add_scalar("Chest/SSIM", metrics["avg_ssim_chest"], epoch + 1)
-    writer.add_scalar("Chest/VIF", metrics["avg_vif_chest"], epoch + 1)
     writer.add_scalar("Abdomen/PSNR", metrics["avg_psnr_abd"], epoch + 1)
     writer.add_scalar("Abdomen/SSIM", metrics["avg_ssim_abd"], epoch + 1)
-    writer.add_scalar("Abdomen/VIF", metrics["avg_vif_abd"], epoch + 1)
     writer.add_scalar("Training/LR", current_lr, epoch + 1)
     writer.add_scalar("Training/EpochTime", epoch_time, epoch + 1)
 
@@ -266,7 +251,6 @@ def main():
     loss_fn = MONAIHybridLoss(
         lambda_l1=LAMBDA_L1,
         lambda_ssim=LAMBDA_SSIM,
-        lambda_perc=LAMBDA_PERC,
         lambda_edge=LAMBDA_EDGE,
         spatial_dims=2,
     ).to(device)
@@ -293,15 +277,11 @@ def main():
         milestones=[WARMUP_EPOCHS],
     )
 
-    # ── Metrics ──
-    ssim_metric = SSIMMetric(spatial_dims=2, data_range=1.0, reduction="mean")
-    vif_metric = VIFMetric(device=device)
-
     # ── TensorBoard & Checkpoint ──
     writer = SummaryWriter(log_dir=LOGS_DIR)
     print(f"📊  TensorBoard logs → {LOGS_DIR}")
 
-    start_epoch, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter = \
+    start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter = \
         load_checkpoint(model, optimizer, scheduler, device)
 
     # ── Data ──
@@ -320,7 +300,7 @@ def main():
         avg_train = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, TOTAL_EPOCHS)
 
         # Validate
-        metrics = validate_one_epoch(model, val_loader, loss_fn, ssim_metric, vif_metric, device, epoch, TOTAL_EPOCHS)
+        metrics = validate_one_epoch(model, val_loader, loss_fn, device, epoch, TOTAL_EPOCHS)
 
         delta_psnr = metrics["avg_psnr"] - metrics["avg_baseline"]
         current_lr = optimizer.param_groups[0]["lr"]
@@ -336,7 +316,6 @@ def main():
             f"Train: {avg_train:.4f}↓ | Val: {metrics['avg_val']:.4f}↓ | "
             f"PSNR: {metrics['avg_psnr']:.2f} dB↑ | ΔPSNR: +{delta_psnr:.2f} dB | "
             f"SSIM: {metrics['avg_ssim']:.4f}↑ | RMSE: {metrics['avg_rmse']:.4f}↓ | "
-            f"VIF: {metrics['avg_vif']:.4f}↑ | "
             f"Chest PSNR: {metrics['avg_psnr_chest']:.2f} | Abd PSNR: {metrics['avg_psnr_abd']:.2f} | "
             f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s | Elapsed: {elapsed} | ETA: {eta}"
         )
@@ -348,7 +327,6 @@ def main():
         if metrics["avg_psnr"] > best_psnr:
             best_psnr = metrics["avg_psnr"]
             best_ssim = metrics["avg_ssim"]
-            best_vif = metrics["avg_vif"]
             best_val_loss = metrics["avg_val"]
             patience_counter = 0
 
@@ -356,14 +334,13 @@ def main():
             print(
                 f"  ✅ Best model saved! "
                 f"PSNR={best_psnr:.2f} | "
-                f"SSIM={best_ssim:.4f} | "
-                f"VIF={best_vif:.4f}"
+                f"SSIM={best_ssim:.4f}"
             )
         else:
             patience_counter += 1
 
         # Save checkpoint (every epoch)
-        save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, best_vif, patience_counter)
+        save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, patience_counter)
 
         if patience_counter >= PATIENCE:
             print(f"⏹️ Early stopping at epoch {epoch + 1}")
@@ -375,7 +352,6 @@ def main():
     print(f"⏱️ Total time  : {total_time}")
     print(f"📊 Best PSNR   : {best_psnr:.2f} dB")
     print(f"📊 Best SSIM   : {best_ssim:.4f}")
-    print(f"📊 Best VIF    : {best_vif:.4f}")
     print(f"📂 Model saved : {BEST_MODEL_PATH}")
 
     writer.close()

@@ -24,7 +24,7 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 TOTAL_EPOCHS = 70
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 5e-6
-TRAIN_BATCH_SIZE = 32
+TRAIN_BATCH_SIZE = 64
 VAL_BATCH_SIZE = 64
 NUM_WORKERS = 8
 PATIENCE = 15
@@ -59,10 +59,6 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 # ═══════════════════════════════════════════
 IN_CHANNELS = 3       # Standard Pseudo-3D (2.5D): (prev, curr, next)
 OUT_CHANNELS = 1
-CHANNELS = (32, 64, 128, 256, 512)
-STRIDES = (2, 2, 2, 2)
-NUM_RES_UNITS = 2
-DROPOUT = 0.1
 
 # Ablation Study Flag: "basic" | "residual" | "multiscale" | "full"
 MAMBA_MODE = "full"
@@ -72,7 +68,6 @@ MAMBA_MODE = "full"
 # ═══════════════════════════════════════════
 LAMBDA_L1 = 1.0
 LAMBDA_SSIM = 0.5
-LAMBDA_PERC = 0.2
 LAMBDA_EDGE = 0.1
 
 # ═══════════════════════════════════════════
