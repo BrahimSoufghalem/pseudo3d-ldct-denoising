@@ -98,10 +98,9 @@ class NAFBlock(nn.Module):
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
 
-        # Small non-zero init (1e-2) ensures all conv weights receive gradients from step 1.
-        # With beta=0/gamma=0, gradient through x*beta is zero, blocking all conv weight updates.
-        self.beta = nn.Parameter(torch.full((1, c, 1, 1), 1e-2), requires_grad=True)
-        self.gamma = nn.Parameter(torch.full((1, c, 1, 1), 1e-2), requires_grad=True)
+        # Authentic Megvii NAFNet zero-initialization (pure identity baseline)
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
 
     def forward(self, inp):
         x = inp
@@ -131,7 +130,6 @@ class AnatomyAttentionGate2D(nn.Module):
     """
     Context-guided Attention Gate on skip connections with 1 + alpha scaling.
     Guarantees zero attenuation of baseline anatomical details while additively boosting clean features.
-    Bias of psi is initialized to -3.0 so sigmoid(-3)≈0.047, making the gate start as near-identity (1.047x).
     """
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -143,18 +141,17 @@ class AnatomyAttentionGate2D(nn.Module):
             nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             LayerNorm2d(F_int)
         )
-        self.psi_conv = nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True)
-        # Small weight std + bias=-3.0: sigmoid is dominated by bias≈-3 → α≈0.047 (near identity)
-        # BUT weight≠0 ensures gradients flow from decoder → skip → encoder
-        nn.init.normal_(self.psi_conv.weight, std=1e-4)
-        nn.init.constant_(self.psi_conv.bias, -3.0)
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
 
     def forward(self, g, x):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
         if g1.shape[2:] != x1.shape[2:]:
             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
-        alpha = torch.sigmoid(self.psi_conv(F.gelu(g1 + x1)))
+        alpha = self.psi(F.gelu(g1 + x1))
         # 1 + alpha guarantees preservation of anatomical detail
         return x * (1.0 + alpha)
 
