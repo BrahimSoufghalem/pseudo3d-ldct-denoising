@@ -98,8 +98,10 @@ class NAFBlock(nn.Module):
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
 
-        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
-        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        # Small non-zero init (1e-2) ensures all conv weights receive gradients from step 1.
+        # With beta=0/gamma=0, gradient through x*beta is zero, blocking all conv weight updates.
+        self.beta = nn.Parameter(torch.full((1, c, 1, 1), 1e-2), requires_grad=True)
+        self.gamma = nn.Parameter(torch.full((1, c, 1, 1), 1e-2), requires_grad=True)
 
     def forward(self, inp):
         x = inp
