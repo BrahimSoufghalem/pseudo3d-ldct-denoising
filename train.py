@@ -16,7 +16,7 @@ from tqdm import tqdm
 from config import (
     MODEL_DIR, LOGS_DIR, CHECKPOINT_PATH, BEST_MODEL_PATH,
     TOTAL_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
-    PATIENCE, GRAD_CLIP_MAX_NORM, WARMUP_EPOCHS,
+    PATIENCE, GRAD_CLIP_MAX_NORM,
     LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE,
     SCHEDULER_MIN_LR,
     A_MIN, A_MAX,
@@ -257,24 +257,11 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Cosine Annealing with Linear Warmup
-    # Phase 1 (Epochs 0..WARMUP_EPOCHS-1): LR ramps linearly from ~0 to LEARNING_RATE
-    # Phase 2 (Epochs WARMUP_EPOCHS..TOTAL_EPOCHS): LR decays via cosine to SCHEDULER_MIN_LR
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+    # Standard Cosine Annealing scheduler (1e-4 -> 1e-7 over TOTAL_EPOCHS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        start_factor=1e-2,   # start at 1% of LEARNING_RATE
-        end_factor=1.0,      # ramp to 100% of LEARNING_RATE
-        total_iters=WARMUP_EPOCHS,
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=TOTAL_EPOCHS - WARMUP_EPOCHS,
+        T_max=TOTAL_EPOCHS,
         eta_min=SCHEDULER_MIN_LR,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[WARMUP_EPOCHS],
     )
 
     # ── TensorBoard & Checkpoint ──

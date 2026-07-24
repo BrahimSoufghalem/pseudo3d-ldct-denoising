@@ -22,14 +22,13 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 # TRAINING HYPERPARAMETERS
 # ═══════════════════════════════════════════
 TOTAL_EPOCHS = 70
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 5e-6
 TRAIN_BATCH_SIZE = 64
 VAL_BATCH_SIZE = 64
 NUM_WORKERS = 8
 PATIENCE = 15
-GRAD_CLIP_MAX_NORM = 0.5
-WARMUP_EPOCHS = 5       # Linear warmup from ~0 to LEARNING_RATE over first N epochs
+GRAD_CLIP_MAX_NORM = 1.0
 
 # ═══════════════════════════════════════════
 # DATA / PREPROCESSING
