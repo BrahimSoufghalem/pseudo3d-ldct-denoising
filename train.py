@@ -56,7 +56,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 
         with autocast("cuda"):
             pred_res = model(images)
-            pred_img = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
+            pred_img = mid_slice + pred_res
             loss, loss_info = loss_fn(pred_img, labels)
 
         scaler.scale(loss).backward()
