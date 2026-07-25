@@ -186,13 +186,13 @@ class CrossMerge2D(nn.Module):
         y2 = torch.flip(y2, dims=[-1])
         y3 = y3.view(y3.shape[0], y3.shape[1], W, H).transpose(2, 3).flatten(2)
         y4 = torch.flip(y4, dims=[-1]).view(y4.shape[0], y4.shape[1], W, H).transpose(2, 3).flatten(2)
-        y = y1 + y2 + y3 + y4
+        y = (y1 + y2 + y3 + y4) * 0.25
         return y.view(y.shape[0], y.shape[1], H, W)
 
 
 class SelectiveStateRecurrenceS6(nn.Module):
     """
-    True S6 Selective State Recurrence Kernel.
+    True S6 Selective State Recurrence Kernel with official Mamba dt initialization & clamping.
     Discretizes continuous state matrices A, B with step size dt and computes recurrence:
       h_t = exp(dt * A) * h_{t-1} + (dt * B) * x_t
       y_t = C * h_t + D * x_t
@@ -212,48 +212,60 @@ class SelectiveStateRecurrenceS6(nn.Module):
         self.x_proj = nn.Linear(d_inner, dt_rank + d_state * 2, bias=False)
         self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
 
-    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
+        # Official Mamba dt_proj initialization
+        dt_init_std = dt_rank ** -0.5
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+
     def forward(self, xs):
-        # xs: [4, B, C, L] — forced to FP32 for numerical stability in recurrence
-        K, B, C, L = xs.shape
-        out_scans = []
+        with torch.autocast(device_type='cuda', enabled=False):
+            xs = xs.float()
+            K, B, C, L = xs.shape
+            out_scans = []
 
-        A = -torch.exp(self.A_log.float())  # [C, N]
+            A = -torch.exp(self.A_log.float())  # [C, N]
 
-        for k in range(K):
-            x_k = xs[k].transpose(1, 2)  # [B, L, C]
+            for k in range(K):
+                x_k = xs[k].transpose(1, 2)  # [B, L, C]
 
-            # Project dt, B, C per token
-            x_dbl = self.x_proj(x_k)  # [B, L, dt_rank + 2*d_state]
-            dt, B_mat, C_mat = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                # Project dt, B, C per token
+                x_dbl = self.x_proj(x_k)  # [B, L, dt_rank + 2*d_state]
+                dt, B_mat, C_mat = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
 
-            dt = F.softplus(self.dt_proj(dt))  # [B, L, C]
+                # Clamp dt step size to prevent numerical divergence
+                dt = F.softplus(self.dt_proj(dt)).clamp(min=1e-3, max=0.1)  # [B, L, C]
 
-            # S6 Selective Recurrence over sequence L
-            y_seq = []
-            h = torch.zeros(B, C, self.d_state, device=xs.device, dtype=torch.float32)  # Recurrent hidden state
+                # S6 Selective Recurrence over sequence L
+                y_seq = []
+                h = torch.zeros(B, C, self.d_state, device=xs.device, dtype=torch.float32)  # Recurrent hidden state
 
-            for t in range(L):
-                x_t = x_k[:, t, :]  # [B, C]
-                dt_t = dt[:, t, :]  # [B, C]
-                B_t = B_mat[:, t, :]  # [B, N]
-                C_t = C_mat[:, t, :]  # [B, N]
+                for t in range(L):
+                    x_t = x_k[:, t, :]  # [B, C]
+                    dt_t = dt[:, t, :]  # [B, C]
+                    B_t = B_mat[:, t, :]  # [B, N]
+                    C_t = C_mat[:, t, :]  # [B, N]
 
-                # Discretization: dA = exp(dt_t * A), dB = dt_t * B_t
-                dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # [B, C, N]
-                dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # [B, C, N]
+                    # Discretization: dA = exp(dt_t * A), dB = dt_t * B_t
+                    dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # [B, C, N]
+                    dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # [B, C, N]
 
-                # Recurrence state update: h_t = dA * h_{t-1} + dB * x_t
-                h = dA * h + dB * x_t.unsqueeze(-1)
+                    # Recurrence state update: h_t = dA * h_{t-1} + dB * x_t
+                    h = dA * h + dB * x_t.unsqueeze(-1)
 
-                # Output state projection: y_t = sum(C_t * h_t) + D * x_t
-                y_t = (h * C_t.unsqueeze(1)).sum(dim=-1) + self.D.unsqueeze(0) * x_t
-                y_seq.append(y_t)
+                    # Output state projection: y_t = sum(C_t * h_t) + D * x_t
+                    y_t = (h * C_t.unsqueeze(1)).sum(dim=-1) + self.D.unsqueeze(0) * x_t
+                    y_seq.append(y_t)
 
-            y_k = torch.stack(y_seq, dim=1).transpose(1, 2)  # [B, C, L]
-            out_scans.append(y_k)
+                y_k = torch.stack(y_seq, dim=1).transpose(1, 2)  # [B, C, L]
+                out_scans.append(y_k)
 
-        return torch.stack(out_scans, dim=0)  # [4, B, C, L]
+            return torch.stack(out_scans, dim=0)  # [4, B, C, L]
 
 
 class SS2DMambaBottleneck(nn.Module):
@@ -278,7 +290,9 @@ class SS2DMambaBottleneck(nn.Module):
         # S6 Recurrence Engine
         self.s6 = SelectiveStateRecurrenceS6(d_inner=self.d_inner, d_state=d_state, dt_rank=math.ceil(d_model / 16))
 
+        self.out_norm = LayerNorm2d(self.d_inner)
         self.out_proj = nn.Conv2d(self.d_inner, d_model, kernel_size=1, bias=False)
+        nn.init.zeros_(self.out_proj.weight)  # Starts as identity residual block
 
     def forward(self, x):
         residual = x
@@ -299,7 +313,7 @@ class SS2DMambaBottleneck(nn.Module):
         ys = self.s6(xs)
 
         # Cross Merge -> [B, C, H, W]
-        ssm_out = self.cross_merge(ys, H, W)
+        ssm_out = self.out_norm(self.cross_merge(ys, H, W))
 
         # Gated multiplicative interaction with z_branch
         out = ssm_out * self.act(z_branch)

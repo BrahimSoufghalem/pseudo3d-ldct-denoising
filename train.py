@@ -36,9 +36,10 @@ from metrics import (
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
 def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, total_epochs):
-    """Run one training epoch. Returns average training loss."""
+    """Run one training epoch. Returns (avg_train_loss, skipped_steps, current_scale)."""
     model.train()
     train_loss = 0.0
+    skipped_steps = 0
 
     train_bar = tqdm(
         train_loader,
@@ -56,12 +57,14 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 
         with autocast("cuda"):
             pred_res = model(images)
-            pred_img = mid_slice + pred_res
+            pred_img = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
             loss, loss_info = loss_fn(pred_img, labels)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+        if not torch.isfinite(gnorm):
+            skipped_steps += 1
         scaler.step(optimizer)
         scaler.update()
 
@@ -72,10 +75,11 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
             L1=f"{loss_info['L1']:.4f}",
             SSIM=f"{loss_info['SSIM']:.4f}",
             Edge=f"{loss_info['Edge']:.4f}",
+            sk=skipped_steps,
         )
 
     avg_train = train_loss / max(1, len(train_loader))
-    return avg_train
+    return avg_train, skipped_steps, scaler.get_scale()
 
 
 # ═══════════════════════════════════════════
@@ -284,7 +288,7 @@ def main():
         epoch_start = time.time()
 
         # Train
-        avg_train = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, TOTAL_EPOCHS)
+        avg_train, skipped_steps, current_scale = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, TOTAL_EPOCHS)
 
         # Validate
         metrics = validate_one_epoch(model, val_loader, loss_fn, device, epoch, TOTAL_EPOCHS)
@@ -295,7 +299,7 @@ def main():
         elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - training_start))
         eta = time.strftime("%H:%M:%S", time.gmtime(epoch_time * (TOTAL_EPOCHS - epoch - 1)))
 
-        scheduler.step()  # epoch-based step (warmup -> cosine)
+        scheduler.step()
 
         # Print summary
         print(
@@ -303,8 +307,8 @@ def main():
             f"Train: {avg_train:.5f}↓ | Val: {metrics['avg_val']:.5f}↓ | "
             f"PSNR: {metrics['avg_psnr']:.3f} dB↑ | ΔPSNR: +{delta_psnr:.3f} dB | "
             f"SSIM: {metrics['avg_ssim']:.5f}↑ | RMSE: {metrics['avg_rmse']:.3f}↓ | "
-            f"Chest PSNR: {metrics['avg_psnr_chest']:.2f} | Abd PSNR: {metrics['avg_psnr_abd']:.2f} | "
-            f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s | Elapsed: {elapsed} | ETA: {eta}"
+            f"skipped: {skipped_steps}/{len(train_loader)} | scale: {current_scale:.0f} | "
+            f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s"
         )
 
         # Log to TensorBoard

@@ -77,8 +77,10 @@ class MSNAFMambaNet(nn.Module):
         self.up1 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False), nn.PixelShuffle(2))
         self.dec1 = nn.Sequential(nn.Conv2d(64, 32, kernel_size=1), NAFBlock(32))
 
-        # Output Head
+        # Output Head (Zero-initialized for pure identity residual baseline at step 0)
         self.head = nn.Conv2d(32, out_channels, kernel_size=3, padding=1, bias=True)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
     def forward(self, x):
         # Stem
@@ -100,8 +102,8 @@ class MSNAFMambaNet(nn.Module):
         # Mamba Bottleneck
         b_feat = self.bottleneck(d4)
 
-        # Skip Attention Gating
-        g4 = self.ag4(g=b_feat, x=e4)
+        # Skip Attention Gating (Use d4 as gate for ag4 to keep b_feat dedicated for bottleneck/fusion)
+        g4 = self.ag4(g=d4, x=e4)
         g3 = self.ag3(g=d3, x=e3)
         g2 = self.ag2(g=d2, x=e2)
         g1 = self.ag1(g=d1, x=e1)

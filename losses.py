@@ -47,7 +47,7 @@ class SobelEdgeLoss(nn.Module):
         sobel_y = self.sobel_y.repeat(c, 1, 1, 1)
         gx = F.conv2d(x, sobel_x, padding=1, groups=c)
         gy = F.conv2d(x, sobel_y, padding=1, groups=c)
-        grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+        grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-3)
         return grad_mag
 
     def forward(self, pred, target):
