@@ -57,7 +57,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 
         with autocast("cuda"):
             pred_res = model(images)
-            pred_img = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
+            pred_img = mid_slice + pred_res
             loss, loss_info = loss_fn(pred_img, labels)
 
         scaler.scale(loss).backward()
@@ -181,9 +181,10 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
 # CHECKPOINT HELPERS
 # ═══════════════════════════════════════════
 def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, patience_counter):
+    model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
     torch.save({
         "epoch": epoch,
-        "model_state": model.state_dict(),
+        "model_state": model_state,
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "best_val_loss": best_val_loss,
@@ -196,8 +197,16 @@ def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim
 def load_checkpoint(model, optimizer, scheduler, device):
     """Load checkpoint if it exists. Returns (start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter)."""
     if os.path.exists(CHECKPOINT_PATH):
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-        model.load_state_dict(checkpoint["model_state"])
+        try:
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+        except Exception:
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        state_dict = checkpoint["model_state"]
+        if hasattr(model, "module"):
+            model.module.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         start_epoch = checkpoint["epoch"] + 1
@@ -261,11 +270,22 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    # Standard Cosine Annealing scheduler (1e-4 -> 1e-7 over TOTAL_EPOCHS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Cosine Annealing with Linear Warmup
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=TOTAL_EPOCHS,
+        start_factor=1e-2,
+        end_factor=1.0,
+        total_iters=WARMUP_EPOCHS,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=TOTAL_EPOCHS - WARMUP_EPOCHS,
         eta_min=SCHEDULER_MIN_LR,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[WARMUP_EPOCHS],
     )
 
     # ── TensorBoard & Checkpoint ──

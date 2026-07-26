@@ -77,10 +77,22 @@ class MSNAFMambaNet(nn.Module):
         self.up1 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False), nn.PixelShuffle(2))
         self.dec1 = nn.Sequential(nn.Conv2d(64, 32, kernel_size=1), NAFBlock(32))
 
+        # Apply ICNR initialization to eliminate checkerboard artifacts in CT images
+        for up in [self.up4, self.up3, self.up2, self.up1]:
+            self._init_icnr(up[0], scale=2)
+
         # Output Head (Zero-initialized for pure identity residual baseline at step 0)
         self.head = nn.Conv2d(32, out_channels, kernel_size=3, padding=1, bias=True)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+
+    @staticmethod
+    def _init_icnr(conv, scale=2):
+        oc, ic, kh, kw = conv.weight.data.shape
+        sub_kernel = torch.randn(oc // (scale ** 2), ic, kh, kw)
+        nn.init.kaiming_normal_(sub_kernel)
+        sub_kernel = sub_kernel.repeat_interleave(scale ** 2, dim=0)
+        conv.weight.data.copy_(sub_kernel)
 
     def forward(self, x):
         # Stem

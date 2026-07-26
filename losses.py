@@ -47,7 +47,7 @@ class SobelEdgeLoss(nn.Module):
         sobel_y = self.sobel_y.repeat(c, 1, 1, 1)
         gx = F.conv2d(x, sobel_x, padding=1, groups=c)
         gy = F.conv2d(x, sobel_y, padding=1, groups=c)
-        grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-3)
+        grad_mag = torch.sqrt(torch.clamp(gx ** 2 + gy ** 2, min=1e-6))
         return grad_mag
 
     def forward(self, pred, target):
@@ -81,6 +81,10 @@ class MONAIHybridLoss(nn.Module):
         self.edge_loss = SobelEdgeLoss()
 
     def forward(self, pred_img, target_img):
+        # Force FP32 precision for loss calculations to prevent FP16 underflow/instability
+        pred_img = pred_img.float()
+        target_img = target_img.float()
+
         l1 = F.l1_loss(pred_img, target_img)
         ssim = self.ssim_loss(pred_img, target_img)
         edge = self.edge_loss(pred_img, target_img)

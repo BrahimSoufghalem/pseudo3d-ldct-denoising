@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 class LayerNormFunction(torch.autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(ctx, x, weight, bias, eps):
         ctx.eps = eps
         N, C, H, W = x.size()
@@ -30,10 +31,11 @@ class LayerNormFunction(torch.autograd.Function):
         return y
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
         eps = ctx.eps
         N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
+        y, var, weight = ctx.saved_tensors
         g = grad_output * weight.view(1, C, 1, 1)
         mean_g = g.mean(dim=1, keepdim=True)
         mean_gy = (g * y).mean(dim=1, keepdim=True)
@@ -61,7 +63,7 @@ class SimpleGate(nn.Module):
 
 
 class SimplifiedChannelAttention(nn.Module):
-    """Parameter-free channel attention from Megvii NAFNet."""
+    """Channel attention with 1x1 Conv from Megvii NAFNet."""
     def __init__(self, c):
         super().__init__()
         self.sca = nn.Sequential(
@@ -98,9 +100,9 @@ class NAFBlock(nn.Module):
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
 
-        # Authentic Megvii NAFNet zero-initialization (pure identity baseline)
-        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
-        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        # Non-zero beta/gamma (1.0) ensures immediate gradient flow to all internal conv layers
+        self.beta = nn.Parameter(torch.ones((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.ones((1, c, 1, 1)), requires_grad=True)
 
     def forward(self, inp):
         x = inp
@@ -123,13 +125,14 @@ class NAFBlock(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 2. ANATOMY-GUIDED ATTENTION SKIP GATE (1 + alpha Preservation)
+# 2. ANATOMY-GUIDED ATTENTION SKIP GATE (Suppression & Amplification)
 # ═════════════════════════════════════════════════════════════════════
 
 class AnatomyAttentionGate2D(nn.Module):
     """
-    Context-guided Attention Gate on skip connections with 1 + alpha scaling.
-    Guarantees zero attenuation of baseline anatomical details while additively boosting clean features.
+    Context-guided Attention Gate with Tanh scaling (0.5 to 1.5 multiplier).
+    Allows both noise suppression (<1.0) and clean signal amplification (>1.0),
+    initialized at exact identity 1.0.
     """
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -143,8 +146,10 @@ class AnatomyAttentionGate2D(nn.Module):
         )
         self.psi = nn.Sequential(
             nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.Sigmoid()
+            nn.Tanh()
         )
+        nn.init.zeros_(self.psi[0].weight)
+        nn.init.zeros_(self.psi[0].bias)
 
     def forward(self, g, x):
         g1 = self.W_g(g)
@@ -152,8 +157,8 @@ class AnatomyAttentionGate2D(nn.Module):
         if g1.shape[2:] != x1.shape[2:]:
             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
         alpha = self.psi(F.gelu(g1 + x1))
-        # 1 + alpha guarantees preservation of anatomical detail
-        return x * (1.0 + alpha)
+        # 1.0 + 0.5 * Tanh gives dynamic range [0.5, 1.5] centered at 1.0
+        return x * (1.0 + 0.5 * alpha)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -231,27 +236,30 @@ class SelectiveStateRecurrenceS6(nn.Module):
             # Merge 4 direction scans into batch dimension: [K*B, L, C]
             x_all = xs.permute(0, 1, 3, 2).reshape(K * B, L, C)
 
-            # Parallel projection for all K*B scans
-            x_dbl = self.x_proj(x_all)  # [K*B, L, dt_rank + 2*d_state]
+            # Linear projection: [K*B, L, dt_rank + 2*d_state]
+            x_dbl = self.x_proj(x_all)
             dt, B_mat, C_mat = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
 
             # Clamp step size to prevent numerical divergence
             dt = F.softplus(self.dt_proj(dt)).clamp(min=1e-3, max=0.1)  # [K*B, L, C]
-
             A = -torch.exp(self.A_log.float())  # [C, N]
 
-            # Vectorized pre-computation of dA and dB*x for all sequence steps
-            dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # [K*B, L, C, N]
-            dB_x = (dt.unsqueeze(-1) * B_mat.unsqueeze(2)) * x_all.unsqueeze(-1)  # [K*B, L, C, N]
-            D_x = self.D.unsqueeze(0).unsqueeze(0) * x_all  # [K*B, L, C]
-
-            # Fast 4.2x Vectorized Recurrence Loop over sequence L
+            # Fast Memory-Light Recurrence over sequence L (8MB VRAM per step instead of 4.3GB 4D tensor)
             h = torch.zeros(K * B, C, self.d_state, device=xs.device, dtype=torch.float32)
             y_seq = []
 
             for t in range(L):
-                h = dA[:, t] * h + dB_x[:, t]
-                y_t = (h * C_mat[:, t].unsqueeze(1)).sum(dim=-1) + D_x[:, t]
+                x_t = x_all[:, t, :]       # [K*B, C]
+                dt_t = dt[:, t, :]         # [K*B, C]
+                B_t = B_mat[:, t, :]       # [K*B, N]
+                C_t = C_mat[:, t, :]       # [K*B, N]
+
+                # Compute 2D slice for step t: [K*B, C, N] (only 8MB VRAM)
+                dA_t = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
+                dB_t = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)
+
+                h = dA_t * h + dB_t * x_t.unsqueeze(-1)
+                y_t = (h * C_t.unsqueeze(1)).sum(dim=-1) + self.D.unsqueeze(0) * x_t
                 y_seq.append(y_t)
 
             y_all = torch.stack(y_seq, dim=1).transpose(1, 2)  # [K*B, C, L]
@@ -357,4 +365,4 @@ class MultiScaleSpatialFusion(nn.Module):
         if up_low.shape[2:] != feat_high.shape[2:]:
             up_low = F.interpolate(up_low, size=feat_high.shape[2:], mode='bilinear', align_corners=False)
         concat = torch.cat([up_low, feat_high], dim=1)
-        return self.fuse_conv(concat)
+        return feat_high + self.fuse_conv(concat)

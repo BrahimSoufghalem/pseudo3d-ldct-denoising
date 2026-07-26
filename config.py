@@ -24,11 +24,12 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 TOTAL_EPOCHS = 50
 LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
-TRAIN_BATCH_SIZE = 64
-VAL_BATCH_SIZE = 64
+TRAIN_BATCH_SIZE = 16
+VAL_BATCH_SIZE = 32
 NUM_WORKERS = 8
 PATIENCE = 15
 GRAD_CLIP_MAX_NORM = 1.0
+WARMUP_EPOCHS = 5
 
 # ═══════════════════════════════════════════
 # DATA / PREPROCESSING
@@ -43,7 +44,7 @@ CACHE_DATA = True
 # ═══════════════════════════════════════════
 # EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
 # ═══════════════════════════════════════════
-EVAL_DATA_RANGE = 2924.0  # Maximum HU of bone (1900) + DICOM offset (1024) -> 2924
+EVAL_DATA_RANGE = 2624.0  # Physical HU span: A_MAX - A_MIN = 1600 - (-1024) = 2624.0
 
 # Clinical Diagnostic Windows in (HU + 1024 offset) domain
 CLINICAL_WINDOWS = {
