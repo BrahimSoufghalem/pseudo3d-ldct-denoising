@@ -35,8 +35,8 @@ from metrics import (
 # ═══════════════════════════════════════════
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
-def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, total_epochs):
-    """Run one training epoch. Returns (avg_train_loss, skipped_steps, current_scale)."""
+def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, total_epochs):
+    """Run one training epoch in pure FP32 precision. Returns (avg_train_loss, skipped_steps)."""
     model.train()
     train_loss = 0.0
     skipped_steps = 0
@@ -55,18 +55,17 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast("cuda"):
-            pred_res = model(images)
-            pred_img = mid_slice + pred_res
-            loss, loss_info = loss_fn(pred_img, labels)
+        pred_res = model(images)
+        pred_img = mid_slice + pred_res
+        loss, loss_info = loss_fn(pred_img, labels)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
         if not torch.isfinite(gnorm):
             skipped_steps += 1
-        scaler.step(optimizer)
-        scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            optimizer.step()
 
         train_loss += loss.item()
 
@@ -79,7 +78,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epo
         )
 
     avg_train = train_loss / max(1, len(train_loader))
-    return avg_train, skipped_steps, scaler.get_scale()
+    return avg_train, skipped_steps
 
 
 # ═══════════════════════════════════════════
@@ -115,10 +114,9 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
         labels = batch["label"].to(device)
         mid_slice = images[:, 1:2, :, :]
 
-        with autocast("cuda"):
-            pred_res = model(images)
-            preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
-            loss, _ = loss_fn(preds, labels)
+        pred_res = model(images)
+        preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
+        loss, _ = loss_fn(preds, labels)
 
         val_loss += loss.item()
         body_types = batch.get("body_type", None)
@@ -298,17 +296,14 @@ def main():
     # ── Data ──
     train_loader, val_loader = prepareCT2D()
 
-    # ── GradScaler ──
-    scaler = GradScaler("cuda")
-
     training_start = time.time()
 
     # ── Training Loop ──
     for epoch in range(start_epoch, TOTAL_EPOCHS):
         epoch_start = time.time()
 
-        # Train
-        avg_train, skipped_steps, current_scale = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, epoch, TOTAL_EPOCHS)
+        # Train (Pure FP32 Precision)
+        avg_train, skipped_steps = train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, TOTAL_EPOCHS)
 
         # Validate
         metrics = validate_one_epoch(model, val_loader, loss_fn, device, epoch, TOTAL_EPOCHS)
@@ -327,7 +322,7 @@ def main():
             f"Train: {avg_train:.5f}↓ | Val: {metrics['avg_val']:.5f}↓ | "
             f"PSNR: {metrics['avg_psnr']:.3f} dB↑ | ΔPSNR: +{delta_psnr:.3f} dB | "
             f"SSIM: {metrics['avg_ssim']:.5f}↑ | RMSE: {metrics['avg_rmse']:.3f}↓ | "
-            f"skipped: {skipped_steps}/{len(train_loader)} | scale: {current_scale:.0f} | "
+            f"skipped: {skipped_steps}/{len(train_loader)} | "
             f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s"
         )
 
