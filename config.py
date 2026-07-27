@@ -22,7 +22,7 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 # TRAINING HYPERPARAMETERS
 # ═══════════════════════════════════════════
 TOTAL_EPOCHS = 50
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-4
 TRAIN_BATCH_SIZE = 16
 VAL_BATCH_SIZE = 32
@@ -71,13 +71,13 @@ ANATOMY_EMBED_DIM = 32
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
 LAMBDA_L1 = 1.0
-LAMBDA_SSIM = 0.5
-LAMBDA_EDGE = 0.1
+LAMBDA_SSIM = 0.6
+LAMBDA_EDGE = 0.2
 
 # ═══════════════════════════════════════════
 # SCHEDULER (Cosine Annealing with Linear Warmup)
 # ═══════════════════════════════════════════
-SCHEDULER_MIN_LR = 1e-7
+SCHEDULER_MIN_LR = 5e-5
 
 # ═══════════════════════════════════════════
 # REPRODUCIBILITY
