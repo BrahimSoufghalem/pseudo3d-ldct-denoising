@@ -50,12 +50,15 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
     for batch in train_bar:
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
+        anatomy_id = batch.get("anatomy_id", None)
+        if anatomy_id is not None:
+            anatomy_id = anatomy_id.to(device).squeeze()
 
         mid_slice = images[:, 1:2, :, :]
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_res = model(images)
+        pred_res = model(images, anatomy_id=anatomy_id)
         pred_img = mid_slice + pred_res
         loss, loss_info = loss_fn(pred_img, labels)
 
@@ -112,9 +115,12 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
     for i, batch in enumerate(val_bar):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
+        anatomy_id = batch.get("anatomy_id", None)
+        if anatomy_id is not None:
+            anatomy_id = anatomy_id.to(device).squeeze()
         mid_slice = images[:, 1:2, :, :]
 
-        pred_res = model(images)
+        pred_res = model(images, anatomy_id=anatomy_id)
         preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
         loss, _ = loss_fn(preds, labels)
 

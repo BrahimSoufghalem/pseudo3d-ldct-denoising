@@ -60,6 +60,11 @@ class StackSlicesd:
 
         del data["image_prev"]
         del data["image_next"]
+
+        # Pass anatomy_id as tensor for DataLoader collation
+        if "anatomy_id" in data:
+            data["anatomy_id"] = torch.tensor(data["anatomy_id"], dtype=torch.long)
+
         return data
 
 
@@ -93,6 +98,7 @@ def collect_files(patient_list, in_dir=DATA_DIR):
                 "label":      full_imgs[i],
                 "patient":    patient,
                 "body_type":  "Chest" if patient.lower().startswith("c") else "Abdomen",
+                "anatomy_id": 0 if patient.lower().startswith("c") else 1,
             })
     return files
 
