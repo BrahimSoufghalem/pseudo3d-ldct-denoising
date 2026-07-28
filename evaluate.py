@@ -1,22 +1,19 @@
 """
-LDCT Project — Evaluation Script (Full Image Resolution & ldct-benchmark Physics Standard)
-==========================================================================================
-All parameters, paths, clinical windows, and evaluation settings are imported from `config.py`.
-Runs the trained model on the `test/` folder using FULL original resolution
-without any cropping or padding.
+LDCT Project - Evaluation Script (full resolution, ldct-benchmark physics)
+=========================================================================
+Runs a trained model over the `test/` folder at FULL original resolution
+(no cropping, no padding loss - the model pads internally and crops back).
 
-Calculates physically & clinically accurate metrics using the exact ldct-benchmark standard:
-- RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
-- PSNR & SSIM: Measured on Clinical Diagnostic Windows (Lung Window for Chest, Soft Tissue Window for Abdomen).
-- VIF: Measured on physical HU scale.
+Metrics (ldct-benchmark standard):
+- RMSE       : physical HU, clipped to [0, A_MAX + 1024] (see config).
+- PSNR/SSIM  : on clinical diagnostic windows (lung for chest, soft tissue for abdomen).
+- VIF        : on the physical HU scale.
 
 Usage:
-    python evaluate.py
-    python evaluate.py --model FinalCT_2.5D-UNET-DATASET/best_model.pt 
-    python evaluate.py --save-images
+    python evaluate.py --input-mode 2.5d --mamba-mode full
+    python evaluate.py --model runs/25d_full/best_model.pt --save-images
 """
 
-import os
 import argparse
 from pathlib import Path
 from glob import glob
@@ -26,14 +23,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from torch.cuda.amp import autocast
 from tqdm import tqdm
 
-from config import (
-    TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
-    A_MIN, A_MAX, B_MIN, B_MAX,
+import config as cfg
+from config import TEST_DIR, EVAL_OUTPUT_DIR, A_MIN, A_MAX
+from utils import (
+    setup_reproducibility, get_device, sort_by_instance_number,
+    build_model_input, extract_centre_slice, load_state_into,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
@@ -51,31 +48,24 @@ def load_dicom_tensor(path):
     """Read one DICOM file and return a float32 tensor in HU."""
     ds = pydicom.dcmread(path)
     arr = ds.pixel_array.astype(np.float32)
-
-    # Apply RescaleSlope / RescaleIntercept if available
     slope = float(getattr(ds, "RescaleSlope", 1.0))
     intercept = float(getattr(ds, "RescaleIntercept", 0.0))
     arr = arr * slope + intercept
-
     return torch.from_numpy(arr)
 
 
 def normalize(tensor, a_min=A_MIN, a_max=A_MAX):
-    """Clip and scale HU → [0, 1]."""
-    tensor = tensor.clamp(a_min, a_max)
-    tensor = (tensor - a_min) / (a_max - a_min)
-    return tensor
+    """Clip and scale HU -> [0, 1]."""
+    return (tensor.clamp(a_min, a_max) - a_min) / (a_max - a_min)
 
 
 # ═══════════════════════════════════════════
 # PATIENT EVALUATION
 # ═══════════════════════════════════════════
 @torch.no_grad()
-def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_dir=None):
-    """
-    Evaluate one patient — runs the model on every slice using FULL resolution
-    and returns a dict with average benchmark-aligned metrics.
-    """
+def evaluate_patient(pid, patient_dir, model, device, input_mode="2.5d",
+                     save_images=False, output_dir=None, use_amp=True):
+    """Evaluate every slice of one patient at full resolution."""
     low_dir = patient_dir / "Low_Dose"
     full_dir = patient_dir / "Full_Dose"
 
@@ -91,41 +81,36 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
     psnr_scores, ssim_scores, rmse_scores, vif_scores = [], [], [], []
     baseline_psnr_scores = []
 
-    # Save one visualization per patient (middle slice)
     viz_slice_idx = n // 2
     viz_triplet = None
+
+    amp_enabled = use_amp and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if (amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
 
     for i in tqdm(range(n), desc=f"  [{pid}]", leave=False, unit="slice"):
         prev_i = max(i - 1, 0)
         next_i = min(i + 1, n - 1)
 
-        # Load raw HU tensors
         raw_prev = load_dicom_tensor(low_imgs[prev_i])
         raw_curr = load_dicom_tensor(low_imgs[i])
         raw_next = load_dicom_tensor(low_imgs[next_i])
         raw_full = load_dicom_tensor(full_imgs[i])
 
-        # Build 3-channel Pseudo-3D input [1, 3, H, W]
-        inp = build_pseudo3d_input(
-            raw_prev, raw_curr, raw_next,
-            a_min=A_MIN, a_max=A_MAX
-        ).to(device)
-
+        # [1, C, H, W] with C = 1 (2d) or 3 (2.5d); HU limits come from config
+        inp = build_model_input(raw_prev, raw_curr, raw_next, input_mode=input_mode).to(device)
         lbl = normalize(raw_full).unsqueeze(0).unsqueeze(0).to(device)
-        mid = inp[:, 1:2, :, :]                              # current low-dose slice in full HU range [0, 1]
+        mid = extract_centre_slice(inp)
 
-        with autocast():
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             pred_res = model(inp)
-            pred = torch.clamp(mid + pred_res, 0.0, 1.0)
+        pred = torch.clamp(mid.float() + pred_res.float(), 0.0, 1.0)
 
-        # ── 1. Convert tensors to HU + 1024 offset domain (ldct-benchmark standard) ──
         pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
-        lbl_hu_offset  = denormalize_to_hu_offset(lbl.squeeze(),  A_MIN, A_MAX)
-        mid_hu_offset  = denormalize_to_hu_offset(mid.squeeze(),  A_MIN, A_MAX)
+        lbl_hu_offset = denormalize_to_hu_offset(lbl.squeeze(), A_MIN, A_MAX)
+        mid_hu_offset = denormalize_to_hu_offset(mid.squeeze(), A_MIN, A_MAX)
 
-        # ── 2. Compute ldct-benchmark metrics ──
         p_val = compute_psnr_windowed(pred_hu_offset, lbl_hu_offset, body_type)
-        b_val = compute_psnr_windowed(mid_hu_offset,  lbl_hu_offset, body_type)
+        b_val = compute_psnr_windowed(mid_hu_offset, lbl_hu_offset, body_type)
         s_val = compute_ssim_windowed(pred_hu_offset, lbl_hu_offset, body_type)
         r_val = compute_rmse_hu(pred_hu_offset, lbl_hu_offset)
         v_val = compute_vif_hu(pred_hu_offset, lbl_hu_offset)
@@ -144,21 +129,21 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
                 apply_center_width(pred_hu_offset, center, width),
             )
 
-    avg = lambda lst: sum(lst) / max(len(lst), 1)
+    def avg(lst):
+        return sum(lst) / max(len(lst), 1)
 
     result = {
-        "PatientID":      pid,
-        "BodyType":       body_type,
-        "NumSlices":      n,
-        "PSNR":           round(avg(psnr_scores), 4),
-        "Baseline_PSNR":  round(avg(baseline_psnr_scores), 4),
-        "Delta_PSNR":     round(avg(psnr_scores) - avg(baseline_psnr_scores), 4),
-        "SSIM":           round(avg(ssim_scores), 4),
-        "RMSE_HU":        round(avg(rmse_scores), 4),
-        "VIF":            round(avg(vif_scores), 4),
+        "PatientID": pid,
+        "BodyType": body_type,
+        "NumSlices": n,
+        "PSNR": round(avg(psnr_scores), 4),
+        "Baseline_PSNR": round(avg(baseline_psnr_scores), 4),
+        "Delta_PSNR": round(avg(psnr_scores) - avg(baseline_psnr_scores), 4),
+        "SSIM": round(avg(ssim_scores), 4),
+        "RMSE_HU": round(avg(rmse_scores), 4),
+        "VIF": round(avg(vif_scores), 4),
     }
 
-    # Save visualization
     if save_images and viz_triplet is not None and output_dir is not None:
         save_patient_viz(pid, body_type, viz_triplet, result, output_dir)
 
@@ -166,45 +151,41 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
 
 
 # ═══════════════════════════════════════════
-# VISUALIZATION HELPER
+# VISUALIZATION
 # ═══════════════════════════════════════════
 def save_patient_viz(pid, body_type, viz_triplet, metrics, output_dir):
-    """Save a side-by-side triplet: LDCT | NDCT | Denoised (using clinical window)."""
+    """Save a side-by-side triplet: LDCT | NDCT | Denoised (clinical window)."""
     ldct, ndct, denoised = viz_triplet
     fig = plt.figure(figsize=(15, 5))
     gs = gridspec.GridSpec(1, 3, wspace=0.05)
 
     window_name = "Lung Window (C=-600, W=1500)" if body_type == "Chest" else "Soft Tissue Window (C=50, W=400)"
-
     titles = [
         f"LDCT (Input)\nBaseline PSNR: {metrics['Baseline_PSNR']:.2f} dB",
         f"NDCT (Ground Truth)\n{window_name}",
         f"Denoised (Output)\nPSNR: {metrics['PSNR']:.2f} dB | SSIM: {metrics['SSIM']:.4f} | RMSE: {metrics['RMSE_HU']:.2f} HU",
     ]
-    imgs = [ldct, ndct, denoised]
-    cmap = "gray"
 
-    for j, (img, title) in enumerate(zip(imgs, titles)):
+    for j, (img, title) in enumerate(zip([ldct, ndct, denoised], titles)):
         ax = fig.add_subplot(gs[j])
-        ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
+        ax.imshow(img, cmap="gray", vmin=0, vmax=1)
         ax.set_title(title, fontsize=10)
         ax.axis("off")
 
     fig.suptitle(f"Patient: {pid} | Type: {body_type}", fontsize=12, fontweight="bold")
-    out_path = output_dir / f"{pid}_viz.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(output_dir / f"{pid}_viz.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 # ═══════════════════════════════════════════
-# PRINT SUMMARY TABLE
+# SUMMARY
 # ═══════════════════════════════════════════
 def print_summary(df):
-    """Print per-body-type and overall average metrics."""
+    """Print per-body-type and overall averages."""
     print("\n" + "=" * 75)
-    print("📊  EVALUATION RESULTS (ldct-benchmark Physical Standard)")
+    print("EVALUATION RESULTS (ldct-benchmark physical standard)")
     print("=" * 75)
-    print(f"\n{'Patient':<14} {'Type':<9} {'Slices':>6}  {'ΔPSNR':>8}  {'PSNR':>8}  {'SSIM':>8}  {'RMSE(HU)':>10}  {'VIF':>8}")
+    print(f"\n{'Patient':<14} {'Type':<9} {'Slices':>6}  {'dPSNR':>8}  {'PSNR':>8}  {'SSIM':>8}  {'RMSE(HU)':>10}  {'VIF':>8}")
     print("-" * 75)
 
     for _, row in df.iterrows():
@@ -223,7 +204,7 @@ def print_summary(df):
         label = f"  {body_type} avg " if body_type != "Overall" else "  Overall avg"
         print(
             f"\n{label:<20} "
-            f"ΔPSNR: {sub['Delta_PSNR'].mean():>+6.2f} dB  |  "
+            f"dPSNR: {sub['Delta_PSNR'].mean():>+6.2f} dB  |  "
             f"PSNR: {sub['PSNR'].mean():>6.2f} dB  |  "
             f"SSIM: {sub['SSIM'].mean():>6.4f}  |  "
             f"RMSE: {sub['RMSE_HU'].mean():>6.2f} HU  |  "
@@ -237,85 +218,80 @@ def print_summary(df):
 # MAIN
 # ═══════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate LDCT denoising model on test set using ldct-benchmark physical metrics.")
-    parser.add_argument("--model", type=str, default=BEST_MODEL_PATH,
-                        help="Path to the trained model weights (.pt file)")
-    parser.add_argument("--test-dir", type=str, default=TEST_DIR,
-                        help="Path to test patients directory")
-    parser.add_argument("--save-images", action="store_true",
-                        help="Save sample LDCT/NDCT/Denoised triplet images")
-    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR,
-                        help="Output folder for CSV report and images")
+    parser = argparse.ArgumentParser(description="Evaluate the LDCT denoising model with ldct-benchmark metrics.")
+    parser.add_argument("--input-mode", default=cfg.INPUT_MODE, choices=list(cfg.VALID_INPUT_MODES))
+    parser.add_argument("--mamba-mode", default=cfg.MAMBA_MODE, choices=list(cfg.VALID_MAMBA_MODES))
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to trained weights (.pt). Defaults to the run folder for the chosen modes.")
+    parser.add_argument("--test-dir", type=str, default=TEST_DIR)
+    parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR)
+    parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
-    # ── Setup ──
+    input_mode = cfg.normalize_input_mode(args.input_mode)
+    mamba_mode = cfg.normalize_mamba_mode(args.mamba_mode)
+    model_path = args.model or cfg.run_paths(mamba_mode=mamba_mode, input_mode=input_mode)["best_model"]
+
     setup_reproducibility()
     device = get_device()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load model ──
-    print(f"\n📂  Loading model from: {args.model}")
-    model = build_model(device)
-    state = torch.load(args.model, map_location=device)
+    print(f"\nLoading model: {model_path}")
+    print(f"input_mode={input_mode} | mamba_mode={mamba_mode} | HU range [{A_MIN}, {A_MAX}]")
+    model = build_model(device, mamba_mode=mamba_mode, input_mode=input_mode, data_parallel=False)
 
-    # Handle DataParallel wrapper
-    if isinstance(state, dict) and "module." in list(state.keys())[0]:
-        state = {k.replace("module.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+    try:
+        state = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(model_path, map_location=device)
+    load_state_into(model, state)      # handles "module." prefixes and wrapped dicts
     model.eval()
-    print("✅  Model loaded successfully.\n")
+    print("Model loaded successfully.\n")
 
-    # ── Discover test patients ──
     test_path = Path(args.test_dir)
     patients = sorted([
         p for p in test_path.iterdir()
-        if p.is_dir()
-        and (p / "Low_Dose").exists()
-        and (p / "Full_Dose").exists()
+        if p.is_dir() and (p / "Low_Dose").exists() and (p / "Full_Dose").exists()
     ])
 
     if not patients:
-        print(f"❌  No valid patients found in '{args.test_dir}'. "
-              "Each patient folder must contain 'Low_Dose/' and 'Full_Dose/' subdirectories.")
+        print(f"No valid patients found in '{args.test_dir}'. "
+              "Each patient folder must contain 'Low_Dose/' and 'Full_Dose/'.")
         return
 
-    chest_patients  = [p for p in patients if p.name[0].upper() == "C"]
+    chest_patients = [p for p in patients if p.name[0].upper() == "C"]
     abdomen_patients = [p for p in patients if p.name[0].upper() == "L"]
+    print(f"Found {len(patients)} patients: {len(chest_patients)} Chest, {len(abdomen_patients)} Abdomen\n")
 
-    print(f"🔍  Found {len(patients)} patients: "
-          f"{len(chest_patients)} Chest, {len(abdomen_patients)} Abdomen\n")
-
-    # ── Evaluate ──
     all_results = []
     for patient_dir in patients:
         pid = patient_dir.name
-        print(f"⚙️   Evaluating [{pid}] ({'Chest' if pid[0].upper() == 'C' else 'Abdomen'}) ...")
+        print(f"Evaluating [{pid}] ({'Chest' if pid[0].upper() == 'C' else 'Abdomen'}) ...")
         try:
-            result = evaluate_patient(
+            all_results.append(evaluate_patient(
                 pid, patient_dir, model, device,
+                input_mode=input_mode,
                 save_images=args.save_images,
                 output_dir=output_dir,
-            )
-            all_results.append(result)
+                use_amp=not args.no_amp,
+            ))
         except Exception as e:
-            print(f"  ❌ Failed: {e}")
+            print(f"  Failed: {e}")
 
     if not all_results:
-        print("❌  No results collected.")
+        print("No results collected.")
         return
 
-    # ── Report ──
-    df = pd.DataFrame(all_results)
-    df = df.sort_values(["BodyType", "PatientID"])
-
-    csv_path = output_dir / "evaluation_report.csv"
+    df = pd.DataFrame(all_results).sort_values(["BodyType", "PatientID"])
+    csv_path = output_dir / f"evaluation_report_{cfg.run_name(mamba_mode, input_mode)}.csv"
     df.to_csv(csv_path, index=False)
 
     print_summary(df)
-    print(f"\n📄  Full report saved → {csv_path}")
+    print(f"\nFull report saved -> {csv_path}")
     if args.save_images:
-        print(f"🖼️   Images saved     → {output_dir}/")
+        print(f"Images saved      -> {output_dir}/")
 
 
 if __name__ == "__main__":
