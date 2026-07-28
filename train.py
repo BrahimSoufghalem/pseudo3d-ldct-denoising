@@ -54,6 +54,8 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
     p.add_argument("--batch-size", type=int, default=cfg.TRAIN_BATCH_SIZE)
     p.add_argument("--lr", type=float, default=LEARNING_RATE)
+    p.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS,
+                   help="linear LR warmup length; raise it if training diverges early")
     p.add_argument("--no-amp", action="store_true", help="disable mixed precision")
     p.add_argument("--grad-checkpoint", action="store_true",
                    help="recompute the Mamba bottleneck in backward to save VRAM")
@@ -62,14 +64,40 @@ def parse_args():
 
 
 # ═══════════════════════════════════════════
+# OPTIMISER PARAM GROUPS
+# ═══════════════════════════════════════════
+def build_param_groups(model, weight_decay):
+    """Split parameters into decayed and non-decayed groups.
+
+    The SSM tensors (`A_logs`, `Ds`, `dt_projs_bias`) carry a `_no_weight_decay`
+    flag, and every 1-D tensor (biases, LayerNorm scales, the NAF beta/gamma
+    residual gates) should be excluded too. Passing `model.parameters()`
+    directly to AdamW silently ignored all of that and decayed them anyway.
+    """
+    decay, no_decay = [], []
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if getattr(param, "_no_weight_decay", False) or param.ndim <= 1:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+# ═══════════════════════════════════════════
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
 def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
                     scaler=None, amp_dtype=None, use_amp=False):
-    """One training epoch. Returns (avg_train_loss, skipped_steps)."""
+    """One training epoch. Returns (avg_train_loss, skipped_steps, max_grad_norm)."""
     model.train()
     train_loss = 0.0
     skipped_steps = 0
+    max_gnorm = 0.0
 
     train_bar = tqdm(
         train_loader,
@@ -88,7 +116,8 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             pred_res = model(images)
             # NOTE: the loss is computed on the UNCLAMPED prediction, exactly as
             # in validation. Clamping here would zero the gradient of every
-            # saturated pixel.
+            # saturated pixel. (MONAIHybridLoss clamps the SSIM term internally,
+            # because SSIM is undefined outside [0, 1] - see losses.py.)
             pred_img = mid_slice + pred_res
             loss, loss_info = loss_fn(pred_img.float(), labels.float())
 
@@ -100,6 +129,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
                 skipped_steps += 1
                 optimizer.zero_grad(set_to_none=True)
             else:
+                max_gnorm = max(max_gnorm, float(gnorm))
                 scaler.step(optimizer)
             scaler.update()
         else:
@@ -109,6 +139,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
                 skipped_steps += 1
                 optimizer.zero_grad(set_to_none=True)
             else:
+                max_gnorm = max(max_gnorm, float(gnorm))
                 optimizer.step()
 
         train_loss += loss.item()
@@ -117,10 +148,11 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             L1=f"{loss_info['L1']:.4f}",
             SSIM=f"{loss_info['SSIM']:.4f}",
             Edge=f"{loss_info['Edge']:.4f}",
+            gn=f"{float(gnorm):.1f}",
             sk=skipped_steps,
         )
 
-    return train_loss / max(1, len(train_loader)), skipped_steps
+    return train_loss / max(1, len(train_loader)), skipped_steps, max_gnorm
 
 
 # ═══════════════════════════════════════════
@@ -262,7 +294,7 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
 # ═══════════════════════════════════════════
 # TENSORBOARD LOGGING
 # ═══════════════════════════════════════════
-def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time):
+def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time, max_gnorm=0.0):
     writer.add_scalars("Loss", {"Train": avg_train, "Val": metrics["avg_val"]}, epoch + 1)
     writer.add_scalar("Metrics/PSNR", metrics["avg_psnr"], epoch + 1)
     writer.add_scalar("Metrics/DELTA_PSNR", metrics["avg_psnr"] - metrics["avg_baseline"], epoch + 1)
@@ -274,6 +306,7 @@ def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time
     writer.add_scalar("Abdomen/SSIM", metrics["avg_ssim_abd"], epoch + 1)
     writer.add_scalar("Training/LR", current_lr, epoch + 1)
     writer.add_scalar("Training/EpochTime", epoch_time, epoch + 1)
+    writer.add_scalar("Training/GradNormMax", max_gnorm, epoch + 1)
 
     if (epoch + 1) % 10 == 0 and metrics["viz_images"] is not None:
         inp, lbl, out = metrics["viz_images"]
@@ -290,6 +323,7 @@ def main():
     input_mode = cfg.normalize_input_mode(args.input_mode)
     mamba_mode = cfg.normalize_mamba_mode(args.mamba_mode)
     total_epochs = args.epochs
+    warmup_epochs = max(0, min(args.warmup_epochs, total_epochs - 1))
 
     paths = cfg.run_paths(mamba_mode=mamba_mode, input_mode=input_mode, output_root=args.output_root)
     os.makedirs(paths["run_dir"], exist_ok=True)
@@ -301,6 +335,7 @@ def main():
     print(f"Run: input_mode={input_mode} | mamba_mode={mamba_mode} | device={device}")
     print(f"Outputs -> {paths['run_dir']}")
     print(f"HU range: [{A_MIN}, {A_MAX}] (preset '{cfg.HU_RANGE_PRESET}')")
+    print(f"LR: {args.lr:.2e} | warmup epochs: {warmup_epochs} | weight decay: {WEIGHT_DECAY}")
 
     # ---- AMP setup --------------------------------------------------
     use_amp = cfg.USE_AMP and (not args.no_amp) and device.type == "cuda"
@@ -328,16 +363,16 @@ def main():
         spatial_dims=2,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(build_param_groups(model, WEIGHT_DECAY), lr=args.lr)
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=WARMUP_EPOCHS,
+        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=max(1, warmup_epochs),
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_epochs - WARMUP_EPOCHS), eta_min=SCHEDULER_MIN_LR,
+        optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=SCHEDULER_MIN_LR,
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[WARMUP_EPOCHS],
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[max(1, warmup_epochs)],
     )
 
     writer = SummaryWriter(log_dir=paths["logs"])
@@ -360,7 +395,7 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
 
-        avg_train, skipped_steps = train_one_epoch(
+        avg_train, skipped_steps, max_gnorm = train_one_epoch(
             model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
             scaler=scaler, amp_dtype=amp_dtype, use_amp=use_amp,
         )
@@ -379,11 +414,12 @@ def main():
             f"Train: {avg_train:.5f} | Val: {metrics['avg_val']:.5f} | "
             f"PSNR: {metrics['avg_psnr']:.3f} dB | dPSNR: {delta_psnr:+.3f} dB | "
             f"SSIM: {metrics['avg_ssim']:.5f} | RMSE: {metrics['avg_rmse']:.3f} | "
+            f"|g|max: {max_gnorm:.1f} | "
             f"skipped: {skipped_steps}/{len(train_loader)} | "
             f"LR: {current_lr:.2e} | {epoch_time:.1f}s"
         )
 
-        log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time)
+        log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time, max_gnorm)
 
         if metrics["avg_psnr"] > best_psnr:
             best_psnr = metrics["avg_psnr"]

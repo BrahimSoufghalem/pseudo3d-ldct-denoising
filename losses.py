@@ -79,8 +79,22 @@ class MONAIHybridLoss(nn.Module):
     Charbonnier + SSIM + Sobel edge loss with configurable weights.
 
     The loss is always evaluated in FP32 (AMP-safe) and expects predictions in
-    the normalized [0, 1] domain. It is deliberately applied to the UNCLAMPED
-    prediction, so pixels outside [0, 1] still receive gradient.
+    the normalized [0, 1] domain.
+
+    Clamping policy (this matters, and an earlier revision got it wrong)
+    -------------------------------------------------------------------
+    * Charbonnier and the Sobel edge term run on the UNCLAMPED prediction, so a
+      pixel that has drifted outside [0, 1] still receives a restoring gradient.
+    * SSIM runs on a CLAMPED copy. `SSIMLoss(data_range=1.0)` is only defined
+      for inputs inside [0, 1]; once the prediction blows up, the variance term
+      in the denominator dominates, the loss saturates at 1.0 and its gradient
+      vanishes. With lambda_ssim = 0.6 that silently removed most of the
+      training signal and turned a transient divergence into a permanent
+      collapse (the model froze at SSIM ~= 0.06 and never recovered).
+      Clamping only the SSIM input keeps the term meaningful while Charbonnier
+      still pulls the prediction back into range.
+
+    Set `ssim_clamp=False` to restore the old (unstable) behaviour.
     """
 
     def __init__(
@@ -90,12 +104,14 @@ class MONAIHybridLoss(nn.Module):
         lambda_edge=LAMBDA_EDGE,
         spatial_dims=2,
         charbonnier_eps=1e-3,
+        ssim_clamp=True,
     ):
         super().__init__()
         self.lambda_charbonnier = lambda_l1
         self.lambda_l1 = lambda_l1          # alias, kept for compatibility
         self.lambda_ssim = lambda_ssim
         self.lambda_edge = lambda_edge
+        self.ssim_clamp = ssim_clamp
 
         self.charbonnier_loss = CharbonnierLoss(eps=charbonnier_eps)
         self.ssim_loss = SSIMLoss(spatial_dims=spatial_dims, data_range=1.0)
@@ -106,8 +122,12 @@ class MONAIHybridLoss(nn.Module):
         target_img = target_img.float()
 
         charb = self.charbonnier_loss(pred_img, target_img)
-        ssim = self.ssim_loss(pred_img, target_img)
         edge = self.edge_loss(pred_img, target_img)
+
+        if self.ssim_clamp:
+            ssim = self.ssim_loss(pred_img.clamp(0.0, 1.0), target_img.clamp(0.0, 1.0))
+        else:
+            ssim = self.ssim_loss(pred_img, target_img)
 
         total = (
             self.lambda_charbonnier * charb
