@@ -17,24 +17,40 @@ import config as cfg
 
 
 # ═══════════════════════════════════════════
-# REPRODUCIBILITY
+# REPRODUCIBILITY / BACKEND FLAGS
 # ═══════════════════════════════════════════
-def setup_reproducibility(seed=cfg.SEED, deterministic=False):
-    """Seed every RNG used by the project.
+def setup_reproducibility(seed=cfg.SEED, deterministic=False, allow_tf32=None):
+    """Seed every RNG used by the project and set fast backend defaults.
 
-    `deterministic=True` also forces deterministic cuDNN kernels, which is
-    slower but makes runs bit-for-bit reproducible.
+    `deterministic=True` forces deterministic cuDNN kernels and disables TF32,
+    which is slower but makes runs bit-for-bit reproducible.
+
+    TF32 (Ampere and newer) is enabled by default for matmul. PyTorch disables
+    matmul TF32 out of the box, which is a large, silent slowdown here: the SS2D
+    bottleneck is dominated by matmul/einsum, not convolutions.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if allow_tf32 is None:
+        allow_tf32 = getattr(cfg, "ALLOW_TF32", True)
+
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        allow_tf32 = False
     else:
         torch.backends.cudnn.benchmark = True
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+
     return seed
 
 
