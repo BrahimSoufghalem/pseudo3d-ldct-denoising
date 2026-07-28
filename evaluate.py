@@ -32,7 +32,6 @@ from tqdm import tqdm
 from config import (
     TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
     A_MIN, A_MAX, B_MIN, B_MAX,
-    USE_ANATOMY_CONDITIONING,
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
@@ -115,13 +114,8 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
         lbl = normalize(raw_full).unsqueeze(0).unsqueeze(0).to(device)
         mid = inp[:, 1:2, :, :]                              # current low-dose slice in full HU range [0, 1]
 
-        # Determine anatomy_id for conditioning
-        anatomy_id = None
-        if USE_ANATOMY_CONDITIONING:
-            anatomy_id = torch.tensor([0 if body_type == "Chest" else 1], device=device)
-
         with autocast():
-            pred_res = model(inp, anatomy_id=anatomy_id)
+            pred_res = model(inp)
             pred = torch.clamp(mid + pred_res, 0.0, 1.0)
 
         # ── 1. Convert tensors to HU + 1024 offset domain (ldct-benchmark standard) ──

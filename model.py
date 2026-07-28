@@ -14,9 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import IN_CHANNELS, OUT_CHANNELS, MAMBA_MODE, USE_ANATOMY_CONDITIONING, ANATOMY_EMBED_DIM
+from config import IN_CHANNELS, OUT_CHANNELS, MAMBA_MODE
 from naf_mamba_blocks import (
-    LayerNorm2d, NAFBlock, AnatomyAttentionGate2D, AnatomyCondition,
+    LayerNorm2d, NAFBlock, AnatomyAttentionGate2D,
     SS2DMambaBottleneck, ResidualMambaBottleneck,
     MultiScaleSpatialFusion
 )
@@ -27,11 +27,9 @@ class MSNAFMambaNet(nn.Module):
     Multi-Scale NAF-Mamba Network with Anatomy Attention Skip Gates.
     Supports 4-stage ablation studies via mamba_mode.
     """
-    def __init__(self, in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS, mamba_mode=MAMBA_MODE,
-                 use_anatomy=USE_ANATOMY_CONDITIONING, anatomy_embed_dim=ANATOMY_EMBED_DIM):
+    def __init__(self, in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS, mamba_mode=MAMBA_MODE):
         super().__init__()
         self.mamba_mode = mamba_mode.lower()
-        self.use_anatomy = use_anatomy
         print(f"🏗️  Initializing MS-NAFMambaNet (Ablation Mode: '{self.mamba_mode.upper()}')")
 
         # Stem Conv
@@ -51,11 +49,10 @@ class MSNAFMambaNet(nn.Module):
         self.down4 = nn.Conv2d(256, 512, kernel_size=2, stride=2)
 
         # Anatomy Attention Gates on Skips
-        ag_embed = anatomy_embed_dim if self.use_anatomy else 0
-        self.ag1 = AnatomyAttentionGate2D(F_g=64, F_l=32, F_int=32, embed_dim=ag_embed)
-        self.ag2 = AnatomyAttentionGate2D(F_g=128, F_l=64, F_int=64, embed_dim=ag_embed)
-        self.ag3 = AnatomyAttentionGate2D(F_g=256, F_l=128, F_int=128, embed_dim=ag_embed)
-        self.ag4 = AnatomyAttentionGate2D(F_g=512, F_l=256, F_int=256, embed_dim=ag_embed)
+        self.ag1 = AnatomyAttentionGate2D(F_g=64, F_l=32, F_int=32)
+        self.ag2 = AnatomyAttentionGate2D(F_g=128, F_l=64, F_int=64)
+        self.ag3 = AnatomyAttentionGate2D(F_g=256, F_l=128, F_int=128)
+        self.ag4 = AnatomyAttentionGate2D(F_g=512, F_l=256, F_int=256)
 
         # Bottleneck (SS2D Mamba 2D Selective State-Space Module)
         if self.mamba_mode in ["residual", "full"]:
@@ -89,15 +86,6 @@ class MSNAFMambaNet(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-        # Anatomy Conditioning Modules (FiLM modulation at strategic locations)
-        if self.use_anatomy:
-            self.anatomy_embedding = nn.Embedding(2, anatomy_embed_dim)
-            self.cond_enc2 = AnatomyCondition(anatomy_embed_dim, 64)
-            self.cond_enc3 = AnatomyCondition(anatomy_embed_dim, 128)
-            self.cond_bottleneck = AnatomyCondition(anatomy_embed_dim, 512)
-            self.cond_dec3 = AnatomyCondition(anatomy_embed_dim, 128)
-            self.cond_dec2 = AnatomyCondition(anatomy_embed_dim, 64)
-
     @staticmethod
     def _init_icnr(conv, scale=2):
         oc, ic, kh, kw = conv.weight.data.shape
@@ -106,12 +94,7 @@ class MSNAFMambaNet(nn.Module):
         sub_kernel = sub_kernel.repeat_interleave(scale ** 2, dim=0)
         conv.weight.data.copy_(sub_kernel)
 
-    def forward(self, x, anatomy_id=None):
-        # Compute anatomy embedding (if enabled and anatomy_id provided)
-        anat_emb = None
-        if self.use_anatomy and anatomy_id is not None:
-            anat_emb = self.anatomy_embedding(anatomy_id)  # [B, embed_dim]
-
+    def forward(self, x):
         # Stem
         x_stem = self.stem(x)
 
@@ -120,13 +103,9 @@ class MSNAFMambaNet(nn.Module):
         d1 = self.down1(e1)
 
         e2 = self.enc2(d1)
-        if anat_emb is not None:
-            e2 = self.cond_enc2(e2, anat_emb)
         d2 = self.down2(e2)
 
         e3 = self.enc3(d2)
-        if anat_emb is not None:
-            e3 = self.cond_enc3(e3, anat_emb)
         d3 = self.down3(e3)
 
         e4 = self.enc4(d3)
@@ -134,14 +113,12 @@ class MSNAFMambaNet(nn.Module):
 
         # Mamba Bottleneck
         b_feat = self.bottleneck(d4)
-        if anat_emb is not None:
-            b_feat = self.cond_bottleneck(b_feat, anat_emb)
 
-        # Skip Attention Gating (anatomy-aware)
-        g4 = self.ag4(g=d4, x=e4, anatomy_emb=anat_emb)
-        g3 = self.ag3(g=d3, x=e3, anatomy_emb=anat_emb)
-        g2 = self.ag2(g=d2, x=e2, anatomy_emb=anat_emb)
-        g1 = self.ag1(g=d1, x=e1, anatomy_emb=anat_emb)
+        # Skip Attention Gating (Use d4 as gate for ag4 to keep b_feat dedicated for bottleneck/fusion)
+        g4 = self.ag4(g=d4, x=e4)
+        g3 = self.ag3(g=d3, x=e3)
+        g2 = self.ag2(g=d2, x=e2)
+        g1 = self.ag1(g=d1, x=e1)
 
         # Multi-Scale Fusion (Stage 3 & 4)
         if self.mamba_mode in ["multiscale", "full"]:
@@ -155,14 +132,10 @@ class MSNAFMambaNet(nn.Module):
         u3 = self.up3(dec4_out)
         d3_cat = torch.cat([u3, g3], dim=1)
         dec3_out = self.dec3(d3_cat)
-        if anat_emb is not None:
-            dec3_out = self.cond_dec3(dec3_out, anat_emb)
 
         u2 = self.up2(dec3_out)
         d2_cat = torch.cat([u2, g2], dim=1)
         dec2_out = self.dec2(d2_cat)
-        if anat_emb is not None:
-            dec2_out = self.cond_dec2(dec2_out, anat_emb)
 
         u1 = self.up1(dec2_out)
         d1_cat = torch.cat([u1, g1], dim=1)
@@ -186,15 +159,5 @@ def build_model(device):
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"📦  Model parameters ({MAMBA_MODE.upper()} mode): {total_params:,}")
-
-    if USE_ANATOMY_CONDITIONING:
-        cond_params = sum(
-            p.numel() for n, p in model.named_parameters()
-            if "cond_" in n or "anatomy" in n or "W_a" in n
-        )
-        print(f"🧬 Anatomy Conditioning: ENABLED (embed_dim={ANATOMY_EMBED_DIM})")
-        print(f"🧬 Conditioning parameters: {cond_params:,} ({cond_params / total_params * 100:.2f}%)")
-    else:
-        print(f"🧬 Anatomy Conditioning: DISABLED")
 
     return model

@@ -19,7 +19,6 @@ from torch.cuda.amp import autocast
 
 from config import (
     TEST_DIR, BEST_MODEL_PATH, A_MIN, A_MAX,
-    USE_ANATOMY_CONDITIONING,
 )
 from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
@@ -104,7 +103,7 @@ def save_as_dicom(ref_dicom_path, output_path, denoised_hu_tensor, series_uid):
 # INFERENCE PIPELINE
 # ═══════════════════════════════════════════
 @torch.no_grad()
-def process_patient(pid, patient_dir, output_dir, model, device, anatomy_override=None):
+def process_patient(pid, patient_dir, output_dir, model, device):
     """Process all slices for a patient and save them."""
     low_dir = patient_dir / "Low_Dose"
     out_patient_dir = output_dir / pid / "Denoised_AI"
@@ -136,18 +135,9 @@ def process_patient(pid, patient_dir, output_dir, model, device, anatomy_overrid
         ).to(device)
         mid = inp[:, 1:2, :, :]                              # current slice in full HU range [0, 1]
 
-        # Determine anatomy_id for conditioning
-        anatomy_id = None
-        if USE_ANATOMY_CONDITIONING:
-            if anatomy_override is not None:
-                aid = 0 if anatomy_override == "chest" else 1
-            else:
-                aid = 0 if pid[0].upper() == "C" else 1
-            anatomy_id = torch.tensor([aid], device=device)
-
         # Apply model to get the enhanced slice (output is between 0 and 1)
         with autocast():
-            pred_res = model(inp, anatomy_id=anatomy_id)
+            pred_res = model(inp)
             pred_normalized = torch.clamp(mid + pred_res, 0.0, 1.0)
 
         # Revert values back to Hounsfield Units
@@ -169,8 +159,6 @@ def main():
     parser.add_argument("--model", type=str, default=BEST_MODEL_PATH, help="Path to the trained model weights (.pt)")
     parser.add_argument("--test-dir", type=str, default=TEST_DIR, help="Path to the test directory")
     parser.add_argument("--output-dir", type=str, default="Output_DICOM", help="Path to save enhanced DICOM files")
-    parser.add_argument("--anatomy", type=str, default=None, choices=["chest", "abdomen"],
-                        help="Override anatomy type for all patients (auto-detected from patient ID if omitted)")
     args = parser.parse_args()
 
     setup_reproducibility()
@@ -204,7 +192,7 @@ def main():
     # ── 3. Processing and exporting results ──
     for patient_dir in patients:
         pid = patient_dir.name
-        process_patient(pid, patient_dir, output_base_dir, model, device, anatomy_override=args.anatomy)
+        process_patient(pid, patient_dir, output_base_dir, model, device)
 
     print("\n" + "=" * 60)
     print(f"🎉 Process completed successfully! Enhanced DICOM files saved in '{args.output_dir}' directory.")

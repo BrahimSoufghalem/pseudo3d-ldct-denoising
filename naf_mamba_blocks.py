@@ -128,46 +128,13 @@ class NAFBlock(nn.Module):
 # 2. ANATOMY-GUIDED ATTENTION SKIP GATE (Suppression & Amplification)
 # ═════════════════════════════════════════════════════════════════════
 
-class AnatomyCondition(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) conditioned on anatomy embedding.
-    Produces per-channel scale (gamma) and shift (beta) from the anatomy
-    embedding vector, then applies: feature = feature * gamma + beta.
-    Initialized near identity (gamma≈1, beta≈0) so conditioning starts neutral.
-    """
-    def __init__(self, embed_dim, feature_channels):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, feature_channels * 2),
-        )
-        # Zero-init final layer → gamma=1, beta=0 at initialization
-        nn.init.zeros_(self.mlp[2].weight)
-        nn.init.zeros_(self.mlp[2].bias)
-
-    def forward(self, feature, embedding):
-        """
-        Args:
-            feature: [B, C, H, W] feature tensor
-            embedding: [B, embed_dim] anatomy embedding vector
-        Returns:
-            Modulated feature [B, C, H, W]
-        """
-        params = self.mlp(embedding)            # [B, 2*C]
-        gamma, beta = params.chunk(2, dim=-1)   # each [B, C]
-        gamma = 1.0 + gamma                     # center at identity
-        return feature * gamma[:, :, None, None] + beta[:, :, None, None]
-
-
 class AnatomyAttentionGate2D(nn.Module):
     """
     Context-guided Attention Gate with Tanh scaling (0.5 to 1.5 multiplier).
     Allows both noise suppression (<1.0) and clean signal amplification (>1.0),
     initialized at exact identity 1.0.
-    Optionally accepts anatomy embedding to bias attention maps.
     """
-    def __init__(self, F_g, F_l, F_int, embed_dim=0):
+    def __init__(self, F_g, F_l, F_int):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
@@ -184,28 +151,12 @@ class AnatomyAttentionGate2D(nn.Module):
         nn.init.zeros_(self.psi[0].weight)
         nn.init.zeros_(self.psi[0].bias)
 
-        # Anatomy embedding projection (only when embed_dim > 0)
-        self.use_anatomy = embed_dim > 0
-        if self.use_anatomy:
-            self.W_a = nn.Sequential(
-                nn.Linear(embed_dim, F_int),
-                nn.GELU(),
-            )
-
-    def forward(self, g, x, anatomy_emb=None):
+    def forward(self, g, x):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
         if g1.shape[2:] != x1.shape[2:]:
             g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
-
-        combined = F.gelu(g1 + x1)
-
-        # Inject anatomy bias (if conditioning is active)
-        if self.use_anatomy and anatomy_emb is not None:
-            a1 = self.W_a(anatomy_emb)              # [B, F_int]
-            combined = combined + a1[:, :, None, None]  # broadcast over H, W
-
-        alpha = self.psi(combined)
+        alpha = self.psi(F.gelu(g1 + x1))
         # 1.0 + 0.5 * Tanh gives dynamic range [0.5, 1.5] centered at 1.0
         return x * (1.0 + 0.5 * alpha)
 

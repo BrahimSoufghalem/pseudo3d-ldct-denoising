@@ -63,10 +63,6 @@ OUT_CHANNELS = 1
 # Ablation Study Flag: "basic" | "residual" | "multiscale" | "full"
 MAMBA_MODE = "full"
 
-# Anatomy Conditioning
-USE_ANATOMY_CONDITIONING = True
-ANATOMY_EMBED_DIM = 32
-
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
