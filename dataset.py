@@ -1,14 +1,20 @@
 """
-LDCT Project — Dataset & Data Pipeline
+LDCT Project - Dataset & Data Pipeline
 =========================================
-Pseudo-3D (2.5D) data preparation with MONAI transforms and DataLoaders.
+MONAI transforms and DataLoaders for both experiment input modes:
+
+  INPUT_MODE == "2d"   -> only the current low-dose slice is read  -> image [1, H, W]
+  INPUT_MODE == "2.5d" -> (prev, curr, next) are read and stacked  -> image [3, H, W]
+
+In "2d" mode the neighbouring files are never loaded, so that ablation is also
+about 3x cheaper in I/O and cache memory - not just a masked-out input.
 """
-   
+
 import os
 import random
+from glob import glob
 
 import torch
-from glob import glob
 from sklearn.model_selection import train_test_split
 from monai.utils import set_determinism
 from monai.data import CacheDataset, Dataset, DataLoader
@@ -17,8 +23,9 @@ from monai.transforms import (
     RandSpatialCropSamplesd, ResizeWithPadOrCropd, ToTensord,
 )
 
+import config as cfg
 from config import (
-    DATA_DIR, SPATIAL_SIZE, A_MIN, A_MAX, B_MIN, B_MAX,
+    DATA_DIR, SPATIAL_SIZE, A_MIN, A_MAX,
     CACHE_DATA, TRAIN_BATCH_SIZE, VAL_BATCH_SIZE, NUM_WORKERS,
     SEED, SPLIT_RANDOM_STATE, SPLIT_TEST_SIZE,
     EXPECTED_VAL, EXPECTED_TRAIN,
@@ -26,52 +33,67 @@ from config import (
 from utils import sort_by_instance_number
 
 
+def image_keys_for(input_mode=None):
+    """Dictionary keys that must be loaded from disk for a given input mode."""
+    if cfg.normalize_input_mode(input_mode) == "2d":
+        return ["image", "label"]
+    return ["image_prev", "image", "image_next", "label"]
+
+
 # ═══════════════════════════════════════════
-# STACK SLICES (Standard Pseudo-3D Transform)
+# NORMALIZE / STACK TRANSFORM
 # ═══════════════════════════════════════════
 class StackSlicesd:
     """
-    Custom MONAI-style dictionary transform.
-    Stacks three adjacent slices (prev, curr, next) into a single 3-channel tensor [3, H, W]
-    normalized to range [0, 1] using A_MIN and A_MAX.
+    MONAI-style dictionary transform.
+
+    Normalizes HU to [0, 1] with the config window [A_MIN, A_MAX] and, in 2.5D
+    mode, concatenates (prev, curr, next) into a 3-channel tensor.
+    In 2D mode it only normalizes the current slice, leaving `image` at [1, H, W].
     """
-    def __init__(self, a_min=A_MIN, a_max=A_MAX):
+
+    def __init__(self, input_mode=None, a_min=A_MIN, a_max=A_MAX):
+        self.input_mode = cfg.normalize_input_mode(input_mode)
         self.a_min = a_min
         self.a_max = a_max
 
+    def _norm(self, x):
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x, dtype=torch.float32)
+        x = x.float()
+        return torch.clamp((x - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
+
     def __call__(self, data):
-        prev_hu = data["image_prev"]
-        curr_hu = data["image"]
-        next_hu = data["image_next"]
-        label_hu = data["label"]
+        data["label"] = self._norm(data["label"])
 
-        if not isinstance(prev_hu, torch.Tensor):
-            prev_hu = torch.as_tensor(prev_hu, dtype=torch.float32)
-            curr_hu = torch.as_tensor(curr_hu, dtype=torch.float32)
-            next_hu = torch.as_tensor(next_hu, dtype=torch.float32)
-            label_hu = torch.as_tensor(label_hu, dtype=torch.float32)
+        if self.input_mode == "2d":
+            data["image"] = self._norm(data["image"])
+            data.pop("image_prev", None)
+            data.pop("image_next", None)
+            return data
 
-        prev_full = torch.clamp((prev_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
-        curr_full = torch.clamp((curr_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
-        next_full = torch.clamp((next_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
-
+        prev_full = self._norm(data["image_prev"])
+        curr_full = self._norm(data["image"])
+        next_full = self._norm(data["image_next"])
         data["image"] = torch.cat([prev_full, curr_full, next_full], dim=0)
-        data["label"] = torch.clamp((label_hu - self.a_min) / (self.a_max - self.a_min), 0.0, 1.0)
-
-        del data["image_prev"]
-        del data["image_next"]
+        data.pop("image_prev", None)
+        data.pop("image_next", None)
         return data
 
 
 # ═══════════════════════════════════════════
 # FILE COLLECTION
 # ═══════════════════════════════════════════
-def collect_files(patient_list, in_dir=DATA_DIR):
+def collect_files(patient_list, in_dir=DATA_DIR, input_mode=None):
     """
-    For each patient, builds a list of dicts with pseudo-3D triplets:
-      image_prev, image (current), image_next, label (full-dose).
+    Build one record per slice.
+
+    2.5D records carry (image_prev, image, image_next, label); 2D records carry
+    only (image, label). Slice neighbours are clamped at volume boundaries.
     """
+    mode = cfg.normalize_input_mode(input_mode)
     files = []
+
     for patient in patient_list:
         low_dir = os.path.join(in_dir, patient, "Low_Dose")
         full_dir = os.path.join(in_dir, patient, "Full_Dose")
@@ -84,33 +106,30 @@ def collect_files(patient_list, in_dir=DATA_DIR):
 
         n = len(low_imgs)
         for i in range(n):
-            prev_i = max(i - 1, 0)
-            next_i = min(i + 1, n - 1)
-            files.append({
-                "image_prev": low_imgs[prev_i],
-                "image":      low_imgs[i],
-                "image_next": low_imgs[next_i],
-                "label":      full_imgs[i],
-                "patient":    patient,
-                "body_type":  "Chest" if patient.lower().startswith("c") else "Abdomen",
-            })
+            record = {
+                "image": low_imgs[i],
+                "label": full_imgs[i],
+                "patient": patient,
+                "body_type": "Chest" if patient.lower().startswith("c") else "Abdomen",
+            }
+            if mode == "2.5d":
+                record["image_prev"] = low_imgs[max(i - 1, 0)]
+                record["image_next"] = low_imgs[min(i + 1, n - 1)]
+            files.append(record)
+
     return files
 
 
 # ═══════════════════════════════════════════
 # TRANSFORMS
 # ═══════════════════════════════════════════
-def get_train_transforms(spatial_size=SPATIAL_SIZE):
-    """Training transforms with random spatial cropping for augmentation."""
+def get_train_transforms(spatial_size=SPATIAL_SIZE, input_mode=None):
+    """Training transforms (random spatial crop augmentation)."""
+    keys = image_keys_for(input_mode)
     return Compose([
-        LoadImaged(
-            keys=["image_prev", "image", "image_next", "label"],
-            reader="PydicomReader",
-        ), 
-        EnsureChannelFirstd(
-            keys=["image_prev", "image", "image_next", "label"],
-        ),
-        StackSlicesd(),
+        LoadImaged(keys=keys, reader="PydicomReader"),
+        EnsureChannelFirstd(keys=keys),
+        StackSlicesd(input_mode=input_mode),
         RandSpatialCropSamplesd(
             keys=["image", "label"],
             roi_size=spatial_size,
@@ -120,45 +139,42 @@ def get_train_transforms(spatial_size=SPATIAL_SIZE):
     ])
 
 
-def get_val_transforms(spatial_size=SPATIAL_SIZE):
-    """Validation transforms with deterministic pad/crop (no random augmentation)."""
+def get_val_transforms(spatial_size=SPATIAL_SIZE, input_mode=None):
+    """Validation transforms (deterministic pad/crop, no augmentation)."""
+    keys = image_keys_for(input_mode)
     return Compose([
-        LoadImaged(
-            keys=["image_prev", "image", "image_next", "label"],
-            reader="PydicomReader",
-        ),
-        EnsureChannelFirstd(
-            keys=["image_prev", "image", "image_next", "label"],
-        ),
-        StackSlicesd(),
-        ResizeWithPadOrCropd(
-            keys=["image", "label"],
-            spatial_size=spatial_size,
-        ),
+        LoadImaged(keys=keys, reader="PydicomReader"),
+        EnsureChannelFirstd(keys=keys),
+        StackSlicesd(input_mode=input_mode),
+        ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=spatial_size),
         ToTensord(keys=["image", "label"]),
     ])
 
 
 # ═══════════════════════════════════════════
-# MAIN DATA PREPARATION FUNCTION
+# MAIN DATA PREPARATION
 # ═══════════════════════════════════════════
 def prepareCT2D(
     in_dir=DATA_DIR,
     spatial_size=SPATIAL_SIZE,
     cache=CACHE_DATA,
+    input_mode=None,
+    train_batch_size=TRAIN_BATCH_SIZE,
+    val_batch_size=VAL_BATCH_SIZE,
+    num_workers=NUM_WORKERS,
 ):
     """
     Full data pipeline:
-      1. Stratified patient split (Chest / Abdomen)
-      2. Collect pseudo-3D file triplets
-      3. Build MONAI datasets & DataLoaders
+      1. Explicit (or stratified fallback) patient split
+      2. Per-slice record collection for the chosen input mode
+      3. MONAI datasets & DataLoaders
 
-    Returns:
-        (train_loader, val_loader)
+    Returns (train_loader, val_loader).
     """
+    mode = cfg.normalize_input_mode(input_mode)
     set_determinism(seed=SEED)
+    random.seed(SEED)
 
-    # ── Patient split ──
     all_patients = sorted([
         p for p in os.listdir(in_dir)
         if os.path.isdir(os.path.join(in_dir, p))
@@ -167,7 +183,7 @@ def prepareCT2D(
     train_patients = [p for p in all_patients if p in EXPECTED_TRAIN]
     val_patients = [p for p in all_patients if p in EXPECTED_VAL]
 
-    # Fallback if dataset hasn't been split explicitly yet
+    # Fallback if the dataset has not been split explicitly yet
     if not train_patients or not val_patients:
         chest_patients = [p for p in all_patients if p.lower().startswith("c")]
         abdomen_patients = [p for p in all_patients if p.lower().startswith("l")]
@@ -188,22 +204,20 @@ def prepareCT2D(
     random.shuffle(train_patients)
     random.shuffle(val_patients)
 
-    print("\n📊 Split:")
+    print(f"\nSplit (input_mode={mode}):")
     print(f"Train Chest   : {len(chest_train)}")
     print(f"Train Abdomen : {len(abdomen_train)}")
     print(f"Val Chest     : {len(chest_val)}")
     print(f"Val Abdomen   : {len(abdomen_val)}")
 
-    # ── Collect files ──
-    train_files = collect_files(train_patients, in_dir)
-    val_files = collect_files(val_patients, in_dir)
+    train_files = collect_files(train_patients, in_dir, input_mode=mode)
+    val_files = collect_files(val_patients, in_dir, input_mode=mode)
 
-    print(f"\n✅ Train slices: {len(train_files)}")
-    print(f"✅ Val slices  : {len(val_files)}")
+    print(f"Train slices  : {len(train_files)}")
+    print(f"Val slices    : {len(val_files)}")
 
-    # ── Datasets & Loaders ──
-    train_transforms = get_train_transforms(spatial_size)
-    val_transforms = get_val_transforms(spatial_size)
+    train_transforms = get_train_transforms(spatial_size, input_mode=mode)
+    val_transforms = get_val_transforms(spatial_size, input_mode=mode)
 
     if cache:
         train_ds = CacheDataset(train_files, train_transforms, cache_rate=1.0)
@@ -213,12 +227,14 @@ def prepareCT2D(
         val_ds = Dataset(val_files, val_transforms)
 
     train_loader = DataLoader(
-        train_ds, batch_size=TRAIN_BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True,
+        train_ds, batch_size=train_batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=VAL_BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True,
+        val_ds, batch_size=val_batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
 
     return train_loader, val_loader
