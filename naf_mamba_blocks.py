@@ -13,31 +13,88 @@ The S6 recurrence is delegated to the OFFICIAL `mamba_ssm` CUDA kernel
 A chunked pure-PyTorch reference implementation is kept as a fallback so the
 model still runs on CPU (unit tests, debugging) - it is correct but slow.
 
-Install the fast path with:
-    pip install mamba-ssm --no-build-isolation
+Install the fast path with (pin the version and never let it touch torch):
+    pip install "mamba-ssm==2.2.5" --no-build-isolation --no-deps
+
+Two real-world breakages are handled automatically here:
+  1. `mamba_ssm/__init__.py` imports `transformers.generation`, which fails on
+     recent transformers releases. We therefore bypass the package __init__ and
+     import the ops submodule directly.
+  2. A compiled kernel that does not cover the local GPU architecture raises at
+     the first call. We catch that once and fall back to the PyTorch scan
+     instead of crashing the whole training run.
 """
 
+import importlib
+import importlib.util
 import math
+import sys
+import types
 import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 # ---------------------------------------------------------------------------
 # Optional official Mamba kernel
 # ---------------------------------------------------------------------------
-try:  # pragma: no cover - depends on the local environment
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _selective_scan_cuda
-    HAS_MAMBA_SSM = True
-except Exception:  # pragma: no cover
-    _selective_scan_cuda = None
-    HAS_MAMBA_SSM = False
+def _load_official_selective_scan():
+    """Return `selective_scan_fn` from mamba_ssm, or None if unavailable.
+
+    The direct import is tried first. If it fails (most often because
+    `mamba_ssm/__init__.py` pulls in `transformers.generation`, whose symbols
+    were renamed in newer transformers), a stub parent package is registered so
+    that only the ops submodule is executed.
+    """
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+        return selective_scan_fn
+    except Exception as direct_error:  # noqa: BLE001 - any failure falls through
+        first_error = direct_error
+
+    try:
+        spec = importlib.util.find_spec("mamba_ssm")
+    except Exception:
+        spec = None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+
+    previous = sys.modules.get("mamba_ssm")
+    stub = types.ModuleType("mamba_ssm")
+    stub.__path__ = list(spec.submodule_search_locations)
+    sys.modules["mamba_ssm"] = stub
+    try:
+        module = importlib.import_module("mamba_ssm.ops.selective_scan_interface")
+        fn = module.selective_scan_fn
+        warnings.warn(
+            "mamba_ssm was imported through a stub package because the normal "
+            f"import failed ({type(first_error).__name__}: {first_error}). "
+            "The selective-scan kernel itself is unaffected.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return fn
+    except Exception:
+        if previous is not None:
+            sys.modules["mamba_ssm"] = previous
+        else:
+            sys.modules.pop("mamba_ssm", None)
+        return None
 
 
-# ══════════════════════════════════════════════════════════════
+_selective_scan_cuda = _load_official_selective_scan()
+HAS_MAMBA_SSM = _selective_scan_cuda is not None
+
+# Flipped to True the first time the compiled kernel raises at runtime (e.g. the
+# wheel was not built for this GPU architecture), so we degrade instead of dying.
+_CUDA_SCAN_DISABLED = False
+
+
+# ═════════════════════════════════════════════════════════════
 # 1. MEGVII NAFNET COMPONENTS (Activation-Free Restoration)
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class LayerNormFunction(torch.autograd.Function):
     """Memory-efficient channel LayerNorm (CUDA fast path)."""
@@ -177,9 +234,9 @@ def make_naf_stage(channels, num_blocks):
     return nn.Sequential(*[NAFBlock(channels) for _ in range(num_blocks)])
 
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # 2. PSEUDO-3D (Z-AXIS) INPUT STEMS
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class Slice2DStem(nn.Module):
     """Plain 2D stem: a single centre slice in, `width` feature maps out."""
@@ -239,9 +296,9 @@ def build_stem(in_channels, width, input_mode="2.5d"):
     return PseudoDepthStem(in_channels, width)
 
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # 3. ANATOMY-GUIDED ATTENTION SKIP GATE
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class AnatomyAttentionGate2D(nn.Module):
     """
@@ -281,14 +338,19 @@ class AnatomyAttentionGate2D(nn.Module):
         return x * (1.0 + 0.5 * alpha)
 
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # 4. SELECTIVE SCAN (S6) BACKENDS
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 def selective_scan_ref(u, delta, A, B, C, D=None, delta_bias=None,
                        delta_softplus=True, chunk_size=32):
     """
     Chunked pure-PyTorch selective scan (fallback for CPU / no mamba-ssm).
+
+    Note: `chunk_size` does NOT change the number of sequential timesteps (that
+    is always L). It only sets the size of the per-chunk temporaries
+    [b, d, chunk, n], so large chunks cost extra memory traffic for no
+    algorithmic gain. Benchmark with `bench_scan.py` instead of guessing.
 
     Shapes
     ------
@@ -338,20 +400,36 @@ def selective_scan_ref(u, delta, A, B, C, D=None, delta_bias=None,
 def selective_scan(u, delta, A, B, C, D=None, delta_bias=None,
                    delta_softplus=True, backend="auto", chunk_size=32):
     """Dispatch to the official CUDA kernel when possible, else the reference scan."""
+    global _CUDA_SCAN_DISABLED
+
     backend = str(backend).lower()
-    can_use_cuda = HAS_MAMBA_SSM and u.is_cuda
+    can_use_cuda = HAS_MAMBA_SSM and u.is_cuda and not _CUDA_SCAN_DISABLED
 
     if backend == "cuda" and not can_use_cuda:
         raise RuntimeError(
             "SCAN_BACKEND='cuda' but the official mamba_ssm kernel is unavailable "
-            "(install with `pip install mamba-ssm --no-build-isolation`) or the "
-            "tensors are not on a CUDA device."
+            "(install with `pip install \"mamba-ssm==2.2.5\" --no-build-isolation "
+            "--no-deps`), the tensors are not on a CUDA device, or the kernel "
+            "already failed at runtime on this GPU architecture."
         )
 
     if backend in ("auto", "cuda") and can_use_cuda:
-        return _selective_scan_cuda(
-            u, delta, A, B, C, D, None, delta_bias, delta_softplus,
-        )
+        try:
+            return _selective_scan_cuda(
+                u, delta, A, B, C, D, None, delta_bias, delta_softplus,
+            )
+        except RuntimeError as err:
+            if backend == "cuda":
+                raise
+            _CUDA_SCAN_DISABLED = True
+            warnings.warn(
+                "The compiled mamba_ssm kernel failed at runtime and has been "
+                "disabled for the rest of this process; falling back to the "
+                "PyTorch scan. This usually means the wheel was not built for "
+                f"this GPU architecture. Original error: {err}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     return selective_scan_ref(
         u, delta, A, B, C, D=D, delta_bias=delta_bias,
@@ -359,9 +437,9 @@ def selective_scan(u, delta, A, B, C, D=None, delta_bias=None,
     )
 
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # 5. 2D CROSS-SCAN SELECTIVE STATE-SPACE (SS2D)
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class CrossScan2D(nn.Module):
     """
@@ -518,9 +596,9 @@ class ResidualMambaBottleneck(nn.Module):
         return self.mamba2(self.mamba1(x))
 
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # 6. MULTI-SCALE SPATIAL FUSION (1/16 Mamba <-> 1/8 NAF)
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class MultiScaleSpatialFusion(nn.Module):
     """
@@ -557,9 +635,10 @@ def warn_if_slow_scan():
     """Emit a one-time warning when the slow PyTorch fallback will be used."""
     if not HAS_MAMBA_SSM:
         warnings.warn(
-            "mamba-ssm is not installed: falling back to the chunked PyTorch "
-            "selective scan, which is correct but MUCH slower. "
-            "Install with `pip install mamba-ssm --no-build-isolation`.",
+            "mamba-ssm is not installed (or could not be imported): falling back "
+            "to the chunked PyTorch selective scan, which is correct but MUCH "
+            "slower. Install with `pip install \"mamba-ssm==2.2.5\" "
+            "--no-build-isolation --no-deps`.",
             RuntimeWarning,
             stacklevel=2,
         )
