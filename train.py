@@ -11,10 +11,19 @@ own run directory (runs/<input>_<mamba>/):
 
 Mixed precision is enabled by default on CUDA (bfloat16 when supported,
 otherwise float16 + GradScaler). Use --no-amp for pure FP32.
+
+Stability note
+--------------
+Gradient CLIPPING is not a safety net for Adam/AdamW: the optimiser normalises
+by the second moment, so a clipped spike still takes a full ~lr-sized step in a
+corrupted direction and pollutes the running variance. Spiking steps are
+therefore SKIPPED outright (--grad-skip-norm), which is what actually keeps the
+run alive.
 """
 
 import argparse
 import os
+import statistics
 import time
 
 import torch
@@ -55,7 +64,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=cfg.TRAIN_BATCH_SIZE)
     p.add_argument("--lr", type=float, default=LEARNING_RATE)
     p.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS,
-                   help="linear LR warmup length; raise it if training diverges early")
+                   help="linear LR warmup length (clamped to epochs - 1)")
+    p.add_argument("--grad-skip-norm", type=float, default=100.0,
+                   help="skip the optimiser step when the pre-clip gradient norm "
+                        "exceeds this value; 0 disables the guard")
     p.add_argument("--no-amp", action="store_true", help="disable mixed precision")
     p.add_argument("--grad-checkpoint", action="store_true",
                    help="recompute the Mamba bottleneck in backward to save VRAM")
@@ -88,16 +100,40 @@ def build_param_groups(model, weight_decay):
     ]
 
 
+def top_grad_params(model, k=5):
+    """Return the k parameters carrying the largest gradient norm.
+
+    Used to name the unstable tensor when a spike is detected, instead of
+    guessing which part of the network blew up.
+    """
+    scored = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        scored.append((float(param.grad.detach().norm()), name))
+    scored.sort(reverse=True)
+    return scored[:k]
+
+
 # ═══════════════════════════════════════════
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
 def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
-                    scaler=None, amp_dtype=None, use_amp=False):
-    """One training epoch. Returns (avg_train_loss, skipped_steps, max_grad_norm)."""
+                    scaler=None, amp_dtype=None, use_amp=False,
+                    grad_skip_norm=100.0, spike_report_budget=None):
+    """Run one training epoch.
+
+    Returns a dict with the average loss and the gradient statistics needed to
+    diagnose instability.
+    """
     model.train()
     train_loss = 0.0
-    skipped_steps = 0
+    skipped_nonfinite = 0
+    spikes = 0
     max_gnorm = 0.0
+    gnorm_samples = []
+    if spike_report_budget is None:
+        spike_report_budget = [5]
 
     train_bar = tqdm(
         train_loader,
@@ -114,45 +150,66 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             pred_res = model(images)
-            # NOTE: the loss is computed on the UNCLAMPED prediction, exactly as
-            # in validation. Clamping here would zero the gradient of every
-            # saturated pixel. (MONAIHybridLoss clamps the SSIM term internally,
-            # because SSIM is undefined outside [0, 1] - see losses.py.)
+            # The loss runs on the UNCLAMPED prediction so saturated pixels keep
+            # a restoring gradient. MONAIHybridLoss clamps only its SSIM term,
+            # which is undefined outside [0, 1] - see losses.py.
             pred_img = mid_slice + pred_res
             loss, loss_info = loss_fn(pred_img.float(), labels.float())
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
-            if not torch.isfinite(gnorm):
-                skipped_steps += 1
-                optimizer.zero_grad(set_to_none=True)
-            else:
-                max_gnorm = max(max_gnorm, float(gnorm))
-                scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
-            if not torch.isfinite(gnorm):
-                skipped_steps += 1
-                optimizer.zero_grad(set_to_none=True)
+
+        # clip_grad_norm_ returns the norm BEFORE clipping, which is the signal
+        # we actually care about.
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+        finite = bool(torch.isfinite(gnorm))
+        gnorm_val = float(gnorm) if finite else float("inf")
+        spiking = grad_skip_norm > 0 and finite and gnorm_val > grad_skip_norm
+
+        if spiking and spike_report_budget[0] > 0:
+            spike_report_budget[0] -= 1
+            offenders = ", ".join(f"{n}={v:.1f}" for v, n in top_grad_params(model))
+            tqdm.write(
+                f"  [spike] epoch {epoch + 1} | |g|={gnorm_val:.1f} > {grad_skip_norm:.0f} "
+                f"| loss={loss.item():.4f} | step skipped | top grads: {offenders}"
+            )
+
+        if not finite:
+            skipped_nonfinite += 1
+            optimizer.zero_grad(set_to_none=True)
+        elif spiking:
+            spikes += 1
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            max_gnorm = max(max_gnorm, gnorm_val)
+            gnorm_samples.append(gnorm_val)
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
             else:
-                max_gnorm = max(max_gnorm, float(gnorm))
                 optimizer.step()
+
+        if scaler is not None and scaler.is_enabled():
+            scaler.update()
 
         train_loss += loss.item()
         train_bar.set_postfix(
             loss=f"{loss.item():.4f}",
             L1=f"{loss_info['L1']:.4f}",
             SSIM=f"{loss_info['SSIM']:.4f}",
-            Edge=f"{loss_info['Edge']:.4f}",
-            gn=f"{float(gnorm):.1f}",
-            sk=skipped_steps,
+            gn=f"{gnorm_val:.1f}",
+            sp=spikes,
         )
 
-    return train_loss / max(1, len(train_loader)), skipped_steps, max_gnorm
+    return {
+        "avg_train": train_loss / max(1, len(train_loader)),
+        "skipped": skipped_nonfinite,
+        "spikes": spikes,
+        "max_gnorm": max_gnorm,
+        "median_gnorm": statistics.median(gnorm_samples) if gnorm_samples else 0.0,
+    }
 
 
 # ═══════════════════════════════════════════
@@ -294,8 +351,8 @@ def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
 # ═══════════════════════════════════════════
 # TENSORBOARD LOGGING
 # ═══════════════════════════════════════════
-def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time, max_gnorm=0.0):
-    writer.add_scalars("Loss", {"Train": avg_train, "Val": metrics["avg_val"]}, epoch + 1)
+def log_to_tensorboard(writer, epoch, train_stats, metrics, current_lr, epoch_time):
+    writer.add_scalars("Loss", {"Train": train_stats["avg_train"], "Val": metrics["avg_val"]}, epoch + 1)
     writer.add_scalar("Metrics/PSNR", metrics["avg_psnr"], epoch + 1)
     writer.add_scalar("Metrics/DELTA_PSNR", metrics["avg_psnr"] - metrics["avg_baseline"], epoch + 1)
     writer.add_scalar("Metrics/SSIM", metrics["avg_ssim"], epoch + 1)
@@ -306,7 +363,9 @@ def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time
     writer.add_scalar("Abdomen/SSIM", metrics["avg_ssim_abd"], epoch + 1)
     writer.add_scalar("Training/LR", current_lr, epoch + 1)
     writer.add_scalar("Training/EpochTime", epoch_time, epoch + 1)
-    writer.add_scalar("Training/GradNormMax", max_gnorm, epoch + 1)
+    writer.add_scalar("Training/GradNormMax", train_stats["max_gnorm"], epoch + 1)
+    writer.add_scalar("Training/GradNormMedian", train_stats["median_gnorm"], epoch + 1)
+    writer.add_scalar("Training/GradSpikes", train_stats["spikes"], epoch + 1)
 
     if (epoch + 1) % 10 == 0 and metrics["viz_images"] is not None:
         inp, lbl, out = metrics["viz_images"]
@@ -323,7 +382,10 @@ def main():
     input_mode = cfg.normalize_input_mode(args.input_mode)
     mamba_mode = cfg.normalize_mamba_mode(args.mamba_mode)
     total_epochs = args.epochs
-    warmup_epochs = max(0, min(args.warmup_epochs, total_epochs - 1))
+    warmup_epochs = max(1, min(args.warmup_epochs, total_epochs - 1))
+    if warmup_epochs != args.warmup_epochs:
+        print(f"Note: warmup clamped from {args.warmup_epochs} to {warmup_epochs} "
+              f"(needs to stay below --epochs).")
 
     paths = cfg.run_paths(mamba_mode=mamba_mode, input_mode=input_mode, output_root=args.output_root)
     os.makedirs(paths["run_dir"], exist_ok=True)
@@ -335,7 +397,8 @@ def main():
     print(f"Run: input_mode={input_mode} | mamba_mode={mamba_mode} | device={device}")
     print(f"Outputs -> {paths['run_dir']}")
     print(f"HU range: [{A_MIN}, {A_MAX}] (preset '{cfg.HU_RANGE_PRESET}')")
-    print(f"LR: {args.lr:.2e} | warmup epochs: {warmup_epochs} | weight decay: {WEIGHT_DECAY}")
+    print(f"LR: {args.lr:.2e} | warmup: {warmup_epochs} | wd: {WEIGHT_DECAY} | "
+          f"grad clip: {GRAD_CLIP_MAX_NORM} | grad skip: {args.grad_skip_norm}")
 
     # ---- AMP setup --------------------------------------------------
     use_amp = cfg.USE_AMP and (not args.no_amp) and device.type == "cuda"
@@ -366,13 +429,13 @@ def main():
     optimizer = torch.optim.AdamW(build_param_groups(model, WEIGHT_DECAY), lr=args.lr)
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=max(1, warmup_epochs),
+        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_epochs,
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=SCHEDULER_MIN_LR,
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[max(1, warmup_epochs)],
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs],
     )
 
     writer = SummaryWriter(log_dir=paths["logs"])
@@ -390,14 +453,16 @@ def main():
     meta = {"input_mode": input_mode, "mamba_mode": mamba_mode,
             "hu_range": [A_MIN, A_MAX], "hu_preset": cfg.HU_RANGE_PRESET}
 
+    spike_report_budget = [8]      # shared across epochs: report the first few only
     training_start = time.time()
 
     for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
 
-        avg_train, skipped_steps, max_gnorm = train_one_epoch(
+        train_stats = train_one_epoch(
             model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
             scaler=scaler, amp_dtype=amp_dtype, use_amp=use_amp,
+            grad_skip_norm=args.grad_skip_norm, spike_report_budget=spike_report_budget,
         )
         metrics = validate_one_epoch(
             model, val_loader, loss_fn, device, epoch, total_epochs,
@@ -411,15 +476,16 @@ def main():
 
         print(
             f"Epoch [{epoch + 1:03d}/{total_epochs}] "
-            f"Train: {avg_train:.5f} | Val: {metrics['avg_val']:.5f} | "
+            f"Train: {train_stats['avg_train']:.5f} | Val: {metrics['avg_val']:.5f} | "
             f"PSNR: {metrics['avg_psnr']:.3f} dB | dPSNR: {delta_psnr:+.3f} dB | "
             f"SSIM: {metrics['avg_ssim']:.5f} | RMSE: {metrics['avg_rmse']:.3f} | "
-            f"|g|max: {max_gnorm:.1f} | "
-            f"skipped: {skipped_steps}/{len(train_loader)} | "
+            f"|g|med: {train_stats['median_gnorm']:.2f} | |g|max: {train_stats['max_gnorm']:.1f} | "
+            f"spikes: {train_stats['spikes']}/{len(train_loader)} | "
+            f"nonfinite: {train_stats['skipped']} | "
             f"LR: {current_lr:.2e} | {epoch_time:.1f}s"
         )
 
-        log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time, max_gnorm)
+        log_to_tensorboard(writer, epoch, train_stats, metrics, current_lr, epoch_time)
 
         if metrics["avg_psnr"] > best_psnr:
             best_psnr = metrics["avg_psnr"]
