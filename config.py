@@ -35,8 +35,8 @@ WARMUP_EPOCHS = 5
 # DATA / PREPROCESSING
 # ═══════════════════════════════════════════
 SPATIAL_SIZE = (256, 256)
-A_MIN = -1024  # HU window min
-A_MAX = 1600   # HU window max
+A_MIN = -1000  # HU window min
+A_MAX = 600    # HU window max
 B_MIN = 0.0
 B_MAX = 1.0
 CACHE_DATA = True
@@ -44,7 +44,7 @@ CACHE_DATA = True
 # ═══════════════════════════════════════════
 # EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
 # ═══════════════════════════════════════════
-EVAL_DATA_RANGE = 2624.0  # Physical HU span: A_MAX - A_MIN = 1600 - (-1024) = 2624.0
+EVAL_DATA_RANGE = 1600.0  # Physical HU span: A_MAX - A_MIN = 600 - (-1000) = 1600.0
 
 # Clinical Diagnostic Windows in (HU + 1024 offset) domain
 CLINICAL_WINDOWS = {

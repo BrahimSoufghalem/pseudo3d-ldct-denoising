@@ -12,6 +12,24 @@ from monai.losses import SSIMLoss
 from config import LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE
 
 # ═══════════════════════════════════════════
+# CHARBONNIER LOSS
+# ═══════════════════════════════════════════
+class CharbonnierLoss(nn.Module):
+    """
+    Charbonnier Loss (Smooth L1 variant): sqrt((pred - target)^2 + eps^2).
+    Provides robust, smooth gradients for medical image restoration & denoising.
+    """
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        loss = torch.sqrt(diff * diff + self.eps * self.eps)
+        return torch.mean(loss)
+
+
+# ═══════════════════════════════════════════
 # SOBEL EDGE LOSS
 # ═══════════════════════════════════════════
 class SobelEdgeLoss(nn.Module):
@@ -59,8 +77,7 @@ class SobelEdgeLoss(nn.Module):
 # ═══════════════════════════════════════════
 class MONAIHybridLoss(nn.Module):
     """
-
-    Combines L1 + SSIM + Edge losses
+    Combines Charbonnier + SSIM + Edge losses
     with configurable weights for LDCT denoising.
     """
     def __init__(
@@ -75,6 +92,7 @@ class MONAIHybridLoss(nn.Module):
         self.lambda_ssim = lambda_ssim
         self.lambda_edge = lambda_edge
 
+        self.charbonnier_loss = CharbonnierLoss(eps=1e-3)
         self.ssim_loss = SSIMLoss(spatial_dims=spatial_dims, data_range=1.0)
         self.edge_loss = SobelEdgeLoss()
 
@@ -83,18 +101,19 @@ class MONAIHybridLoss(nn.Module):
         pred_img = pred_img.float()
         target_img = target_img.float()
 
-        l1 = F.l1_loss(pred_img, target_img)
+        charb = self.charbonnier_loss(pred_img, target_img)
         ssim = self.ssim_loss(pred_img, target_img)
         edge = self.edge_loss(pred_img, target_img)
 
         total = (
-            self.lambda_l1 * l1
+            self.lambda_l1 * charb
             + self.lambda_ssim * ssim
             + self.lambda_edge * edge
         )
 
         return total, {
-            "L1": l1.item(),
+            "L1": charb.item(),
+            "Charbonnier": charb.item(),
             "SSIM": ssim.item(),
             "Edge": edge.item(),
             "Total": total.item(),

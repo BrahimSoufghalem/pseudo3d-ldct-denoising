@@ -270,19 +270,28 @@ def main():
     csv_path = output_dir / "benchmark_models_comparison.csv"
     df.to_csv(csv_path, index=False)
 
-    print("\n" + "=" * 80)
-    print("🏆  MODEL COMPARISON SUMMARY TABLE (ldct-benchmark Physical Standard)")
-    print("=" * 80)
-    
-    summary_df = df.groupby("Model")[["PSNR", "SSIM", "RMSE_HU", "VIF"]].mean().reset_index()
-    summary_df = summary_df.sort_values(by="PSNR", ascending=False)
+    print("\n" + "=" * 85)
+    print("🏆  MODEL COMPARISON SUMMARY TABLES (ldct-benchmark Physical Standard)")
+    print("=" * 85)
 
-    print(f"{'Model Name':<28} {'PSNR (dB) ↑':>12} {'SSIM ↑':>12} {'RMSE (HU) ↓':>14} {'VIF ↑':>12}")
-    print("-" * 80)
-    for _, row in summary_df.iterrows():
-        name_str = f"⭐ {row['Model']}" if "Ours" in row['Model'] else row['Model']
-        print(f"{name_str:<28} {row['PSNR']:>12.2f} {row['SSIM']:>12.4f} {row['RMSE_HU']:>14.2f} {row['VIF']:>12.4f}")
-    print("=" * 80)
+    for body_type in ["Chest", "Abdomen", "Overall"]:
+        sub_df = df if body_type == "Overall" else df[df["BodyType"] == body_type]
+        if sub_df.empty:
+            continue
+
+        dose_info = "(10% dose)" if body_type == "Chest" else ("(25% dose)" if body_type == "Abdomen" else "(Combined)")
+        print(f"\n📊 [{body_type.upper()} {dose_info} SUMMARY]")
+        summary_df = sub_df.groupby("Model")[["PSNR", "SSIM", "RMSE_HU", "VIF"]].mean().reset_index()
+        summary_df = summary_df.sort_values(by="PSNR", ascending=False)
+
+        print(f"{'Model Name':<28} {'PSNR (dB) ↑':>12} {'SSIM ↑':>12} {'RMSE (HU) ↓':>14} {'VIF ↑':>12}")
+        print("-" * 85)
+        for _, row in summary_df.iterrows():
+            name_str = f"⭐ {row['Model']}" if "Ours" in row['Model'] else row['Model']
+            print(f"{name_str:<28} {row['PSNR']:>12.2f} {row['SSIM']:>12.4f} {row['RMSE_HU']:>14.2f} {row['VIF']:>12.4f}")
+        print("-" * 85)
+
+    print("=" * 85)
     print(f"\n📄  Full detailed report saved → {csv_path}")
 
 
