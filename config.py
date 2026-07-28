@@ -133,13 +133,31 @@ SPATIAL_SIZE = (256, 256)
 CACHE_DATA = True
 
 # HU windowing preset.
-#   "wide"   : [-1024, 3072] HU -> matches the ldct-benchmark convention and
-#              fully contains BOTH clinical evaluation windows below.
-#   "legacy" : [-1000, 600] HU -> the original setting. It clipped all bone
-#              (>600 HU) and part of the lung window (down to -1350 HU), which
-#              biases the windowed PSNR/SSIM numbers.
-# Switch back with a single line if you need to reproduce the old results.
-HU_RANGE_PRESET = "wide"
+#
+#   "legacy" : [-1000, 600] HU. THE DEFAULT, and the only preset verified to
+#              train stably. Bone above 600 HU is clipped, which is a real
+#              limitation for bone-detail claims, but it keeps soft tissue
+#              spread across most of [0, 1].
+#
+#   "wide"   : [-1024, 3072] HU. Matches the ldct-benchmark convention and
+#              contains both clinical windows below WITHOUT clipping bone.
+#              *** DO NOT USE FOR TRAINING AS-IS: it diverges. ***
+#
+# Measured A/B, identical code and seed, mamba-mode=basic, lr=1e-4:
+#
+#     preset    epoch 3            |g|max        best dPSNR
+#     legacy    +3.65 dB, 0 spikes  2.5 - 5.9     +3.90 dB
+#     wide      collapse, 498/1113  3652 - 9271   +1.55 dB
+#
+# Mechanism: a 4096 HU span squeezes soft tissue into a narrow band of [0, 1].
+# Local variance then falls far below the SSIM stabilisation constants
+# (C2 = 0.03^2), so the SSIM gradient becomes ill-conditioned and scales like
+# 1/sigma^2. The per-spike diagnostic confirmed head.weight (the final conv,
+# adjacent to the loss) dominated every spike - no SSM tensor was involved.
+#
+# Using "wide" would need a data_range matched to the ACTUAL tissue span rather
+# than the nominal 1.0, or a variance-normalised SSIM. Until then it stays off.
+HU_RANGE_PRESET = "legacy"
 
 if HU_RANGE_PRESET == "wide":
     A_MIN = -1024.0
@@ -157,6 +175,9 @@ B_MAX = 1.0
 # ═══════════════════════════════════════════
 # EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
 # ═══════════════════════════════════════════
+# NOTE: EVAL_DATA_RANGE depends on HU_RANGE_PRESET, so PSNR values are NOT
+# comparable across presets. Compare dPSNR (prediction minus noisy baseline)
+# instead - it is preset-independent.
 HU_OFFSET = 1024.0                     # HU -> non-negative display domain
 HU_OFFSET_MAX = A_MAX + HU_OFFSET      # upper clip bound in the offset domain
 EVAL_DATA_RANGE = HU_OFFSET_MAX        # backward-compatible alias
