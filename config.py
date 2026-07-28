@@ -122,11 +122,6 @@ WARMUP_EPOCHS = 5
 # needed); otherwise float16 + GradScaler is used automatically.
 USE_AMP = True
 
-# TF32 tensor cores (Ampere and newer). PyTorch disables TF32 for matmul by
-# default, which silently slows this model down: the SS2D bottleneck is matmul /
-# einsum bound, not convolution bound. Set to False for bit-exact FP32 math.
-ALLOW_TF32 = True
-
 # Recompute the Mamba bottleneck during backward to trade compute for VRAM.
 USE_GRAD_CHECKPOINT = False
 
@@ -189,11 +184,7 @@ N_SCAN_DIRECTIONS = 4                  # SS2D cross-scan directions
 #   "cuda" -> require the official kernel (raises if unavailable)
 #   "ref"  -> always use the chunked PyTorch fallback (slow, for CPU/debug)
 SCAN_BACKEND = "auto"
-
-# Sequence chunk for the PyTorch fallback. The SS2D scan runs at 1/16 resolution,
-# so a 256x256 input gives L = 256 -> a chunk of 128 means only 2 sequential
-# chunks per direction instead of 8. Lower this only if VRAM is tight.
-SCAN_CHUNK_SIZE = 128
+SCAN_CHUNK_SIZE = 32                   # sequence chunk for the PyTorch fallback
 
 # The network downsamples 4x, so inputs are reflection-padded to a multiple of 16
 SIZE_DIVISOR = 16
