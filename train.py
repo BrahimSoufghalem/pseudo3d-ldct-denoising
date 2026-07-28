@@ -12,13 +12,17 @@ own run directory (runs/<input>_<mamba>/):
 Mixed precision is enabled by default on CUDA (bfloat16 when supported,
 otherwise float16 + GradScaler). Use --no-amp for pure FP32.
 
-Stability note
---------------
-Gradient CLIPPING is not a safety net for Adam/AdamW: the optimiser normalises
-by the second moment, so a clipped spike still takes a full ~lr-sized step in a
-corrupted direction and pollutes the running variance. Spiking steps are
-therefore SKIPPED outright (--grad-skip-norm), which is what actually keeps the
-run alive.
+Stability notes
+---------------
+1. Gradient CLIPPING is not a safety net for Adam/AdamW: the optimiser
+   normalises by the second moment, so a clipped spike still takes a full
+   ~lr-sized step in a corrupted direction and pollutes the running variance.
+   Spiking steps are therefore SKIPPED outright (--grad-skip-norm).
+
+2. The skip guard is a seatbelt, NOT a cure. In the diverged wide-HU run it
+   dropped 498/1113 steps in epoch 3 and the model collapsed anyway through the
+   steps that stayed under the threshold. If you are seeing many spikes, the
+   real cause is upstream - see the HU_RANGE_PRESET notes in config.py.
 """
 
 import argparse
@@ -50,6 +54,10 @@ from metrics import (
     compute_rmse_hu,
     denormalize_to_hu_offset,
 )
+
+# Abort the run when more than this fraction of an epoch's steps are skipped:
+# at that point the optimiser is barely moving and the log is misleading.
+SPIKE_RATE_ABORT = 0.5
 
 
 # ═══════════════════════════════════════════
@@ -203,10 +211,12 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             sp=spikes,
         )
 
+    n_steps = max(1, len(train_loader))
     return {
-        "avg_train": train_loss / max(1, len(train_loader)),
+        "avg_train": train_loss / n_steps,
         "skipped": skipped_nonfinite,
         "spikes": spikes,
+        "spike_rate": (spikes + skipped_nonfinite) / n_steps,
         "max_gnorm": max_gnorm,
         "median_gnorm": statistics.median(gnorm_samples) if gnorm_samples else 0.0,
     }
@@ -501,6 +511,20 @@ def main():
 
         save_checkpoint(paths["checkpoint"], epoch, model, optimizer, scheduler, scaler,
                         best_val_loss, best_ssim, best_psnr, patience_counter, meta=meta)
+
+        # A mostly-skipped epoch means the optimiser is frozen. Continuing would
+        # print progress lines that look like training but change nothing.
+        if train_stats["spike_rate"] > SPIKE_RATE_ABORT:
+            print(
+                f"\nABORT: {train_stats['spike_rate'] * 100:.0f}% of steps were skipped this "
+                f"epoch, so the optimiser barely moved.\n"
+                f"The skip guard cannot rescue a run that is already diverging - fix the "
+                f"cause instead.\n"
+                f"Check the [spike] lines above for the dominant tensor, and verify "
+                f"HU_RANGE_PRESET in config.py ('legacy' is the stable setting).\n"
+                f"Best weights so far are kept at {paths['best_model']}."
+            )
+            break
 
         if patience_counter >= PATIENCE:
             print(f"Early stopping at epoch {epoch + 1}")
