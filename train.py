@@ -1,26 +1,38 @@
 """
-LDCT Project — Training Script
+LDCT Project - Training Script
 =================================
-Main entry point: training loop, validation, checkpointing, TensorBoard logging.
+Training loop, validation, checkpointing and TensorBoard logging.
+
+Ablation axes are selected from the command line and each combination gets its
+own run directory (runs/<input>_<mamba>/):
+
+    python train.py --input-mode 2.5d --mamba-mode full
+    python train.py --input-mode 2d   --mamba-mode basic
+
+Mixed precision is enabled by default on CUDA (bfloat16 when supported,
+otherwise float16 + GradScaler). Use --no-amp for pure FP32.
 """
 
+import argparse
 import os
 import time
 
 import torch
-import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import config as cfg
 from config import (
-    MODEL_DIR, LOGS_DIR, CHECKPOINT_PATH, BEST_MODEL_PATH,
     TOTAL_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
     PATIENCE, GRAD_CLIP_MAX_NORM, WARMUP_EPOCHS,
     LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE,
     SCHEDULER_MIN_LR,
     A_MIN, A_MAX,
 )
-from utils import setup_reproducibility, get_device
+from utils import (
+    setup_reproducibility, get_device,
+    extract_centre_slice, get_state_dict, load_state_into,
+)
 from dataset import prepareCT2D
 from model import build_model
 from losses import MONAIHybridLoss
@@ -32,10 +44,29 @@ from metrics import (
 
 
 # ═══════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════
+def parse_args():
+    p = argparse.ArgumentParser(description="Train MS-NAFMambaNet for LDCT denoising")
+    p.add_argument("--input-mode", default=cfg.INPUT_MODE, choices=list(cfg.VALID_INPUT_MODES),
+                   help="2d = centre slice only, 2.5d = (prev, curr, next)")
+    p.add_argument("--mamba-mode", default=cfg.MAMBA_MODE, choices=list(cfg.VALID_MAMBA_MODES))
+    p.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
+    p.add_argument("--batch-size", type=int, default=cfg.TRAIN_BATCH_SIZE)
+    p.add_argument("--lr", type=float, default=LEARNING_RATE)
+    p.add_argument("--no-amp", action="store_true", help="disable mixed precision")
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="recompute the Mamba bottleneck in backward to save VRAM")
+    p.add_argument("--output-root", default=cfg.OUTPUT_ROOT)
+    return p.parse_args()
+
+
+# ═══════════════════════════════════════════
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
-def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, total_epochs):
-    """Run one training epoch in pure FP32 precision. Returns (avg_train_loss, skipped_steps)."""
+def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
+                    scaler=None, amp_dtype=None, use_amp=False):
+    """One training epoch. Returns (avg_train_loss, skipped_steps)."""
     model.train()
     train_loss = 0.0
     skipped_steps = 0
@@ -47,27 +78,40 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
     )
 
     for batch in train_bar:
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
-
-        mid_slice = images[:, 1:2, :, :]
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+        mid_slice = extract_centre_slice(images)
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_res = model(images)
-        pred_img = mid_slice + pred_res
-        loss, loss_info = loss_fn(pred_img, labels)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            pred_res = model(images)
+            # NOTE: the loss is computed on the UNCLAMPED prediction, exactly as
+            # in validation. Clamping here would zero the gradient of every
+            # saturated pixel.
+            pred_img = mid_slice + pred_res
+            loss, loss_info = loss_fn(pred_img.float(), labels.float())
 
-        loss.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
-        if not torch.isfinite(gnorm):
-            skipped_steps += 1
-            optimizer.zero_grad(set_to_none=True)
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+            if not torch.isfinite(gnorm):
+                skipped_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                scaler.step(optimizer)
+            scaler.update()
         else:
-            optimizer.step()
+            loss.backward()
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+            if not torch.isfinite(gnorm):
+                skipped_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                optimizer.step()
 
         train_loss += loss.item()
-
         train_bar.set_postfix(
             loss=f"{loss.item():.4f}",
             L1=f"{loss_info['L1']:.4f}",
@@ -76,30 +120,27 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             sk=skipped_steps,
         )
 
-    avg_train = train_loss / max(1, len(train_loader))
-    return avg_train, skipped_steps
+    return train_loss / max(1, len(train_loader)), skipped_steps
 
 
 # ═══════════════════════════════════════════
 # VALIDATE ONE EPOCH
 # ═══════════════════════════════════════════
 @torch.no_grad()
-def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
+def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs,
+                       amp_dtype=None, use_amp=False):
     """
-    Run one validation epoch using exact ldct-benchmark physical HU metrics.
-    Returns a dict containing all averaged metrics and visualization tensors.
+    One validation epoch with ldct-benchmark physical HU metrics.
+
+    The LOSS uses the same unclamped prediction as training (so train/val curves
+    are comparable); the METRICS use the clamped image, which is what a real
+    viewer would display.
     """
     model.eval()
     val_loss = 0.0
-    val_psnr_sum = 0.0
-    val_ssim_sum = 0.0
-    val_rmse_sum = 0.0
-    baseline_psnr_sum = 0.0
+    val_psnr_sum = val_ssim_sum = val_rmse_sum = baseline_psnr_sum = 0.0
     total_samples = 0
-
-    psnr_chest, psnr_abd = [], []
-    ssim_chest, ssim_abd = [], []
-
+    psnr_chest, psnr_abd, ssim_chest, ssim_abd = [], [], [], []
     viz_images = None
 
     val_bar = tqdm(
@@ -109,21 +150,24 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
     )
 
     for i, batch in enumerate(val_bar):
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
-        mid_slice = images[:, 1:2, :, :]
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+        mid_slice = extract_centre_slice(images)
 
-        pred_res = model(images)
-        preds = torch.clamp(mid_slice + pred_res, 0.0, 1.0)
-        loss, _ = loss_fn(preds, labels)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            pred_res = model(images)
+
+        pred_img = (mid_slice + pred_res).float()
+        loss, _ = loss_fn(pred_img, labels.float())          # unclamped, like training
+        preds = pred_img.clamp(0.0, 1.0)                     # clamped, for metrics/viz
 
         val_loss += loss.item()
         body_types = batch.get("body_type", None)
 
         for b_idx in range(preds.shape[0]):
-            pred_hu = denormalize_to_hu_offset(preds[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
-            lbl_hu = denormalize_to_hu_offset(labels[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
-            mid_hu = denormalize_to_hu_offset(mid_slice[b_idx:b_idx+1], A_MIN, A_MAX).squeeze()
+            pred_hu = denormalize_to_hu_offset(preds[b_idx:b_idx + 1], A_MIN, A_MAX).squeeze()
+            lbl_hu = denormalize_to_hu_offset(labels[b_idx:b_idx + 1], A_MIN, A_MAX).squeeze()
+            mid_hu = denormalize_to_hu_offset(mid_slice[b_idx:b_idx + 1], A_MIN, A_MAX).squeeze()
 
             bt = "Abdomen"
             if body_types is not None:
@@ -149,11 +193,7 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
                 ssim_abd.append(s_val)
 
         if i == 0:
-            viz_images = (
-                mid_slice.float().cpu(),
-                labels.float().cpu(),
-                preds.float().cpu(),
-            )
+            viz_images = (mid_slice.float().cpu(), labels.float().cpu(), preds.float().cpu())
 
         val_bar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -177,54 +217,52 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs):
 # ═══════════════════════════════════════════
 # CHECKPOINT HELPERS
 # ═══════════════════════════════════════════
-def save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, patience_counter):
-    model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler,
+                    best_val_loss, best_ssim, best_psnr, patience_counter, meta=None):
+    """Save a resumable checkpoint. Weights are always stored unwrapped."""
     torch.save({
         "epoch": epoch,
-        "model_state": model_state,
+        "model_state": get_state_dict(model),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
         "best_val_loss": best_val_loss,
         "best_ssim": best_ssim,
         "best_psnr": best_psnr,
         "patience_counter": patience_counter,
-    }, CHECKPOINT_PATH)
+        "meta": meta or {},
+    }, path)
 
 
-def load_checkpoint(model, optimizer, scheduler, device):
-    """Load checkpoint if it exists. Returns (start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter)."""
-    if os.path.exists(CHECKPOINT_PATH):
-        try:
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-        except Exception:
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-        state_dict = checkpoint["model_state"]
-        if hasattr(model, "module"):
-            model.module.load_state_dict(state_dict)
-        else:
-            model.load_state_dict(state_dict)
+def load_checkpoint(path, model, optimizer, scheduler, scaler, device):
+    """Resume from `path` if it exists."""
+    if not os.path.exists(path):
+        return 0, float("inf"), -float("inf"), -float("inf"), 0
 
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        best_ssim = checkpoint.get("best_ssim", -float("inf"))
-        best_psnr = checkpoint.get("best_psnr", -float("inf"))
-        patience_counter = checkpoint.get("patience_counter", 0)
-        print(
-            f"✅ Resumed from epoch {start_epoch} | "
-            f"Best SSIM={best_ssim:.4f} | Best PSNR={best_psnr:.2f} dB"
-        )
-        return start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
 
-    return 0, float("inf"), -float("inf"), -float("inf"), 0
+    load_state_into(model, checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    if scaler is not None and checkpoint.get("scaler_state"):
+        scaler.load_state_dict(checkpoint["scaler_state"])
+
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    best_ssim = checkpoint.get("best_ssim", -float("inf"))
+    best_psnr = checkpoint.get("best_psnr", -float("inf"))
+    patience_counter = checkpoint.get("patience_counter", 0)
+    print(f"Resumed from epoch {start_epoch} | best SSIM={best_ssim:.4f} | best PSNR={best_psnr:.2f} dB")
+    return start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter
 
 
 # ═══════════════════════════════════════════
 # TENSORBOARD LOGGING
 # ═══════════════════════════════════════════
 def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time):
-    """Log training/validation metrics and images to TensorBoard."""
     writer.add_scalars("Loss", {"Train": avg_train, "Val": metrics["avg_val"]}, epoch + 1)
     writer.add_scalar("Metrics/PSNR", metrics["avg_psnr"], epoch + 1)
     writer.add_scalar("Metrics/DELTA_PSNR", metrics["avg_psnr"] - metrics["avg_baseline"], epoch + 1)
@@ -245,18 +283,43 @@ def log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time
 
 
 # ═══════════════════════════════════════════
-# MAIN TRAINING LOOP
+# MAIN
 # ═══════════════════════════════════════════
 def main():
-    # ── Setup ──
-    setup_reproducibility()
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(LOGS_DIR, exist_ok=True)
+    args = parse_args()
+    input_mode = cfg.normalize_input_mode(args.input_mode)
+    mamba_mode = cfg.normalize_mamba_mode(args.mamba_mode)
+    total_epochs = args.epochs
 
+    paths = cfg.run_paths(mamba_mode=mamba_mode, input_mode=input_mode, output_root=args.output_root)
+    os.makedirs(paths["run_dir"], exist_ok=True)
+    os.makedirs(paths["logs"], exist_ok=True)
+
+    setup_reproducibility()
     device = get_device()
 
-    # ── Model, Loss, Optimizer, Scheduler ──
-    model = build_model(device)
+    print(f"Run: input_mode={input_mode} | mamba_mode={mamba_mode} | device={device}")
+    print(f"Outputs -> {paths['run_dir']}")
+    print(f"HU range: [{A_MIN}, {A_MAX}] (preset '{cfg.HU_RANGE_PRESET}')")
+
+    # ---- AMP setup --------------------------------------------------
+    use_amp = cfg.USE_AMP and (not args.no_amp) and device.type == "cuda"
+    amp_dtype = None
+    scaler = None
+    if use_amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        scaler = torch.amp.GradScaler(device.type, enabled=(amp_dtype == torch.float16))
+        print(f"Mixed precision: {amp_dtype} (GradScaler={'on' if scaler.is_enabled() else 'off'})")
+    else:
+        print("Mixed precision: disabled (FP32)")
+
+    # ---- Model / loss / optimiser -----------------------------------
+    model = build_model(
+        device,
+        mamba_mode=mamba_mode,
+        input_mode=input_mode,
+        use_checkpoint=args.grad_checkpoint or cfg.USE_GRAD_CHECKPOINT,
+    )
 
     loss_fn = MONAIHybridLoss(
         lambda_l1=LAMBDA_L1,
@@ -265,99 +328,88 @@ def main():
         spatial_dims=2,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
 
-    # Cosine Annealing with Linear Warmup
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1e-2,
-        end_factor=1.0,
-        total_iters=WARMUP_EPOCHS,
+        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=WARMUP_EPOCHS,
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=TOTAL_EPOCHS - WARMUP_EPOCHS,
-        eta_min=SCHEDULER_MIN_LR,
+        optimizer, T_max=max(1, total_epochs - WARMUP_EPOCHS), eta_min=SCHEDULER_MIN_LR,
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[WARMUP_EPOCHS],
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[WARMUP_EPOCHS],
     )
 
-    # ── TensorBoard & Checkpoint ──
-    writer = SummaryWriter(log_dir=LOGS_DIR)
-    print(f"📊  TensorBoard logs → {LOGS_DIR}")
+    writer = SummaryWriter(log_dir=paths["logs"])
+    print(f"TensorBoard logs -> {paths['logs']}")
 
-    start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter = \
-        load_checkpoint(model, optimizer, scheduler, device)
+    start_epoch, best_val_loss, best_ssim, best_psnr, patience_counter = load_checkpoint(
+        paths["checkpoint"], model, optimizer, scheduler, scaler, device
+    )
 
-    # ── Data ──
-    train_loader, val_loader = prepareCT2D()
+    train_loader, val_loader = prepareCT2D(
+        input_mode=input_mode,
+        train_batch_size=args.batch_size,
+    )
+
+    meta = {"input_mode": input_mode, "mamba_mode": mamba_mode,
+            "hu_range": [A_MIN, A_MAX], "hu_preset": cfg.HU_RANGE_PRESET}
 
     training_start = time.time()
 
-    # ── Training Loop ──
-    for epoch in range(start_epoch, TOTAL_EPOCHS):
+    for epoch in range(start_epoch, total_epochs):
         epoch_start = time.time()
 
-        # Train (Pure FP32 Precision)
-        avg_train, skipped_steps = train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, TOTAL_EPOCHS)
-
-        # Validate
-        metrics = validate_one_epoch(model, val_loader, loss_fn, device, epoch, TOTAL_EPOCHS)
+        avg_train, skipped_steps = train_one_epoch(
+            model, train_loader, loss_fn, optimizer, device, epoch, total_epochs,
+            scaler=scaler, amp_dtype=amp_dtype, use_amp=use_amp,
+        )
+        metrics = validate_one_epoch(
+            model, val_loader, loss_fn, device, epoch, total_epochs,
+            amp_dtype=amp_dtype, use_amp=use_amp,
+        )
 
         delta_psnr = metrics["avg_psnr"] - metrics["avg_baseline"]
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_time = time.time() - epoch_start
-        elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - training_start))
-        eta = time.strftime("%H:%M:%S", time.gmtime(epoch_time * (TOTAL_EPOCHS - epoch - 1)))
-
         scheduler.step()
 
-        # Print summary
         print(
-            f"Epoch [{epoch + 1:03d}/{TOTAL_EPOCHS}] "
-            f"Train: {avg_train:.5f}↓ | Val: {metrics['avg_val']:.5f}↓ | "
-            f"PSNR: {metrics['avg_psnr']:.3f} dB↑ | ΔPSNR: +{delta_psnr:.3f} dB | "
-            f"SSIM: {metrics['avg_ssim']:.5f}↑ | RMSE: {metrics['avg_rmse']:.3f}↓ | "
+            f"Epoch [{epoch + 1:03d}/{total_epochs}] "
+            f"Train: {avg_train:.5f} | Val: {metrics['avg_val']:.5f} | "
+            f"PSNR: {metrics['avg_psnr']:.3f} dB | dPSNR: {delta_psnr:+.3f} dB | "
+            f"SSIM: {metrics['avg_ssim']:.5f} | RMSE: {metrics['avg_rmse']:.3f} | "
             f"skipped: {skipped_steps}/{len(train_loader)} | "
-            f"LR: {current_lr:.2e} | ⏱️ {epoch_time:.1f}s"
+            f"LR: {current_lr:.2e} | {epoch_time:.1f}s"
         )
 
-        # Log to TensorBoard
         log_to_tensorboard(writer, epoch, avg_train, metrics, current_lr, epoch_time)
 
-        # Check for best model
         if metrics["avg_psnr"] > best_psnr:
             best_psnr = metrics["avg_psnr"]
             best_ssim = metrics["avg_ssim"]
             best_val_loss = metrics["avg_val"]
             patience_counter = 0
-
-            torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(
-                f"  ✅ Best model saved! "
-                f"PSNR={best_psnr:.2f} | "
-                f"SSIM={best_ssim:.4f}"
-            )
+            torch.save({"model_state_dict": get_state_dict(model), "meta": meta,
+                        "psnr": best_psnr, "ssim": best_ssim, "epoch": epoch},
+                       paths["best_model"])
+            print(f"  Best model saved: PSNR={best_psnr:.2f} | SSIM={best_ssim:.4f}")
         else:
             patience_counter += 1
 
-        # Save checkpoint (every epoch)
-        save_checkpoint(epoch, model, optimizer, scheduler, best_val_loss, best_ssim, best_psnr, patience_counter)
+        save_checkpoint(paths["checkpoint"], epoch, model, optimizer, scheduler, scaler,
+                        best_val_loss, best_ssim, best_psnr, patience_counter, meta=meta)
 
         if patience_counter >= PATIENCE:
-            print(f"⏹️ Early stopping at epoch {epoch + 1}")
+            print(f"Early stopping at epoch {epoch + 1}")
             break
 
-    # ── Final Summary ──
     total_time = time.strftime("%H:%M:%S", time.gmtime(time.time() - training_start))
-    print(f"\n🎉 Training complete!")
-    print(f"⏱️ Total time  : {total_time}")
-    print(f"📊 Best PSNR   : {best_psnr:.2f} dB")
-    print(f"📊 Best SSIM   : {best_ssim:.4f}")
-    print(f"📂 Model saved : {BEST_MODEL_PATH}")
+    print("\nTraining complete!")
+    print(f"Total time  : {total_time}")
+    print(f"Best PSNR   : {best_psnr:.2f} dB")
+    print(f"Best SSIM   : {best_ssim:.4f}")
+    print(f"Model saved : {paths['best_model']}")
 
     writer.close()
 
