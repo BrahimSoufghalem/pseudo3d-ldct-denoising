@@ -5,11 +5,10 @@ Main entry point: training loop, validation, checkpointing, TensorBoard logging.
 """
 
 import os
-import time 
- 
+import time
+
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -28,7 +27,7 @@ from losses import MONAIHybridLoss
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
     compute_rmse_hu,
-    denormalize_to_hu_offset, psnr, rmse
+    denormalize_to_hu_offset,
 )
 
 

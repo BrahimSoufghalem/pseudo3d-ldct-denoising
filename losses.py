@@ -1,17 +1,15 @@
 """
 LDCT Project — Loss Functions
 ================================
-VGG Perceptual Loss, Sobel Edge Loss, and the combined Hybrid Loss.
+Sobel Edge Loss and MONAI Hybrid Loss.
 """
- 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from monai.losses import SSIMLoss 
 
-from config import LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE 
-
-
+from config import LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE
 
 # ═══════════════════════════════════════════
 # SOBEL EDGE LOSS
