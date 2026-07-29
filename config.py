@@ -157,18 +157,51 @@ USE_GRAD_CHECKPOINT = False
 SPATIAL_SIZE = (256, 256)
 CACHE_DATA = True
 
-# HU windowing preset.
+# HU windowing preset. Read this whole block before changing it: the preset
+# decides both what the network can represent AND what the metrics mean.
 #
-#   "legacy" : [-1000, 600] HU. THE DEFAULT, and the only preset verified to
-#              train stably. Bone above 600 HU is clipped, which is a real
-#              limitation for bone-detail claims, but it keeps soft tissue
-#              spread across most of [0, 1].
+#   "legacy"    : [-1000, 600] HU. THE DEFAULT, and the only preset verified to
+#                 train stably end to end. Bone above 600 HU is clipped, which
+#                 is a real limitation for bone-detail claims, but it keeps soft
+#                 tissue spread across most of [0, 1].
 #
-#   "wide"   : [-1024, 3072] HU. Matches the ldct-benchmark convention and
-#              contains both clinical windows below WITHOUT clipping bone.
-#              *** DO NOT USE FOR TRAINING AS-IS: it diverges. ***
+#   "benchmark" : [-1024, 1900] HU. Reproduces the ldct-benchmark convention
+#                 EXACTLY: A_MAX + HU_OFFSET = 2924, which is the DATA_RANGE
+#                 constant in ldctbench/evaluate/utils.py (max bone HU 1900 plus
+#                 the 1024 offset). Use this for any number you intend to
+#                 compare against the published table. NOT yet verified stable.
 #
-# Measured A/B, identical code and seed, mamba-mode=basic, lr=1e-4:
+#   "wide"      : [-1024, 3072] HU. Historical. It diverges, AND it never
+#                 matched the reference either (4096 != 2924). Kept only so old
+#                 run directories remain interpretable.
+#
+# Why "benchmark" matters, verified by reading eeulig/ldct-benchmark @ 09b1011:
+#
+#   Our metric code is already identical to the reference - apply_center_width
+#   line for line, the same two clinical windows, PSNR and SSIM on windowed
+#   images with data_range 1.0, VIF via torchmetrics with sigma_n_sq=2.0 on
+#   UNWINDOWED images clipped to [0, DATA_RANGE], RMSE likewise, all per slice.
+#   The one and only mismatch is that clip bound. And because the data pipeline
+#   clips HU at A_MAX before the model ever sees a voxel, the consequence is not
+#   cosmetic:
+#
+#     Abdomen PSNR/SSIM  COMPARABLE. The soft-tissue window spans [-150, 250] HU,
+#                        entirely inside [-1000, 600]. Empirically confirmed:
+#                        0.9043 SSIM here vs 0.9028 +- 0.0007 published, after
+#                        only two epochs.
+#     Chest PSNR/SSIM    NOT comparable. The lung window spans [-1350, 150] HU.
+#                        Clipping at -1000 flattens 350 HU inside the diagnostic
+#                        window itself, which caps chest scores by construction.
+#     VIF, RMSE          NOT comparable. Both are computed unwindowed over the
+#                        full [0, DATA_RANGE], so they see the whole HU span,
+#                        including the bone we discard.
+#
+#   So the "gap" against the published chest and VIF columns is substantially a
+#   measurement-convention artefact, not a model deficit. Fix the convention
+#   before spending GPU hours chasing it.
+#
+# Measured A/B for the legacy-vs-wide instability, identical code and seed,
+# mamba-mode=basic, lr=1e-4:
 #
 #     preset    epoch 3            |g|max        best dPSNR
 #     legacy    +3.65 dB, 0 spikes  2.5 - 5.9     +3.90 dB
@@ -180,18 +213,38 @@ CACHE_DATA = True
 # 1/sigma^2. The per-spike diagnostic confirmed head.weight (the final conv,
 # adjacent to the loss) dominated every spike - no SSM tensor was involved.
 #
-# Using "wide" would need a data_range matched to the ACTUAL tissue span rather
-# than the nominal 1.0, or a variance-normalised SSIM. Until then it stays off.
-HU_RANGE_PRESET = "legacy"
+# "benchmark" spans 2924 HU, i.e. 1.83x legacy, against 2.56x for "wide". It is
+# therefore a milder version of the same risk, and the two other regressions
+# that were confounded with the original divergence (NAFBlock beta/gamma = 0 and
+# bf16 AMP) are both fixed now. That makes it worth retesting, not safe to
+# assume. Probe it on the cheap configuration first and watch epochs 2-4:
+#
+#   HU_RANGE_PRESET=benchmark python train.py --input-mode 2d --mamba-mode basic \
+#     --lr 2e-4 --epochs 15 --output-root probe_benchmark
+#
+# Accept the preset only if epoch 2 dPSNR > +3, epoch 3 does not regress, and
+# spikes stay at 0/1113. Also watch abdomen PSNR specifically: a wider span
+# gives soft tissue a narrower slice of [0, 1] and hence a smaller Charbonnier
+# gradient, so if abdomen PSNR drops below the legacy 32.58 dB this is a
+# trade-off rather than an upgrade.
+#
+# Overridable from the environment so a probe needs no file edit.
+HU_RANGE_PRESET = os.environ.get("HU_RANGE_PRESET", "legacy").strip().lower()
 
 if HU_RANGE_PRESET == "wide":
     A_MIN = -1024.0
     A_MAX = 3072.0
+elif HU_RANGE_PRESET == "benchmark":
+    # A_MAX + HU_OFFSET == 2924 == ldctbench DATA_RANGE. Do not "round" these.
+    A_MIN = -1024.0
+    A_MAX = 1900.0
 elif HU_RANGE_PRESET == "legacy":
     A_MIN = -1000.0
     A_MAX = 600.0
 else:
-    raise ValueError("HU_RANGE_PRESET must be 'wide' or 'legacy'")
+    raise ValueError(
+        f"HU_RANGE_PRESET must be 'legacy', 'benchmark' or 'wide', got '{HU_RANGE_PRESET}'"
+    )
 
 B_MIN = 0.0
 B_MAX = 1.0
@@ -200,14 +253,22 @@ B_MAX = 1.0
 # ═══════════════════════════════════════════
 # EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
 # ═══════════════════════════════════════════
-# NOTE: EVAL_DATA_RANGE depends on HU_RANGE_PRESET, so PSNR values are NOT
-# comparable across presets. Compare dPSNR (prediction minus noisy baseline)
-# instead - it is preset-independent.
+# EVAL_DATA_RANGE is DERIVED from HU_RANGE_PRESET, so absolute PSNR, RMSE and
+# VIF are NOT comparable across presets. Compare dPSNR (prediction minus noisy
+# baseline) when comparing our own runs - it is preset-independent.
+#
+# Preset -> EVAL_DATA_RANGE:  legacy 1624 | benchmark 2924 | wide 4096
+# Only 2924 equals the reference DATA_RANGE in ldctbench/evaluate/utils.py.
 HU_OFFSET = 1024.0                     # HU -> non-negative display domain
 HU_OFFSET_MAX = A_MAX + HU_OFFSET      # upper clip bound in the offset domain
 EVAL_DATA_RANGE = HU_OFFSET_MAX        # backward-compatible alias
 
-# Clinical diagnostic windows, expressed as (center, width) in the HU+1024 domain
+# Clinical diagnostic windows, expressed as (center, width) in the HU+1024
+# domain. These match CW["C"] and CW["L"] in ldctbench/evaluate/utils.py exactly.
+# The reference also defines CW["N"] = (1024 + 40, 80), a neuro/head window; we
+# omit it because this dataset contains only chest and abdomen exams. If the
+# published row you compare against averages over all three exam types, only
+# its PER-REGION numbers are comparable to ours, never the overall mean.
 CLINICAL_WINDOWS = {
     "Chest": (HU_OFFSET - 600, 1500),   # Lung window:        C=-600 HU, W=1500 HU
     "Abdomen": (HU_OFFSET + 50, 400),   # Soft tissue window: C=  50 HU, W= 400 HU
