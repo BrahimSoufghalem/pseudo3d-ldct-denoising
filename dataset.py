@@ -8,6 +8,18 @@ MONAI transforms and DataLoaders for both experiment input modes:
 
 In "2d" mode the neighbouring files are never loaded, so that ablation is also
 about 3x cheaper in I/O and cache memory - not just a masked-out input.
+
+Memory note
+-----------
+With cache_rate=1.0 the whole split lives in RAM as float32. At 512x512 that is
+roughly:
+
+    2D   : 17,816 x (1 + 1) channels  ~= 37 GB train + ~11 GB val
+    2.5D : 17,816 x (3 + 1) channels  ~= 75 GB train + ~21 GB val
+
+So a single 2.5D cache nearly fills a 100 GB machine, and running several
+training processes side by side is impossible. Either share one cache across
+models in a single process (see run_ablation.py) or lower `cache_rate`.
 """
 
 import os
@@ -162,6 +174,7 @@ def prepareCT2D(
     train_batch_size=TRAIN_BATCH_SIZE,
     val_batch_size=VAL_BATCH_SIZE,
     num_workers=NUM_WORKERS,
+    cache_rate=1.0,
 ):
     """
     Full data pipeline:
@@ -169,11 +182,18 @@ def prepareCT2D(
       2. Per-slice record collection for the chosen input mode
       3. MONAI datasets & DataLoaders
 
+    Args:
+        cache: use CacheDataset at all.
+        cache_rate: fraction of records held in RAM (1.0 = everything). Lower it
+            for the 2.5D mode, whose cache is ~3x the 2D one; the uncached
+            remainder is loaded on the fly by the DataLoader workers.
+
     Returns (train_loader, val_loader).
     """
     mode = cfg.normalize_input_mode(input_mode)
     set_determinism(seed=SEED)
     random.seed(SEED)
+    cache_rate = float(min(max(cache_rate, 0.0), 1.0))
 
     all_patients = sorted([
         p for p in os.listdir(in_dir)
@@ -219,9 +239,11 @@ def prepareCT2D(
     train_transforms = get_train_transforms(spatial_size, input_mode=mode)
     val_transforms = get_val_transforms(spatial_size, input_mode=mode)
 
-    if cache:
-        train_ds = CacheDataset(train_files, train_transforms, cache_rate=1.0)
-        val_ds = CacheDataset(val_files, val_transforms, cache_rate=1.0)
+    if cache and cache_rate > 0.0:
+        if cache_rate < 1.0:
+            print(f"Cache rate    : {cache_rate:.2f} (remainder loaded on the fly)")
+        train_ds = CacheDataset(train_files, train_transforms, cache_rate=cache_rate)
+        val_ds = CacheDataset(val_files, val_transforms, cache_rate=cache_rate)
     else:
         train_ds = Dataset(train_files, train_transforms)
         val_ds = Dataset(val_files, val_transforms)
