@@ -118,9 +118,34 @@ PATIENCE = 15
 GRAD_CLIP_MAX_NORM = 1.0
 WARMUP_EPOCHS = 5
 
-# Mixed precision. bfloat16 is preferred when the GPU supports it (no GradScaler
-# needed); otherwise float16 + GradScaler is used automatically.
-USE_AMP = True
+# Mixed precision. DISABLED BY DEFAULT - this model does not tolerate bfloat16.
+#
+# Controlled A/B, identical code/seed/data, 2d + basic + legacy HU, lr 2e-4,
+# beta/gamma = 1, 15 epochs:
+#
+#   precision   ep1     ep2     ep3     outcome
+#   bf16 AMP    +1.29   +3.59   +3.76   COLLAPSE at ep4 (-0.48), then stuck at
+#                                       dPSNR ~0 for 4 epochs, train loss frozen
+#   FP32        +1.29   +5.81   +6.24   monotone to ep15 +7.17,
+#                                       PSNR 29.06 dB, SSIM 0.7152
+#
+# The bf16 failure is invisible to every guard we have: |g|max peaked at 9.7
+# (threshold is 100) and there were zero non-finite values. It is not overflow,
+# it is accumulated rounding error. bfloat16 has 8 mantissa bits, and with
+# beta/gamma = 1 each of the eight NAF stages adds a full-magnitude branch to
+# the residual stream, so relative error compounds with depth until the
+# optimiser settles in a degenerate identity solution it cannot escape.
+#
+# The collapse fired exactly as warmup pushed lr past ~1.2e-4. That is also why
+# the learning rate appeared to matter enormously here while barely mattering in
+# the original FP32 code: lr sensitivity was a symptom of the precision choice,
+# not a property of the architecture.
+#
+# Cost of FP32 on an RTX PRO 6000: 173s vs 157s per epoch, roughly 10%. Cheap.
+#
+# If you re-enable AMP for VRAM reasons, treat any non-monotone dPSNR in the
+# first five epochs as a precision artefact before blaming the model.
+USE_AMP = False
 
 # Recompute the Mamba bottleneck during backward to trade compute for VRAM.
 USE_GRAD_CHECKPOINT = False
