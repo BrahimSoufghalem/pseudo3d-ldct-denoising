@@ -203,8 +203,9 @@ USE_GRAD_CHECKPOINT = False
 SPATIAL_SIZE = (256, 256)
 CACHE_DATA = True
 
-# HU windowing preset. Read this whole block before changing it: the preset
-# decides both what the network can represent AND what the metrics mean.
+# HU windowing preset. THE DEFAULT HAS ALWAYS BEEN 'legacy' AND STILL IS.
+# Nothing about the training pipeline changed when 'benchmark' was added; it is
+# a pure opt-in.
 #
 #   "legacy"    : [-1000, 600] HU. THE DEFAULT, and the preset every strong
 #                 result so far was produced with. Bone above 600 HU is clipped,
@@ -334,11 +335,11 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 #     multi-scale SSIM         +0.0084       +0.0013
 #     window-aligned loss      no separable effect
 #
-# Chest SSIM did improve - its gap to target roughly halved - so MS-SSIM stays
-# on. But VIF is untouched, and there is a clean argument for why no loss tweak
-# will fix it: RED-CNN in the reference table is trained with plain MSE, the
-# most smoothing objective available, and still reaches VIF 0.221 at PSNR 28.36.
-# If a naive MSE model beats us on VIF, the loss is not the binding constraint.
+# Both are now OFF by default (see the LOSS WEIGHTS section). There is a clean
+# argument for why no loss tweak will fix VIF: RED-CNN in the reference table is
+# trained with plain MSE, the most smoothing objective available, and still
+# reaches VIF 0.221 at PSNR 28.36. If a naive MSE model beats us on VIF, the
+# loss is not the binding constraint.
 #
 # Capacity, meanwhile, has never been varied even once. Every number in this
 # project comes from a single 5.1 M-parameter configuration with ONE NAF block
@@ -370,17 +371,27 @@ SIZE_DIVISOR = 16
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
+# The active objective is the one that produced the best result to date
+# (runs_fp32: PSNR 29.06, SSIM 0.7152, dPSNR +7.17):
+#
+#     1.0 * Charbonnier  +  0.6 * SSIM (single scale)  +  0.2 * Sobel edge
+#
 LAMBDA_L1 = 1.0                        # Charbonnier weight (historical name)
 LAMBDA_SSIM = 0.6
 LAMBDA_EDGE = 0.2
 
 # ---------------------------------------------------------------------------
-# WHY THE NEXT TWO SWITCHES EXIST, AND WHAT THEY ACTUALLY DELIVERED
+# TWO OBJECTIVE EXPERIMENTS THAT WERE RUN AND ROLLED BACK
 # ---------------------------------------------------------------------------
-# evaluate.py reports the metrics of the raw LDCT input as well as of the
-# prediction, which lets us score the model on the FRACTION OF THE REQUIRED GAIN
-# it achieves instead of on absolute numbers. Measured on the 10 test patients
-# (2d / basic, 20 epochs, 512x512), against the published targets:
+# Keep this record. Both switches below default to OFF, so the loss behaves
+# exactly as it did before they existed. The implementations stay in losses.py
+# because they are tested and safe, and because a falsified hypothesis is worth
+# more written down than deleted.
+#
+# The motivation. evaluate.py reports the metrics of the raw LDCT input as well
+# as of the prediction, which lets us score the model on the FRACTION OF THE
+# REQUIRED GAIN it achieves instead of on absolute numbers. On the 10 test
+# patients (2d / basic, 20 epochs, 512x512), against the published targets:
 #
 #   metric        baseline   ours     target    needed    got      share
 #   PSNR chest     18.09     27.21    28.36     +10.27    +9.12     89%
@@ -397,52 +408,46 @@ LAMBDA_EDGE = 0.2
 #
 # The shortfall was SPECIFIC to VIF, which suggested the missing ingredient was
 # information spread over MULTIPLE SCALES - VIF sums information across
-# sub-bands, while our SSIM term used a single 11x11 window. That was the
-# hypothesis these two switches were built to test.
+# sub-bands, while the SSIM term uses a single 11x11 window.
 #
-# RESULT: HALF RIGHT.
-#   chest Delta_SSIM  +0.2737 -> +0.2821   (gap to target roughly halved)
+# RESULT: hypothesis FALSIFIED.
+#   chest Delta_SSIM  +0.2737 -> +0.2821   (real, but small)
 #   chest Delta_VIF   +0.0634 -> +0.0647   (noise)
 #   abdomen Delta_VIF +0.0581 -> +0.0583   (noise)
 #
-# MS-SSIM is a real improvement for SSIM and stays on by default. The
-# multi-scale explanation of the VIF deficit is FALSIFIED. See the MODEL
-# ARCHITECTURE section for where the investigation went next.
+# MS-SSIM is a genuine if modest SSIM improvement and can be re-enabled once
+# only one variable is moving at a time. It is off for now so the capacity sweep
+# is measured against the known-good baseline objective.
 # ---------------------------------------------------------------------------
 
-# Replace the single-scale SSIM term with multi-scale SSIM (5 levels).
+# Multi-scale SSIM (5 levels) in place of the single-scale term.
+# OFF by default - see the record above. Enable with USE_MS_SSIM=1, or disable
+# per-run with train.py's --no-ms-ssim.
 # Falls back to single-scale automatically if torchmetrics is unavailable or the
 # crop is too small for 5 levels. Costs about 5% more time per step.
-# Requires min(H, W) > (kernel_size - 1) * 2**(levels - 1) = 160 for 5 levels,
-# which SPATIAL_SIZE (256, 256) satisfies.
-USE_MS_SSIM = _env_flag("USE_MS_SSIM", True)
+USE_MS_SSIM = _env_flag("USE_MS_SSIM", False)
 MS_SSIM_BETAS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)   # Wang et al. 2003
 MS_SSIM_KERNEL_SIZE = 11
 
-# Window-aligned loss.
+# Window-aligned loss. OFF by default - see the record above.
 #
-# The loss runs on the full normalized [0, 1] range, but PSNR and SSIM are only
-# ever measured inside a clinical window: lung is 1500 HU wide, soft tissue only
-# 400 HU wide, out of a 1624 HU (legacy) or 2924 HU (benchmark) span. Everything
-# outside - bone, external air, the scanner table - consumes gradient that no
-# metric ever reads. This term re-spends that capacity where it is scored.
+# The idea: the loss runs on the full normalized [0, 1] range, but PSNR and SSIM
+# are only ever measured inside a clinical window (lung 1500 HU, soft tissue
+# 400 HU). Everything outside - bone, external air, the scanner table - consumes
+# gradient that no metric ever reads.
 #
-#   "off"   : loss on [0, 1] only.
-#   "extra" : DEFAULT. Keeps the global term AND adds a windowed one weighted by
-#             LAMBDA_WINDOW. Safer, because the global term still supplies a
-#             gradient to pixels outside the window (the windowed term clamps
-#             them, so their gradient there is exactly zero).
-#   "only"  : windowed term alone. Strongest effect, but nothing constrains the
-#             out-of-window pixels any more; expect bone and air to drift.
+#   "off"   : DEFAULT. Loss on [0, 1] only.
+#   "extra" : keeps the global term AND adds a windowed one weighted by
+#             LAMBDA_WINDOW. Safer than "only", because the global term still
+#             supplies a gradient to pixels outside the window (the windowed
+#             term clamps them, so their gradient there is exactly zero).
+#   "only"  : windowed term alone. Nothing constrains the out-of-window pixels
+#             any more; expect bone and air to drift.
 #
-# The window is selected per SAMPLE from the batch's body_type, so a mixed
-# chest/abdomen batch is handled correctly. NOTE: run_ablation.py does not pass
-# body_type to the loss, so this term is silently disabled there (with a
-# warning) - use train.py for window-loss experiments.
-#
-# Measured effect so far: none separable from MS-SSIM. Left on because it is
-# principled and costs ~5%, but do not credit it with any result yet.
-WINDOW_LOSS_MODE = os.environ.get("WINDOW_LOSS_MODE", "extra").strip().lower()
+# The window is selected per SAMPLE from the batch's body_type. NOTE:
+# run_ablation.py does not pass body_type to the loss, so this term is silently
+# disabled there (with a warning) - use train.py for window-loss experiments.
+WINDOW_LOSS_MODE = os.environ.get("WINDOW_LOSS_MODE", "off").strip().lower()
 VALID_WINDOW_LOSS_MODES = ("off", "extra", "only")
 if WINDOW_LOSS_MODE not in VALID_WINDOW_LOSS_MODES:
     raise ValueError(
