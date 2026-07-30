@@ -25,6 +25,43 @@ def _env_flag(name, default):
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _env_int(name, default):
+    """Read an integer from the environment, falling back to `default`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got '{raw}'") from None
+
+
+def _env_blocks(name, default):
+    """Read a per-stage block count tuple, e.g. ENC_BLOCKS=2,2,4,8.
+
+    Validated on purpose. A typo here does not crash - it silently builds a
+    DIFFERENT architecture, and you only discover it when a checkpoint refuses
+    to load hours later.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    parts = [p for p in raw.replace(" ", "").split(",") if p]
+    try:
+        values = tuple(int(p) for p in parts)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be comma-separated integers, got '{raw}'"
+        ) from None
+    if len(values) != len(default):
+        raise ValueError(
+            f"{name} needs exactly {len(default)} values (one per stage), got '{raw}'"
+        )
+    if any(v < 1 for v in values):
+        raise ValueError(f"{name} entries must all be >= 1, got '{raw}'")
+    return values
+
+
 # ═══════════════════════════════════════════
 # PATHS
 # ═══════════════════════════════════════════
@@ -184,8 +221,19 @@ CACHE_DATA = True
 #                 matched the reference either (4096 != 2924). Kept only so old
 #                 run directories remain interpretable.
 #
-# WHAT THE PRESET DOES *NOT* EXPLAIN (tested, do not re-run)
+# INVARIANT: THE EVAL PRESET MUST EQUAL THE TRAINING PRESET
 # ----------------------------------------------------------
+# normalize_hu() uses A_MIN/A_MAX, so the preset defines the input scaling the
+# network was fitted to. Evaluating a legacy-trained checkpoint under
+# 'benchmark' feeds it a distribution it has never seen and reports numbers that
+# look exactly like a model regression. The tell is the baseline row: the LDCT
+# input metrics depend ONLY on the preset, never on the model, so if two reports
+# disagree on the baseline they were produced under different conventions and
+# their denoised columns cannot be compared. Checkpoints record their preset in
+# meta["hu_preset"] - check it before trusting a comparison.
+#
+# WHAT THE PRESET DOES *NOT* EXPLAIN (tested twice, do not re-run)
+# -----------------------------------------------------------------
 # An earlier version of this comment claimed the chest and VIF gaps against the
 # published table were "substantially a measurement-convention artefact". That
 # was wrong, and it was falsified by the obvious experiment: the SAME checkpoint
@@ -269,11 +317,44 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 # ═══════════════════════════════════════════
 # MODEL ARCHITECTURE
 # ═══════════════════════════════════════════
-MODEL_WIDTH = 32                       # channels of stage 1; stages are w,2w,4w,8w,16w
-ENC_BLOCKS = (1, 1, 1, 1)              # NAF blocks per encoder stage
-DEC_BLOCKS = (1, 1, 1, 1)              # NAF blocks per decoder stage
-D_STATE = 16                           # SSM state dimension N
-N_SCAN_DIRECTIONS = 4                  # SS2D cross-scan directions
+# Capacity is read from the environment so a scaling sweep needs no file edit
+# and behaves identically under train.py and run_ablation.py:
+#
+#   MODEL_WIDTH=48 ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2 python train.py ...
+#
+# Cost scales roughly with width^2 for the convolutions and linearly with the
+# block counts. Reference point: mamba_mode=basic, width 32, (1,1,1,1)/(1,1,1,1)
+# is 5,136,613 parameters and about 175 s/epoch in FP32 at 256x256.
+#
+# WHY CAPACITY IS THE CURRENT LEVER
+# ----------------------------------
+# Two objective changes were measured first and neither moved VIF:
+#
+#     lever                  chest dSSIM   chest dVIF
+#     multi-scale SSIM         +0.0084       +0.0013
+#     window-aligned loss      no separable effect
+#
+# Chest SSIM did improve - its gap to target roughly halved - so MS-SSIM stays
+# on. But VIF is untouched, and there is a clean argument for why no loss tweak
+# will fix it: RED-CNN in the reference table is trained with plain MSE, the
+# most smoothing objective available, and still reaches VIF 0.221 at PSNR 28.36.
+# If a naive MSE model beats us on VIF, the loss is not the binding constraint.
+#
+# Capacity, meanwhile, has never been varied even once. Every number in this
+# project comes from a single 5.1 M-parameter configuration with ONE NAF block
+# per stage, which is small for this task. Suggested ladder, cheapest first:
+#
+#     ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2          depth first, width kept at 32
+#     MODEL_WIDTH=48                                  width only
+#     MODEL_WIDTH=48 ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2
+#
+# Change ONE axis at a time. A checkpoint is only loadable by a run with the
+# same capacity settings, so give each configuration its own --output-root.
+MODEL_WIDTH = _env_int("MODEL_WIDTH", 32)              # stages are w,2w,4w,8w,16w
+ENC_BLOCKS = _env_blocks("ENC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per encoder stage
+DEC_BLOCKS = _env_blocks("DEC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per decoder stage
+D_STATE = _env_int("D_STATE", 16)                      # SSM state dimension N
+N_SCAN_DIRECTIONS = 4                                  # SS2D cross-scan directions
 
 # Selective-scan backend:
 #   "auto" -> official mamba_ssm CUDA kernel when available, else PyTorch fallback
@@ -294,12 +375,12 @@ LAMBDA_SSIM = 0.6
 LAMBDA_EDGE = 0.2
 
 # ---------------------------------------------------------------------------
-# WHY THE NEXT TWO SWITCHES EXIST
+# WHY THE NEXT TWO SWITCHES EXIST, AND WHAT THEY ACTUALLY DELIVERED
 # ---------------------------------------------------------------------------
-# evaluate.py now reports the metrics of the raw LDCT input as well as of the
+# evaluate.py reports the metrics of the raw LDCT input as well as of the
 # prediction, which lets us score the model on the FRACTION OF THE REQUIRED GAIN
-# it actually achieves instead of on absolute numbers. Measured on the 10 test
-# patients (2d / basic, 20 epochs, 512x512), against the published targets:
+# it achieves instead of on absolute numbers. Measured on the 10 test patients
+# (2d / basic, 20 epochs, 512x512), against the published targets:
 #
 #   metric        baseline   ours     target    needed    got      share
 #   PSNR chest     18.09     27.21    28.36     +10.27    +9.12     89%
@@ -309,20 +390,24 @@ LAMBDA_EDGE = 0.2
 #   VIF  chest      0.0993    0.1627   0.221     +0.1217  +0.0634   52%
 #   VIF  abdomen    0.3882    0.4463   0.491     +0.1028  +0.0581   57%
 #
-# Two things follow, and they are the whole justification for this section.
+# Delta_VIF is POSITIVE everywhere (+0.048 to +0.068 on all ten patients), so
+# the model adds visual information rather than destroying it. The "unbeatable
+# posterior-mean ceiling" argument is dead, and with it the case for going
+# adversarial.
 #
-# 1. Delta_VIF is POSITIVE everywhere (+0.048 to +0.068 on all ten patients).
-#    The model adds visual information, it does not destroy it. The "the loss
-#    family has an unbeatable posterior-mean ceiling" argument is therefore
-#    dead, and so is the case for going adversarial right now.
+# The shortfall was SPECIFIC to VIF, which suggested the missing ingredient was
+# information spread over MULTIPLE SCALES - VIF sums information across
+# sub-bands, while our SSIM term used a single 11x11 window. That was the
+# hypothesis these two switches were built to test.
 #
-# 2. The shortfall is SPECIFIC to VIF: 89-112% of the required gain on PSNR and
-#    SSIM, but only 52-57% on VIF. A generic capacity shortage would drag all
-#    three down proportionally. Something is missing that VIF measures and the
-#    other two do not - and that is information spread over MULTIPLE SCALES.
-#    VIF decomposes the image into sub-bands and sums the information preserved
-#    in each. Our SSIM term uses a single 11x11 window, i.e. one scale.
-#    We train on one scale and get scored on several.
+# RESULT: HALF RIGHT.
+#   chest Delta_SSIM  +0.2737 -> +0.2821   (gap to target roughly halved)
+#   chest Delta_VIF   +0.0634 -> +0.0647   (noise)
+#   abdomen Delta_VIF +0.0581 -> +0.0583   (noise)
+#
+# MS-SSIM is a real improvement for SSIM and stays on by default. The
+# multi-scale explanation of the VIF deficit is FALSIFIED. See the MODEL
+# ARCHITECTURE section for where the investigation went next.
 # ---------------------------------------------------------------------------
 
 # Replace the single-scale SSIM term with multi-scale SSIM (5 levels).
@@ -342,7 +427,7 @@ MS_SSIM_KERNEL_SIZE = 11
 # outside - bone, external air, the scanner table - consumes gradient that no
 # metric ever reads. This term re-spends that capacity where it is scored.
 #
-#   "off"   : previous behaviour, loss on [0, 1] only.
+#   "off"   : loss on [0, 1] only.
 #   "extra" : DEFAULT. Keeps the global term AND adds a windowed one weighted by
 #             LAMBDA_WINDOW. Safer, because the global term still supplies a
 #             gradient to pixels outside the window (the windowed term clamps
@@ -351,7 +436,12 @@ MS_SSIM_KERNEL_SIZE = 11
 #             out-of-window pixels any more; expect bone and air to drift.
 #
 # The window is selected per SAMPLE from the batch's body_type, so a mixed
-# chest/abdomen batch is handled correctly.
+# chest/abdomen batch is handled correctly. NOTE: run_ablation.py does not pass
+# body_type to the loss, so this term is silently disabled there (with a
+# warning) - use train.py for window-loss experiments.
+#
+# Measured effect so far: none separable from MS-SSIM. Left on because it is
+# principled and costs ~5%, but do not credit it with any result yet.
 WINDOW_LOSS_MODE = os.environ.get("WINDOW_LOSS_MODE", "extra").strip().lower()
 VALID_WINDOW_LOSS_MODES = ("off", "extra", "only")
 if WINDOW_LOSS_MODE not in VALID_WINDOW_LOSS_MODES:
