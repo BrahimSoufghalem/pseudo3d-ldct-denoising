@@ -36,6 +36,17 @@ def _env_int(name, default):
         raise ValueError(f"{name} must be an integer, got '{raw}'") from None
 
 
+def _env_float(name, default):
+    """Read a float from the environment, falling back to `default`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a float, got '{raw}'") from None
+
+
 def _env_blocks(name, default):
     """Read a per-stage block count tuple, e.g. ENC_BLOCKS=2,2,4,8.
 
@@ -203,20 +214,16 @@ USE_GRAD_CHECKPOINT = False
 SPATIAL_SIZE = (256, 256)
 CACHE_DATA = True
 
-# HU windowing preset. THE DEFAULT HAS ALWAYS BEEN 'legacy' AND STILL IS.
-# Nothing about the training pipeline changed when 'benchmark' was added; it is
-# a pure opt-in.
+# HU windowing preset. The file default is 'legacy'; 'benchmark' is opt-in via
+# the environment and is what publication-facing runs should use.
 #
-#   "legacy"    : [-1000, 600] HU. THE DEFAULT, and the preset every strong
-#                 result so far was produced with. Bone above 600 HU is clipped,
-#                 which is a real limitation for bone-detail claims, but it
-#                 keeps soft tissue spread across most of [0, 1].
+#   "legacy"    : [-1000, 600] HU. Bone above 600 HU is clipped, which is a real
+#                 limitation for bone-detail claims, but it keeps soft tissue
+#                 spread across most of [0, 1].
 #
 #   "benchmark" : [-1024, 1900] HU. Reproduces the ldct-benchmark convention
 #                 EXACTLY: A_MAX + HU_OFFSET = 2924, which is the DATA_RANGE
-#                 constant in ldctbench/evaluate/utils.py. VERIFIED STABLE on a
-#                 15-epoch probe (no spikes, no collapse). Use this for any
-#                 number you intend to publish next to the reference table.
+#                 constant in ldctbench/evaluate/utils.py. Verified stable.
 #
 #   "wide"      : [-1024, 3072] HU. Historical. It diverges, AND it never
 #                 matched the reference either (4096 != 2924). Kept only so old
@@ -232,6 +239,10 @@ CACHE_DATA = True
 # disagree on the baseline they were produced under different conventions and
 # their denoised columns cannot be compared. Checkpoints record their preset in
 # meta["hu_preset"] - check it before trusting a comparison.
+#
+# Reference baseline rows under 'benchmark', for exactly this purpose:
+#   Chest    LDCT input: PSNR 18.09 | SSIM 0.3119 | RMSE 235.52 | VIF 0.0993
+#   Abdomen  LDCT input: PSNR 29.01 | SSIM 0.8527 | RMSE  18.37 | VIF 0.3882
 #
 # WHAT THE PRESET DOES *NOT* EXPLAIN (tested twice, do not re-run)
 # -----------------------------------------------------------------
@@ -250,8 +261,7 @@ CACHE_DATA = True
 # real difference inside the diagnostic window is about 24 HU.
 #
 # Conclusion: 'benchmark' is the honest convention to publish under, and it is
-# numerically inert. Switching it will not close any gap. Do not spend GPU hours
-# there again.
+# numerically inert. Switching it will not close any gap.
 #
 # Measured A/B for the legacy-vs-wide instability, identical code and seed,
 # mamba-mode=basic, lr=1e-4:
@@ -265,8 +275,6 @@ CACHE_DATA = True
 # (C2 = 0.03^2), so the SSIM gradient becomes ill-conditioned and scales like
 # 1/sigma^2. The per-spike diagnostic confirmed head.weight (the final conv,
 # adjacent to the loss) dominated every spike - no SSM tensor was involved.
-#
-# Overridable from the environment so a probe needs no file edit.
 HU_RANGE_PRESET = os.environ.get("HU_RANGE_PRESET", "legacy").strip().lower()
 
 if HU_RANGE_PRESET == "wide":
@@ -323,34 +331,23 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 #
 #   MODEL_WIDTH=48 ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2 python train.py ...
 #
-# Cost scales roughly with width^2 for the convolutions and linearly with the
-# block counts. Reference point: mamba_mode=basic, width 32, (1,1,1,1)/(1,1,1,1)
-# is 5,136,613 parameters and about 175 s/epoch in FP32 at 256x256.
+# The SAME variables must be set when running evaluate.py, because the model is
+# constructed from this file before the checkpoint is loaded.
 #
-# WHY CAPACITY IS THE CURRENT LEVER
-# ----------------------------------
-# Two objective changes were measured first and neither moved VIF:
+# CAPACITY WAS TESTED AND IS NOT THE CONSTRAINT
+# ----------------------------------------------
+# 2d / basic, 20 epochs, FP32, benchmark preset, everything else identical:
 #
-#     lever                  chest dSSIM   chest dVIF
-#     multi-scale SSIM         +0.0084       +0.0013
-#     window-aligned loss      no separable effect
+#   config                     params    chest VIF  chest dVIF  abd dVIF  dPSNR
+#   width 32, (1,1,1,1)         5.14 M    0.1627      +0.0634    +0.0581   +6.58
+#   width 32, enc (2,2,4,8)     9.43 M    0.1667      +0.0674    +0.0639   +6.78
+#   width 48, (1,1,1,1)        11.37 M    0.1666      +0.0673    +0.0637   +6.84
 #
-# Both are now OFF by default (see the LOSS WEIGHTS section). There is a clean
-# argument for why no loss tweak will fix VIF: RED-CNN in the reference table is
-# trained with plain MSE, the most smoothing objective available, and still
-# reaches VIF 0.221 at PSNR 28.36. If a naive MSE model beats us on VIF, the
-# loss is not the binding constraint.
-#
-# Capacity, meanwhile, has never been varied even once. Every number in this
-# project comes from a single 5.1 M-parameter configuration with ONE NAF block
-# per stage, which is small for this task. Suggested ladder, cheapest first:
-#
-#     ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2          depth first, width kept at 32
-#     MODEL_WIDTH=48                                  width only
-#     MODEL_WIDTH=48 ENC_BLOCKS=2,2,4,8 DEC_BLOCKS=2,2,2,2
-#
-# Change ONE axis at a time. A checkpoint is only loadable by a run with the
-# same capacity settings, so give each configuration its own --output-root.
+# 5.1 M -> 9.4 M bought +0.0040 chest VIF. 9.4 M -> 11.4 M bought -0.0001, i.e.
+# nothing. Two different scaling axes landed on the same value to four decimal
+# places, which is a saturation curve rather than a capacity shortage. The
+# pre-registered success threshold was +0.02 and it was missed by a factor of
+# five. Do not spend more GPU time on width or depth without a new reason.
 MODEL_WIDTH = _env_int("MODEL_WIDTH", 32)              # stages are w,2w,4w,8w,16w
 ENC_BLOCKS = _env_blocks("ENC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per encoder stage
 DEC_BLOCKS = _env_blocks("DEC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per decoder stage
@@ -371,27 +368,26 @@ SIZE_DIVISOR = 16
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
-# The active objective is the one that produced the best result to date
-# (runs_fp32: PSNR 29.06, SSIM 0.7152, dPSNR +7.17):
+# The active objective, unchanged since the first working run:
 #
 #     1.0 * Charbonnier  +  0.6 * SSIM (single scale)  +  0.2 * Sobel edge
 #
-LAMBDA_L1 = 1.0                        # Charbonnier weight (historical name)
-LAMBDA_SSIM = 0.6
-LAMBDA_EDGE = 0.2
+# Env-overridable so terms can be removed without editing this file. Defaults
+# are the values every existing result was produced with.
+#
+#   LAMBDA_SSIM=0 LAMBDA_EDGE=0 python train.py ...    # pure Charbonnier
+#   LAMBDA_SSIM=0.2 python train.py ...                # weight sweep
+LAMBDA_L1 = _env_float("LAMBDA_L1", 1.0)      # Charbonnier weight (historical name)
+LAMBDA_SSIM = _env_float("LAMBDA_SSIM", 0.6)
+LAMBDA_EDGE = _env_float("LAMBDA_EDGE", 0.2)
 
 # ---------------------------------------------------------------------------
-# TWO OBJECTIVE EXPERIMENTS THAT WERE RUN AND ROLLED BACK
+# WHY REMOVING TERMS IS NOW THE EXPERIMENT WORTH RUNNING
 # ---------------------------------------------------------------------------
-# Keep this record. Both switches below default to OFF, so the loss behaves
-# exactly as it did before they existed. The implementations stay in losses.py
-# because they are tested and safe, and because a falsified hypothesis is worth
-# more written down than deleted.
-#
-# The motivation. evaluate.py reports the metrics of the raw LDCT input as well
-# as of the prediction, which lets us score the model on the FRACTION OF THE
-# REQUIRED GAIN it achieves instead of on absolute numbers. On the 10 test
-# patients (2d / basic, 20 epochs, 512x512), against the published targets:
+# evaluate.py reports the metrics of the raw LDCT input as well as of the
+# prediction, which scores the model on the FRACTION OF THE REQUIRED GAIN it
+# achieves rather than on absolute numbers. On the 10 test patients, against the
+# published targets (5.14 M baseline model):
 #
 #   metric        baseline   ours     target    needed    got      share
 #   PSNR chest     18.09     27.21    28.36     +10.27    +9.12     89%
@@ -401,35 +397,51 @@ LAMBDA_EDGE = 0.2
 #   VIF  chest      0.0993    0.1627   0.221     +0.1217  +0.0634   52%
 #   VIF  abdomen    0.3882    0.4463   0.491     +0.1028  +0.0581   57%
 #
-# Delta_VIF is POSITIVE everywhere (+0.048 to +0.068 on all ten patients), so
-# the model adds visual information rather than destroying it. The "unbeatable
-# posterior-mean ceiling" argument is dead, and with it the case for going
-# adversarial.
+# Delta_VIF is POSITIVE everywhere, so the model adds visual information rather
+# than destroying it, and the "posterior-mean ceiling" argument is dead. But the
+# shortfall is SPECIFIC to VIF, and two attempts to close it have now failed:
 #
-# The shortfall was SPECIFIC to VIF, which suggested the missing ingredient was
-# information spread over MULTIPLE SCALES - VIF sums information across
-# sub-bands, while the SSIM term uses a single 11x11 window.
+#   attempt                      chest dSSIM      chest dVIF
+#   multi-scale SSIM             +0.0084          +0.0013   (noise)
+#   window-aligned loss          no separable effect
+#   depth 5.1 M -> 9.4 M         +0.0037          +0.0040
+#   width 5.1 M -> 11.4 M        +0.0026          +0.0039
 #
-# RESULT: hypothesis FALSIFIED.
-#   chest Delta_SSIM  +0.2737 -> +0.2821   (real, but small)
-#   chest Delta_VIF   +0.0634 -> +0.0647   (noise)
-#   abdomen Delta_VIF +0.0581 -> +0.0583   (noise)
+# Adding to the objective did not work. Adding parameters did not work. The one
+# direction never tried is SUBTRACTION.
 #
-# MS-SSIM is a genuine if modest SSIM improvement and can be re-enabled once
-# only one variable is moving at a time. It is off for now so the capacity sweep
-# is measured against the known-good baseline objective.
+# The argument: RED-CNN in the reference table reaches VIF 0.221 trained on
+# nothing but MSE - the most smoothing objective available. If a plain MSE model
+# beats a hybrid-loss model on VIF, the extra terms are not merely useless, they
+# are suspects. SSIM is a LOCAL CONTRAST criterion: it is well satisfied by
+# output that is locally smooth with the right local mean and variance, which is
+# close to the opposite of what VIF rewards. At lambda 0.6 against Charbonnier's
+# 1.0 it is not a minor regulariser.
+#
+# Run order, cheapest first, one variable at a time, always at width 32 with
+# (1,1,1,1) so it is comparable to the 5.14 M row above:
+#
+#   LAMBDA_SSIM=0 LAMBDA_EDGE=0    pure Charbonnier - the direct RED-CNN analogue
+#   LAMBDA_SSIM=0.2                is the effect monotone in the SSIM weight?
+#   LAMBDA_EDGE=0                  isolate the Sobel term
+#
+# If pure Charbonnier raises chest VIF while costing SSIM, the trade-off is real
+# and the weights become a tunable axis. If it changes nothing, the objective is
+# fully exonerated and the remaining suspects are the output head and the input
+# representation.
 # ---------------------------------------------------------------------------
 
 # Multi-scale SSIM (5 levels) in place of the single-scale term.
-# OFF by default - see the record above. Enable with USE_MS_SSIM=1, or disable
-# per-run with train.py's --no-ms-ssim.
+# OFF by default: measured at +0.0084 chest Delta_SSIM and +0.0013 chest
+# Delta_VIF, i.e. it did not do what it was built to do. Enable with
+# USE_MS_SSIM=1, or disable per-run with train.py's --no-ms-ssim.
 # Falls back to single-scale automatically if torchmetrics is unavailable or the
 # crop is too small for 5 levels. Costs about 5% more time per step.
 USE_MS_SSIM = _env_flag("USE_MS_SSIM", False)
 MS_SSIM_BETAS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)   # Wang et al. 2003
 MS_SSIM_KERNEL_SIZE = 11
 
-# Window-aligned loss. OFF by default - see the record above.
+# Window-aligned loss. OFF by default - no separable effect was measured.
 #
 # The idea: the loss runs on the full normalized [0, 1] range, but PSNR and SSIM
 # are only ever measured inside a clinical window (lung 1500 HU, soft tissue
@@ -454,7 +466,7 @@ if WINDOW_LOSS_MODE not in VALID_WINDOW_LOSS_MODES:
         f"WINDOW_LOSS_MODE must be one of {VALID_WINDOW_LOSS_MODES}, got '{WINDOW_LOSS_MODE}'"
     )
 
-LAMBDA_WINDOW = float(os.environ.get("LAMBDA_WINDOW", "0.5"))
+LAMBDA_WINDOW = _env_float("LAMBDA_WINDOW", 0.5)
 
 
 # ═══════════════════════════════════════════
