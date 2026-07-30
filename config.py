@@ -16,6 +16,15 @@ so ablation runs never overwrite each other.
 
 import os
 
+
+def _env_flag(name, default):
+    """Read a boolean switch from the environment."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 # ═══════════════════════════════════════════
 # PATHS
 # ═══════════════════════════════════════════
@@ -160,45 +169,40 @@ CACHE_DATA = True
 # HU windowing preset. Read this whole block before changing it: the preset
 # decides both what the network can represent AND what the metrics mean.
 #
-#   "legacy"    : [-1000, 600] HU. THE DEFAULT, and the only preset verified to
-#                 train stably end to end. Bone above 600 HU is clipped, which
-#                 is a real limitation for bone-detail claims, but it keeps soft
-#                 tissue spread across most of [0, 1].
+#   "legacy"    : [-1000, 600] HU. THE DEFAULT, and the preset every strong
+#                 result so far was produced with. Bone above 600 HU is clipped,
+#                 which is a real limitation for bone-detail claims, but it
+#                 keeps soft tissue spread across most of [0, 1].
 #
 #   "benchmark" : [-1024, 1900] HU. Reproduces the ldct-benchmark convention
 #                 EXACTLY: A_MAX + HU_OFFSET = 2924, which is the DATA_RANGE
-#                 constant in ldctbench/evaluate/utils.py (max bone HU 1900 plus
-#                 the 1024 offset). Use this for any number you intend to
-#                 compare against the published table. NOT yet verified stable.
+#                 constant in ldctbench/evaluate/utils.py. VERIFIED STABLE on a
+#                 15-epoch probe (no spikes, no collapse). Use this for any
+#                 number you intend to publish next to the reference table.
 #
 #   "wide"      : [-1024, 3072] HU. Historical. It diverges, AND it never
 #                 matched the reference either (4096 != 2924). Kept only so old
 #                 run directories remain interpretable.
 #
-# Why "benchmark" matters, verified by reading eeulig/ldct-benchmark @ 09b1011:
+# WHAT THE PRESET DOES *NOT* EXPLAIN (tested, do not re-run)
+# ----------------------------------------------------------
+# An earlier version of this comment claimed the chest and VIF gaps against the
+# published table were "substantially a measurement-convention artefact". That
+# was wrong, and it was falsified by the obvious experiment: the SAME checkpoint
+# evaluated under 'legacy' and under 'benchmark' produced no meaningful
+# difference in any column.
 #
-#   Our metric code is already identical to the reference - apply_center_width
-#   line for line, the same two clinical windows, PSNR and SSIM on windowed
-#   images with data_range 1.0, VIF via torchmetrics with sigma_n_sq=2.0 on
-#   UNWINDOWED images clipped to [0, DATA_RANGE], RMSE likewise, all per slice.
-#   The one and only mismatch is that clip bound. And because the data pipeline
-#   clips HU at A_MAX before the model ever sees a voxel, the consequence is not
-#   cosmetic:
+# The real mechanism runs the other way. Clipping at 600 HU makes every bone
+# voxel IDENTICAL in the prediction and the target, so those pixels contribute
+# perfect agreement to the unwindowed VIF and RMSE. 'legacy' numbers are
+# therefore slightly OPTIMISTIC, not understated. And the lung window's upper
+# bound is only +150 HU while its nominal lower bound (-1350 HU) sits below the
+# physical CT floor of -1024 that the reference cannot exceed either, so the
+# real difference inside the diagnostic window is about 24 HU.
 #
-#     Abdomen PSNR/SSIM  COMPARABLE. The soft-tissue window spans [-150, 250] HU,
-#                        entirely inside [-1000, 600]. Empirically confirmed:
-#                        0.9043 SSIM here vs 0.9028 +- 0.0007 published, after
-#                        only two epochs.
-#     Chest PSNR/SSIM    NOT comparable. The lung window spans [-1350, 150] HU.
-#                        Clipping at -1000 flattens 350 HU inside the diagnostic
-#                        window itself, which caps chest scores by construction.
-#     VIF, RMSE          NOT comparable. Both are computed unwindowed over the
-#                        full [0, DATA_RANGE], so they see the whole HU span,
-#                        including the bone we discard.
-#
-#   So the "gap" against the published chest and VIF columns is substantially a
-#   measurement-convention artefact, not a model deficit. Fix the convention
-#   before spending GPU hours chasing it.
+# Conclusion: 'benchmark' is the honest convention to publish under, and it is
+# numerically inert. Switching it will not close any gap. Do not spend GPU hours
+# there again.
 #
 # Measured A/B for the legacy-vs-wide instability, identical code and seed,
 # mamba-mode=basic, lr=1e-4:
@@ -212,21 +216,6 @@ CACHE_DATA = True
 # (C2 = 0.03^2), so the SSIM gradient becomes ill-conditioned and scales like
 # 1/sigma^2. The per-spike diagnostic confirmed head.weight (the final conv,
 # adjacent to the loss) dominated every spike - no SSM tensor was involved.
-#
-# "benchmark" spans 2924 HU, i.e. 1.83x legacy, against 2.56x for "wide". It is
-# therefore a milder version of the same risk, and the two other regressions
-# that were confounded with the original divergence (NAFBlock beta/gamma = 0 and
-# bf16 AMP) are both fixed now. That makes it worth retesting, not safe to
-# assume. Probe it on the cheap configuration first and watch epochs 2-4:
-#
-#   HU_RANGE_PRESET=benchmark python train.py --input-mode 2d --mamba-mode basic \
-#     --lr 2e-4 --epochs 15 --output-root probe_benchmark
-#
-# Accept the preset only if epoch 2 dPSNR > +3, epoch 3 does not regress, and
-# spikes stay at 0/1113. Also watch abdomen PSNR specifically: a wider span
-# gives soft tissue a narrower slice of [0, 1] and hence a smaller Charbonnier
-# gradient, so if abdomen PSNR drops below the legacy 32.58 dB this is a
-# trade-off rather than an upgrade.
 #
 # Overridable from the environment so a probe needs no file edit.
 HU_RANGE_PRESET = os.environ.get("HU_RANGE_PRESET", "legacy").strip().lower()
@@ -300,9 +289,77 @@ SIZE_DIVISOR = 16
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
-LAMBDA_L1 = 1.0
+LAMBDA_L1 = 1.0                        # Charbonnier weight (historical name)
 LAMBDA_SSIM = 0.6
 LAMBDA_EDGE = 0.2
+
+# ---------------------------------------------------------------------------
+# WHY THE NEXT TWO SWITCHES EXIST
+# ---------------------------------------------------------------------------
+# evaluate.py now reports the metrics of the raw LDCT input as well as of the
+# prediction, which lets us score the model on the FRACTION OF THE REQUIRED GAIN
+# it actually achieves instead of on absolute numbers. Measured on the 10 test
+# patients (2d / basic, 20 epochs, 512x512), against the published targets:
+#
+#   metric        baseline   ours     target    needed    got      share
+#   PSNR chest     18.09     27.21    28.36     +10.27    +9.12     89%
+#   PSNR abdomen   29.01     33.04    33.22      +4.21    +4.03     96%
+#   SSIM chest      0.3119    0.5856   0.609     +0.2971  +0.2737   92%
+#   SSIM abdomen    0.8527    0.9089   0.9028    +0.0501  +0.0563  112%
+#   VIF  chest      0.0993    0.1627   0.221     +0.1217  +0.0634   52%
+#   VIF  abdomen    0.3882    0.4463   0.491     +0.1028  +0.0581   57%
+#
+# Two things follow, and they are the whole justification for this section.
+#
+# 1. Delta_VIF is POSITIVE everywhere (+0.048 to +0.068 on all ten patients).
+#    The model adds visual information, it does not destroy it. The "the loss
+#    family has an unbeatable posterior-mean ceiling" argument is therefore
+#    dead, and so is the case for going adversarial right now.
+#
+# 2. The shortfall is SPECIFIC to VIF: 89-112% of the required gain on PSNR and
+#    SSIM, but only 52-57% on VIF. A generic capacity shortage would drag all
+#    three down proportionally. Something is missing that VIF measures and the
+#    other two do not - and that is information spread over MULTIPLE SCALES.
+#    VIF decomposes the image into sub-bands and sums the information preserved
+#    in each. Our SSIM term uses a single 11x11 window, i.e. one scale.
+#    We train on one scale and get scored on several.
+# ---------------------------------------------------------------------------
+
+# Replace the single-scale SSIM term with multi-scale SSIM (5 levels).
+# Falls back to single-scale automatically if torchmetrics is unavailable or the
+# crop is too small for 5 levels. Costs about 5% more time per step.
+# Requires min(H, W) > (kernel_size - 1) * 2**(levels - 1) = 160 for 5 levels,
+# which SPATIAL_SIZE (256, 256) satisfies.
+USE_MS_SSIM = _env_flag("USE_MS_SSIM", True)
+MS_SSIM_BETAS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)   # Wang et al. 2003
+MS_SSIM_KERNEL_SIZE = 11
+
+# Window-aligned loss.
+#
+# The loss runs on the full normalized [0, 1] range, but PSNR and SSIM are only
+# ever measured inside a clinical window: lung is 1500 HU wide, soft tissue only
+# 400 HU wide, out of a 1624 HU (legacy) or 2924 HU (benchmark) span. Everything
+# outside - bone, external air, the scanner table - consumes gradient that no
+# metric ever reads. This term re-spends that capacity where it is scored.
+#
+#   "off"   : previous behaviour, loss on [0, 1] only.
+#   "extra" : DEFAULT. Keeps the global term AND adds a windowed one weighted by
+#             LAMBDA_WINDOW. Safer, because the global term still supplies a
+#             gradient to pixels outside the window (the windowed term clamps
+#             them, so their gradient there is exactly zero).
+#   "only"  : windowed term alone. Strongest effect, but nothing constrains the
+#             out-of-window pixels any more; expect bone and air to drift.
+#
+# The window is selected per SAMPLE from the batch's body_type, so a mixed
+# chest/abdomen batch is handled correctly.
+WINDOW_LOSS_MODE = os.environ.get("WINDOW_LOSS_MODE", "extra").strip().lower()
+VALID_WINDOW_LOSS_MODES = ("off", "extra", "only")
+if WINDOW_LOSS_MODE not in VALID_WINDOW_LOSS_MODES:
+    raise ValueError(
+        f"WINDOW_LOSS_MODE must be one of {VALID_WINDOW_LOSS_MODES}, got '{WINDOW_LOSS_MODE}'"
+    )
+
+LAMBDA_WINDOW = float(os.environ.get("LAMBDA_WINDOW", "0.5"))
 
 
 # ═══════════════════════════════════════════
