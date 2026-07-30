@@ -9,8 +9,8 @@ own run directory (runs/<input>_<mamba>/):
     python train.py --input-mode 2.5d --mamba-mode full
     python train.py --input-mode 2d   --mamba-mode basic
 
-Mixed precision is enabled by default on CUDA (bfloat16 when supported,
-otherwise float16 + GradScaler). Use --no-amp for pure FP32.
+Mixed precision is DISABLED by default: bfloat16 was measured to cap this model
+at about dPSNR +3.7 and to collapse around epoch 4 (see USE_AMP in config.py).
 
 Stability notes
 ---------------
@@ -23,6 +23,14 @@ Stability notes
    dropped 498/1113 steps in epoch 3 and the model collapsed anyway through the
    steps that stayed under the threshold. If you are seeing many spikes, the
    real cause is upstream - see the HU_RANGE_PRESET notes in config.py.
+
+Objective notes
+---------------
+The loss can now be multi-scale (--no-ms-ssim to disable) and can be evaluated a
+second time inside the clinical diagnostic window (--window-loss). Both are
+motivated by the baseline-relative measurement documented in config.py: the
+model reaches 89-112% of the required PSNR/SSIM gain but only 52-57% of the
+required VIF gain.
 """
 
 import argparse
@@ -39,6 +47,7 @@ from config import (
     TOTAL_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
     PATIENCE, GRAD_CLIP_MAX_NORM, WARMUP_EPOCHS,
     LAMBDA_L1, LAMBDA_SSIM, LAMBDA_EDGE,
+    USE_MS_SSIM, WINDOW_LOSS_MODE, LAMBDA_WINDOW, VALID_WINDOW_LOSS_MODES,
     SCHEDULER_MIN_LR,
     A_MIN, A_MAX,
 )
@@ -80,6 +89,16 @@ def parse_args():
     p.add_argument("--grad-checkpoint", action="store_true",
                    help="recompute the Mamba bottleneck in backward to save VRAM")
     p.add_argument("--output-root", default=cfg.OUTPUT_ROOT)
+
+    # ---- objective ----------------------------------------------------
+    p.add_argument("--no-ms-ssim", action="store_true",
+                   help="use single-scale SSIM instead of multi-scale SSIM")
+    p.add_argument("--window-loss", default=WINDOW_LOSS_MODE,
+                   choices=list(VALID_WINDOW_LOSS_MODES),
+                   help="evaluate the loss inside the clinical window too "
+                        "('extra'), only there ('only'), or not at all ('off')")
+    p.add_argument("--lambda-window", type=float, default=LAMBDA_WINDOW,
+                   help="weight of the windowed term when --window-loss=extra")
     return p.parse_args()
 
 
@@ -123,6 +142,22 @@ def top_grad_params(model, k=5):
     return scored[:k]
 
 
+def body_types_of(batch, batch_size):
+    """Extract 'Chest'/'Abdomen' per sample from a batch, or None if absent.
+
+    The windowed loss term needs this to pick the lung window (1500 HU) or the
+    soft tissue window (400 HU) for each slice. Returning None rather than a
+    guess is deliberate: the loss then skips the windowed term and warns, which
+    is far better than applying the wrong window to half the batch.
+    """
+    raw = batch.get("body_type", None) if hasattr(batch, "get") else None
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw] * batch_size
+    return [str(raw[i] if i < len(raw) else raw[-1]) for i in range(batch_size)]
+
+
 # ═══════════════════════════════════════════
 # TRAIN ONE EPOCH
 # ═══════════════════════════════════════════
@@ -153,6 +188,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
         mid_slice = extract_centre_slice(images)
+        body_types = body_types_of(batch, images.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -162,7 +198,7 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             # a restoring gradient. MONAIHybridLoss clamps only its SSIM term,
             # which is undefined outside [0, 1] - see losses.py.
             pred_img = mid_slice + pred_res
-            loss, loss_info = loss_fn(pred_img.float(), labels.float())
+            loss, loss_info = loss_fn(pred_img.float(), labels.float(), body_types)
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -203,13 +239,16 @@ def train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch, tota
             scaler.update()
 
         train_loss += loss.item()
-        train_bar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            L1=f"{loss_info['L1']:.4f}",
-            SSIM=f"{loss_info['SSIM']:.4f}",
-            gn=f"{gnorm_val:.1f}",
-            sp=spikes,
-        )
+        postfix = {
+            "loss": f"{loss.item():.4f}",
+            "L1": f"{loss_info['L1']:.4f}",
+            "SSIM": f"{loss_info['SSIM']:.4f}",
+            "gn": f"{gnorm_val:.1f}",
+            "sp": spikes,
+        }
+        if "Window" in loss_info:
+            postfix["win"] = f"{loss_info['Window']:.4f}"
+        train_bar.set_postfix(**postfix)
 
     n_steps = max(1, len(train_loader))
     return {
@@ -252,16 +291,16 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs,
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
         mid_slice = extract_centre_slice(images)
+        body_types = body_types_of(batch, images.shape[0])
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             pred_res = model(images)
 
         pred_img = (mid_slice + pred_res).float()
-        loss, _ = loss_fn(pred_img, labels.float())          # unclamped, like training
-        preds = pred_img.clamp(0.0, 1.0)                     # clamped, for metrics/viz
+        loss, _ = loss_fn(pred_img, labels.float(), body_types)   # unclamped, like training
+        preds = pred_img.clamp(0.0, 1.0)                          # clamped, for metrics/viz
 
         val_loss += loss.item()
-        body_types = batch.get("body_type", None)
 
         for b_idx in range(preds.shape[0]):
             pred_hu = denormalize_to_hu_offset(preds[b_idx:b_idx + 1], A_MIN, A_MAX).squeeze()
@@ -270,8 +309,7 @@ def validate_one_epoch(model, val_loader, loss_fn, device, epoch, total_epochs,
 
             bt = "Abdomen"
             if body_types is not None:
-                bt_raw = body_types[b_idx] if isinstance(body_types, (list, tuple)) else body_types
-                bt = "Chest" if str(bt_raw).lower().startswith("c") else "Abdomen"
+                bt = "Chest" if body_types[b_idx].strip().lower().startswith("c") else "Abdomen"
 
             p_val = compute_psnr_windowed(pred_hu, lbl_hu, bt)
             b_val = compute_psnr_windowed(mid_hu, lbl_hu, bt)
@@ -434,7 +472,11 @@ def main():
         lambda_ssim=LAMBDA_SSIM,
         lambda_edge=LAMBDA_EDGE,
         spatial_dims=2,
+        use_ms_ssim=USE_MS_SSIM and not args.no_ms_ssim,
+        window_mode=args.window_loss,
+        lambda_window=args.lambda_window,
     ).to(device)
+    print(f"Loss: {loss_fn.describe()}")
 
     optimizer = torch.optim.AdamW(build_param_groups(model, WEIGHT_DECAY), lr=args.lr)
 
@@ -461,7 +503,8 @@ def main():
     )
 
     meta = {"input_mode": input_mode, "mamba_mode": mamba_mode,
-            "hu_range": [A_MIN, A_MAX], "hu_preset": cfg.HU_RANGE_PRESET}
+            "hu_range": [A_MIN, A_MAX], "hu_preset": cfg.HU_RANGE_PRESET,
+            "loss": loss_fn.describe()}
 
     spike_report_budget = [8]      # shared across epochs: report the first few only
     training_start = time.time()
