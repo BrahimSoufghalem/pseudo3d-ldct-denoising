@@ -7,12 +7,22 @@ Components:
   1. Activation-free restoration encoder/decoder (NAF blocks, Megvii NAFNet).
   2. Anatomy-guided attention skip gates driven by bottleneck/decoder context.
   3. 2D cross-scan selective state-space (SS2D) Mamba bottleneck.
-  4. Two orthogonal ablation axes:
+  4. Three orthogonal ablation axes:
        INPUT_MODE : "2d" | "2.5d"
        MAMBA_MODE : "basic" | "residual" | "multiscale" | "full"
+       NUM_STAGES : depth of the resolution pyramid (downsampling = 2**NUM_STAGES)
 
 The network predicts a RESIDUAL. The centre low-dose slice is added back
 outside the model (see train.py / evaluate.py).
+
+A note on NUM_STAGES
+--------------------
+The encoder/decoder used to be written out four times by hand, which made the
+downsampling depth impossible to vary. It is now built in a loop. At the
+default NUM_STAGES=4 the result is IDENTICAL to the hand-written version -
+same channel widths, same construction order, and the submodules are registered
+under the same attribute names (enc1..enc4, down1..down4, ag1..ag4, up1..up4,
+dec1..dec4) - so every existing checkpoint still loads.
 """
 
 import torch
@@ -51,6 +61,7 @@ class MSNAFMambaNet(nn.Module):
         mamba_mode=None,
         input_mode=None,
         width=cfg.MODEL_WIDTH,
+        num_stages=cfg.NUM_STAGES,
         enc_blocks=cfg.ENC_BLOCKS,
         dec_blocks=cfg.DEC_BLOCKS,
         d_state=cfg.D_STATE,
@@ -58,7 +69,7 @@ class MSNAFMambaNet(nn.Module):
         scan_backend=cfg.SCAN_BACKEND,
         scan_chunk_size=cfg.SCAN_CHUNK_SIZE,
         use_checkpoint=cfg.USE_GRAD_CHECKPOINT,
-        size_divisor=cfg.SIZE_DIVISOR,
+        size_divisor=None,
         verbose=True,
     ):
         super().__init__()
@@ -67,10 +78,26 @@ class MSNAFMambaNet(nn.Module):
         self.in_channels = in_channels or cfg.in_channels_for(self.input_mode)
         self.centre_index = self.in_channels // 2
         self.use_checkpoint = use_checkpoint
-        self.size_divisor = size_divisor
+
+        n = int(num_stages)
+        if n < 1:
+            raise ValueError(f"num_stages must be >= 1, got {n}")
+        if len(enc_blocks) != n or len(dec_blocks) != n:
+            raise ValueError(
+                f"enc_blocks/dec_blocks must have exactly num_stages={n} entries, "
+                f"got {len(enc_blocks)} and {len(dec_blocks)}"
+            )
+        self.num_stages = n
+
+        # The network downsamples 2**n times, so inputs must be padded up to a
+        # multiple of that. Derived unless explicitly overridden.
+        self.size_divisor = size_divisor if size_divisor is not None else 2 ** n
 
         w = width
-        c1, c2, c3, c4, c5 = w, 2 * w, 4 * w, 8 * w, 16 * w
+        # chans[i] is the channel count at pyramid level i.
+        # For n=4 this is exactly the old c1..c5 = w, 2w, 4w, 8w, 16w.
+        chans = [w * (2 ** i) for i in range(n + 1)]
+        self.chans = chans
 
         scan_kwargs = dict(
             d_state=d_state,
@@ -80,52 +107,61 @@ class MSNAFMambaNet(nn.Module):
         )
 
         # ---- Stem (2D vs pseudo-3D z-axis modelling) --------------------
-        self.stem = build_stem(self.in_channels, c1, self.input_mode)
+        self.stem = build_stem(self.in_channels, chans[0], self.input_mode)
 
         # ---- Encoder ----------------------------------------------------
-        self.enc1 = make_naf_stage(c1, enc_blocks[0])
-        self.down1 = nn.Conv2d(c1, c2, kernel_size=2, stride=2)
-        self.enc2 = make_naf_stage(c2, enc_blocks[1])
-        self.down2 = nn.Conv2d(c2, c3, kernel_size=2, stride=2)
-        self.enc3 = make_naf_stage(c3, enc_blocks[2])
-        self.down3 = nn.Conv2d(c3, c4, kernel_size=2, stride=2)
-        self.enc4 = make_naf_stage(c4, enc_blocks[3])
-        self.down4 = nn.Conv2d(c4, c5, kernel_size=2, stride=2)
+        # Registered as enc1..encN / down1..downN to keep old state_dict keys.
+        for s in range(1, n + 1):
+            setattr(self, f"enc{s}", make_naf_stage(chans[s - 1], enc_blocks[s - 1]))
+            setattr(
+                self,
+                f"down{s}",
+                nn.Conv2d(chans[s - 1], chans[s], kernel_size=2, stride=2),
+            )
 
         # ---- Bottleneck --------------------------------------------------
         if self.mamba_mode in ("residual", "full"):
-            self.bottleneck = ResidualMambaBottleneck(c5, **scan_kwargs)
+            self.bottleneck = ResidualMambaBottleneck(chans[n], **scan_kwargs)
         else:
-            self.bottleneck = SS2DMambaBottleneck(c5, **scan_kwargs)
+            self.bottleneck = SS2DMambaBottleneck(chans[n], **scan_kwargs)
 
-        # ---- Multi-scale fusion (1/16 Mamba <-> 1/8 NAF) -----------------
+        # ---- Multi-scale fusion (deepest Mamba level <-> level below) ----
         self.use_fusion = self.mamba_mode in ("multiscale", "full")
         if self.use_fusion:
-            self.fusion = MultiScaleSpatialFusion(in_c_low=c5, in_c_high=c4, out_c=c4)
+            self.fusion = MultiScaleSpatialFusion(
+                in_c_low=chans[n], in_c_high=chans[n - 1], out_c=chans[n - 1]
+            )
 
         # ---- Attention gates --------------------------------------------
-        # g comes from the bottleneck (ag4) or the decoder path (ag3..ag1),
-        # so each gate sees genuinely deeper context than the skip it gates.
-        self.ag4 = AnatomyAttentionGate2D(F_g=c5, F_l=c4, F_int=c4)
-        self.ag3 = AnatomyAttentionGate2D(F_g=c4, F_l=c3, F_int=c3)
-        self.ag2 = AnatomyAttentionGate2D(F_g=c3, F_l=c2, F_int=c2)
-        self.ag1 = AnatomyAttentionGate2D(F_g=c2, F_l=c1, F_int=c1)
+        # g for the deepest gate comes from the bottleneck; for the others it
+        # comes from the decoder output of the stage below, so every gate sees
+        # genuinely deeper context than the skip it gates. In both cases the
+        # context has chans[s] channels.
+        for s in range(1, n + 1):
+            setattr(
+                self,
+                f"ag{s}",
+                AnatomyAttentionGate2D(
+                    F_g=chans[s], F_l=chans[s - 1], F_int=chans[s - 1]
+                ),
+            )
 
         # ---- Decoder ------------------------------------------------------
-        self.up4 = _up_block(c5)
-        self.dec4 = nn.Sequential(nn.Conv2d(c5, c4, kernel_size=1), make_naf_stage(c4, dec_blocks[0]))
-        self.up3 = _up_block(c4)
-        self.dec3 = nn.Sequential(nn.Conv2d(c4, c3, kernel_size=1), make_naf_stage(c3, dec_blocks[1]))
-        self.up2 = _up_block(c3)
-        self.dec2 = nn.Sequential(nn.Conv2d(c3, c2, kernel_size=1), make_naf_stage(c2, dec_blocks[2]))
-        self.up1 = _up_block(c2)
-        self.dec1 = nn.Sequential(nn.Conv2d(c2, c1, kernel_size=1), make_naf_stage(c1, dec_blocks[3]))
-
-        for up in (self.up4, self.up3, self.up2, self.up1):
-            self._init_icnr(up[0], scale=2)
+        # dec_blocks is ordered DEEPEST FIRST: decN <- dec_blocks[0].
+        for s in range(n, 0, -1):
+            setattr(self, f"up{s}", _up_block(chans[s]))
+            setattr(
+                self,
+                f"dec{s}",
+                nn.Sequential(
+                    nn.Conv2d(chans[s], chans[s - 1], kernel_size=1),
+                    make_naf_stage(chans[s - 1], dec_blocks[n - s]),
+                ),
+            )
+            self._init_icnr(getattr(self, f"up{s}")[0], scale=2)
 
         # ---- Output head (zero-init -> exact identity residual at step 0) --
-        self.head = nn.Conv2d(c1, out_channels, kernel_size=3, padding=1, bias=True)
+        self.head = nn.Conv2d(chans[0], out_channels, kernel_size=3, padding=1, bias=True)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
@@ -133,7 +169,8 @@ class MSNAFMambaNet(nn.Module):
             warn_if_slow_scan()
             print(
                 f"Initializing MS-NAFMambaNet | input={self.input_mode} "
-                f"({self.in_channels}ch) | mamba={self.mamba_mode} | width={w}"
+                f"({self.in_channels}ch) | mamba={self.mamba_mode} | width={w} | "
+                f"stages={n} (downsample {2 ** n}x, bottleneck {chans[n]}ch)"
             )
 
     # ------------------------------------------------------------------
@@ -158,36 +195,29 @@ class MSNAFMambaNet(nn.Module):
 
     # ------------------------------------------------------------------
     def _forward_features(self, x):
-        x_stem = self.stem(x)
+        n = self.num_stages
 
-        e1 = self.enc1(x_stem)
-        d1 = self.down1(e1)
-        e2 = self.enc2(d1)
-        d2 = self.down2(e2)
-        e3 = self.enc3(d2)
-        d3 = self.down3(e3)
-        e4 = self.enc4(d3)
-        d4 = self.down4(e4)
+        x = self.stem(x)
 
-        b_feat = self._run_bottleneck(d4)
+        skips = []
+        for s in range(1, n + 1):
+            e = getattr(self, f"enc{s}")(x)
+            skips.append(e)
+            x = getattr(self, f"down{s}")(e)
 
-        # Stage 4: gate with the global bottleneck context
-        g4 = self.ag4(g=b_feat, x=e4)
-        if self.use_fusion:
-            g4 = self.fusion(feat_low=b_feat, feat_high=g4)
-        dec4_out = self.dec4(torch.cat([self.up4(b_feat), g4], dim=1))
+        b_feat = self._run_bottleneck(x)
 
-        # Stages 3..1: gate with the decoder context of the previous stage
-        g3 = self.ag3(g=dec4_out, x=e3)
-        dec3_out = self.dec3(torch.cat([self.up3(dec4_out), g3], dim=1))
+        # Deepest stage is gated by the global bottleneck context; each stage
+        # below is gated by the decoder output of the stage above it.
+        ctx = b_feat
+        for s in range(n, 0, -1):
+            g = getattr(self, f"ag{s}")(g=ctx, x=skips[s - 1])
+            if s == n and self.use_fusion:
+                g = self.fusion(feat_low=b_feat, feat_high=g)
+            up = getattr(self, f"up{s}")(ctx)
+            ctx = getattr(self, f"dec{s}")(torch.cat([up, g], dim=1))
 
-        g2 = self.ag2(g=dec3_out, x=e2)
-        dec2_out = self.dec2(torch.cat([self.up2(dec3_out), g2], dim=1))
-
-        g1 = self.ag1(g=dec2_out, x=e1)
-        dec1_out = self.dec1(torch.cat([self.up1(dec2_out), g1], dim=1))
-
-        return self.head(dec1_out)
+        return self.head(ctx)
 
     def forward(self, x):
         """Predict the residual to add to the centre low-dose slice."""
@@ -205,7 +235,7 @@ class MSNAFMambaNet(nn.Module):
         return out
 
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
 def build_model(device, mamba_mode=None, input_mode=None, use_checkpoint=None,
                 data_parallel=True, verbose=True):
     """
