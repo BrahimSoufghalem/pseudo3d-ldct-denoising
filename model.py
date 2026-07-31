@@ -5,7 +5,8 @@ Multi-Scale Non-Linear Activation-Free Mamba Network for LDCT denoising.
 
 Components:
   1. Activation-free restoration encoder/decoder (NAF blocks, Megvii NAFNet).
-  2. Anatomy-guided attention skip gates driven by bottleneck/decoder context.
+  2. Direct high-resolution encoder skips (attention gates are bypassed by
+     default after the controlled 90-epoch VIF plateau experiment).
   3. 2D cross-scan selective state-space (SS2D) Mamba bottleneck.
   4. Three orthogonal ablation axes:
        INPUT_MODE : "2d" | "2.5d"
@@ -19,10 +20,19 @@ A note on NUM_STAGES
 --------------------
 The encoder/decoder used to be written out four times by hand, which made the
 downsampling depth impossible to vary. It is now built in a loop. At the
-default NUM_STAGES=4 the result is IDENTICAL to the hand-written version -
-same channel widths, same construction order, and the submodules are registered
-under the same attribute names (enc1..enc4, down1..down4, ag1..ag4, up1..up4,
-dec1..dec4) - so every existing checkpoint still loads.
+default NUM_STAGES=4 the result has the same channel widths, construction order
+and submodule names (enc1..enc4, down1..down4, ag1..ag4, up1..up4, dec1..dec4),
+so every existing checkpoint still loads.
+
+A note on attention gates
+-------------------------
+The anatomy gates produce one spatial multiplier per pixel and apply it to all
+skip-feature channels. That may suppress high-frequency anatomical channels
+together with noise. The standard path therefore bypasses them and sends each
+raw encoder skip directly to its decoder stage. Gate modules remain registered
+but frozen so old checkpoints retain identical state_dict keys; pass
+`use_attention_gates=True` when constructing MSNAFMambaNet explicitly to restore
+the previous gated path.
 """
 
 import torch
@@ -52,7 +62,7 @@ def _up_block(c_in):
 
 
 class MSNAFMambaNet(nn.Module):
-    """Multi-scale NAF-Mamba network with anatomy attention skip gates."""
+    """Multi-scale NAF-Mamba network with direct encoder skips by default."""
 
     def __init__(
         self,
@@ -69,6 +79,7 @@ class MSNAFMambaNet(nn.Module):
         scan_backend=cfg.SCAN_BACKEND,
         scan_chunk_size=cfg.SCAN_CHUNK_SIZE,
         use_checkpoint=cfg.USE_GRAD_CHECKPOINT,
+        use_attention_gates=False,
         size_divisor=None,
         verbose=True,
     ):
@@ -78,6 +89,7 @@ class MSNAFMambaNet(nn.Module):
         self.in_channels = in_channels or cfg.in_channels_for(self.input_mode)
         self.centre_index = self.in_channels // 2
         self.use_checkpoint = use_checkpoint
+        self.use_attention_gates = bool(use_attention_gates)
 
         n = int(num_stages)
         if n < 1:
@@ -132,19 +144,17 @@ class MSNAFMambaNet(nn.Module):
                 in_c_low=chans[n], in_c_high=chans[n - 1], out_c=chans[n - 1]
             )
 
-        # ---- Attention gates --------------------------------------------
-        # g for the deepest gate comes from the bottleneck; for the others it
-        # comes from the decoder output of the stage below, so every gate sees
-        # genuinely deeper context than the skip it gates. In both cases the
-        # context has chans[s] channels.
+        # ---- Attention gates (retained only for checkpoint compatibility) --
+        # The default forward path bypasses these modules. Keeping their names
+        # means every existing checkpoint still loads strictly; freezing them
+        # removes them from the optimizer and trainable-parameter count.
         for s in range(1, n + 1):
-            setattr(
-                self,
-                f"ag{s}",
-                AnatomyAttentionGate2D(
-                    F_g=chans[s], F_l=chans[s - 1], F_int=chans[s - 1]
-                ),
+            gate = AnatomyAttentionGate2D(
+                F_g=chans[s], F_l=chans[s - 1], F_int=chans[s - 1]
             )
+            if not self.use_attention_gates:
+                gate.requires_grad_(False)
+            setattr(self, f"ag{s}", gate)
 
         # ---- Decoder ------------------------------------------------------
         # dec_blocks is ordered DEEPEST FIRST: decN <- dec_blocks[0].
@@ -170,7 +180,8 @@ class MSNAFMambaNet(nn.Module):
             print(
                 f"Initializing MS-NAFMambaNet | input={self.input_mode} "
                 f"({self.in_channels}ch) | mamba={self.mamba_mode} | width={w} | "
-                f"stages={n} (downsample {2 ** n}x, bottleneck {chans[n]}ch)"
+                f"stages={n} (downsample {2 ** n}x, bottleneck {chans[n]}ch) | "
+                f"attention={'on' if self.use_attention_gates else 'off'}"
             )
 
     # ------------------------------------------------------------------
@@ -207,15 +218,17 @@ class MSNAFMambaNet(nn.Module):
 
         b_feat = self._run_bottleneck(x)
 
-        # Deepest stage is gated by the global bottleneck context; each stage
-        # below is gated by the decoder output of the stage above it.
+        # With attention disabled, each decoder receives the raw encoder skip:
+        # no coarse spatial mask is allowed to suppress fine feature channels.
         ctx = b_feat
         for s in range(n, 0, -1):
-            g = getattr(self, f"ag{s}")(g=ctx, x=skips[s - 1])
+            skip = skips[s - 1]
+            if self.use_attention_gates:
+                skip = getattr(self, f"ag{s}")(g=ctx, x=skip)
             if s == n and self.use_fusion:
-                g = self.fusion(feat_low=b_feat, feat_high=g)
+                skip = self.fusion(feat_low=b_feat, feat_high=skip)
             up = getattr(self, f"up{s}")(ctx)
-            ctx = getattr(self, f"dec{s}")(torch.cat([up, g], dim=1))
+            ctx = getattr(self, f"dec{s}")(torch.cat([up, skip], dim=1))
 
         return self.head(ctx)
 
@@ -239,7 +252,10 @@ class MSNAFMambaNet(nn.Module):
 def build_model(device, mamba_mode=None, input_mode=None, use_checkpoint=None,
                 data_parallel=True, verbose=True):
     """
-    Factory for MS-NAFMambaNet.
+    Factory for MSNAFMambaNet.
+
+    Attention gates are deliberately disabled in the standard factory. The gate
+    modules remain in the state_dict only to keep old checkpoints loadable.
 
     Note: nn.DataParallel is legacy and only used as a convenience when several
     GPUs are visible. Prefer torchrun + DistributedDataParallel for real
@@ -249,6 +265,7 @@ def build_model(device, mamba_mode=None, input_mode=None, use_checkpoint=None,
         mamba_mode=mamba_mode,
         input_mode=input_mode,
         use_checkpoint=cfg.USE_GRAD_CHECKPOINT if use_checkpoint is None else use_checkpoint,
+        use_attention_gates=False,
         verbose=verbose,
     ).to(device)
 
