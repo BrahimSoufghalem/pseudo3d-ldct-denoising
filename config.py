@@ -66,7 +66,8 @@ def _env_blocks(name, default):
         ) from None
     if len(values) != len(default):
         raise ValueError(
-            f"{name} needs exactly {len(default)} values (one per stage), got '{raw}'"
+            f"{name} needs exactly {len(default)} values (one per stage), got '{raw}'. "
+            f"NUM_STAGES is currently {len(default)}."
         )
     if any(v < 1 for v in values):
         raise ValueError(f"{name} entries must all be >= 1, got '{raw}'")
@@ -342,17 +343,75 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 #   width 32, (1,1,1,1)         5.14 M    0.1627      +0.0634    +0.0581   +6.58
 #   width 32, enc (2,2,4,8)     9.43 M    0.1667      +0.0674    +0.0639   +6.78
 #   width 48, (1,1,1,1)        11.37 M    0.1666      +0.0673    +0.0637   +6.84
+#   width 32, pure Charbonnier  5.14 M    0.1671      +0.0679    +0.0607   +6.83
 #
-# 5.1 M -> 9.4 M bought +0.0040 chest VIF. 9.4 M -> 11.4 M bought -0.0001, i.e.
-# nothing. Two different scaling axes landed on the same value to four decimal
-# places, which is a saturation curve rather than a capacity shortage. The
-# pre-registered success threshold was +0.02 and it was missed by a factor of
-# five. Do not spend more GPU time on width or depth without a new reason.
+# 5.1 M -> 9.4 M bought +0.0040 chest VIF. 9.4 M -> 11.4 M bought -0.0001. And
+# deleting the SSIM and Sobel terms from the loss reached the SAME 0.167 with
+# 5.1 M parameters. Four independent interventions, one value. The
+# pre-registered success threshold was +0.02 and every one of them missed it by
+# a factor of five. Neither parameters nor loss terms are the binding
+# constraint. Do not spend more GPU time on width, depth or loss weights.
 MODEL_WIDTH = _env_int("MODEL_WIDTH", 32)              # stages are w,2w,4w,8w,16w
-ENC_BLOCKS = _env_blocks("ENC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per encoder stage
-DEC_BLOCKS = _env_blocks("DEC_BLOCKS", (1, 1, 1, 1))   # NAF blocks per decoder stage
 D_STATE = _env_int("D_STATE", 16)                      # SSM state dimension N
 N_SCAN_DIRECTIONS = 4                                  # SS2D cross-scan directions
+
+# ---------------------------------------------------------------------------
+# NUM_STAGES - the depth of the resolution pyramid, and the current experiment
+# ---------------------------------------------------------------------------
+# Number of encoder downsampling steps. The network downsamples by 2**NUM_STAGES
+# and the Mamba bottleneck runs at that resolution. Channels are
+# w, 2w, 4w, ... with the bottleneck at w * 2**NUM_STAGES.
+#
+#   NUM_STAGES  downsampling  bottleneck on a 256 crop  bottleneck channels (w=32)
+#        4          16x              16 x 16                     512
+#        3           8x              32 x 32                     256
+#        2           4x              64 x 64                     128
+#
+# WHY THIS IS NOW THE EXPERIMENT
+# -------------------------------
+# Everything non-structural has been eliminated (see the capacity table above).
+# The one remaining difference between this network and the reference models is
+# that RED-CNN - which reaches VIF 0.221 trained on nothing but MSE - is a FLAT
+# convolutional stack that never downsamples at all, while we compress 16x and
+# rebuild through PixelShuffle.
+#
+# That single fact predicts the entire measured pattern:
+#
+#   * PSNR and SSIM weight low spatial frequencies heavily, and they sit at
+#     89-92% of the required gain. Low frequencies survive a bottleneck.
+#   * VIF distributes its weight over sub-bands including the highest, and sits
+#     at 56%. The highest band cannot be reconstructed faithfully from a 16x16
+#     representation, no matter how many channels or parameters it has.
+#   * Adding width or depth widens channels, not resolution, so it changed
+#     nothing. This is why capacity failed.
+#   * No loss function can request information that was destroyed in the forward
+#     pass. This is why the loss experiments failed.
+#   * Delta_VIF is nearly constant at 0.048-0.068 across patients whose baseline
+#     VIF varies fourfold, i.e. the model applies a fixed filter bandwidth
+#     rather than an adaptive filtering strength. A fixed bandwidth is exactly
+#     what a fixed resolution pyramid imposes.
+#
+# NUM_STAGES=4 is bit-identical to the previous hard-coded architecture,
+# including every parameter name, so all existing checkpoints still load.
+#
+#   NUM_STAGES=2 python train.py --input-mode 2d --mamba-mode basic \
+#     --lr 2e-4 --no-amp --epochs 20 --output-root runs_s2
+#
+# Expect FEWER parameters and MORE compute per step: the same work moves to
+# higher resolution. If a smaller model wins on VIF, the diagnosis is confirmed
+# and the resolution pyramid, not the parameter budget, is what to redesign.
+NUM_STAGES = _env_int("NUM_STAGES", 4)
+if not 1 <= NUM_STAGES <= 5:
+    raise ValueError(f"NUM_STAGES must be between 1 and 5, got {NUM_STAGES}")
+
+# One entry per stage. Defaults follow NUM_STAGES, so NUM_STAGES=2 expects two
+# values here, not four. DEC_BLOCKS is ordered DEEPEST FIRST.
+ENC_BLOCKS = _env_blocks("ENC_BLOCKS", (1,) * NUM_STAGES)
+DEC_BLOCKS = _env_blocks("DEC_BLOCKS", (1,) * NUM_STAGES)
+
+# Inputs are reflection-padded up to a multiple of this. Derived, not fixed:
+# a 2-stage network only needs a multiple of 4.
+SIZE_DIVISOR = 2 ** NUM_STAGES
 
 # Selective-scan backend:
 #   "auto" -> official mamba_ssm CUDA kernel when available, else PyTorch fallback
@@ -361,19 +420,15 @@ N_SCAN_DIRECTIONS = 4                                  # SS2D cross-scan directi
 SCAN_BACKEND = "auto"
 SCAN_CHUNK_SIZE = 32                   # sequence chunk for the PyTorch fallback
 
-# The network downsamples 4x, so inputs are reflection-padded to a multiple of 16
-SIZE_DIVISOR = 16
-
 
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
-# The active objective, unchanged since the first working run:
+# The active objective:
 #
 #     1.0 * Charbonnier  +  0.6 * SSIM (single scale)  +  0.2 * Sobel edge
 #
-# Env-overridable so terms can be removed without editing this file. Defaults
-# are the values every existing result was produced with.
+# Env-overridable so terms can be removed without editing this file:
 #
 #   LAMBDA_SSIM=0 LAMBDA_EDGE=0 python train.py ...    # pure Charbonnier
 #   LAMBDA_SSIM=0.2 python train.py ...                # weight sweep
@@ -382,53 +437,23 @@ LAMBDA_SSIM = _env_float("LAMBDA_SSIM", 0.6)
 LAMBDA_EDGE = _env_float("LAMBDA_EDGE", 0.2)
 
 # ---------------------------------------------------------------------------
-# WHY REMOVING TERMS IS NOW THE EXPERIMENT WORTH RUNNING
+# MEASURED EFFECT OF THE LOSS WEIGHTS (2d/basic, 5.14 M, 20 epochs, benchmark)
 # ---------------------------------------------------------------------------
-# evaluate.py reports the metrics of the raw LDCT input as well as of the
-# prediction, which scores the model on the FRACTION OF THE REQUIRED GAIN it
-# achieves rather than on absolute numbers. On the 10 test patients, against the
-# published targets (5.14 M baseline model):
+#   weights              PSNR chest  SSIM chest  VIF chest  VIF abdomen
+#   0.6 / 0.2 (default)    27.21       0.5856     0.1627      0.4463
+#   0.2 / 0.2              27.23       0.5848     0.1633      0.4479
+#   0.0 / 0.0              27.59       0.5787     0.1671      0.4489
 #
-#   metric        baseline   ours     target    needed    got      share
-#   PSNR chest     18.09     27.21    28.36     +10.27    +9.12     89%
-#   PSNR abdomen   29.01     33.04    33.22      +4.21    +4.03     96%
-#   SSIM chest      0.3119    0.5856   0.609     +0.2971  +0.2737   92%
-#   SSIM abdomen    0.8527    0.9089   0.9028    +0.0501  +0.0563  112%
-#   VIF  chest      0.0993    0.1627   0.221     +0.1217  +0.0634   52%
-#   VIF  abdomen    0.3882    0.4463   0.491     +0.1028  +0.0581   57%
+# The trade-off is real and in the predicted direction: removing SSIM buys
+# +0.38 dB PSNR and +0.0044 VIF at a cost of -0.0069 SSIM. SSIM is a LOCAL
+# CONTRAST criterion, well satisfied by output that is locally smooth with the
+# right local mean and variance, which is close to the opposite of what VIF
+# rewards.
 #
-# Delta_VIF is POSITIVE everywhere, so the model adds visual information rather
-# than destroying it, and the "posterior-mean ceiling" argument is dead. But the
-# shortfall is SPECIFIC to VIF, and two attempts to close it have now failed:
-#
-#   attempt                      chest dSSIM      chest dVIF
-#   multi-scale SSIM             +0.0084          +0.0013   (noise)
-#   window-aligned loss          no separable effect
-#   depth 5.1 M -> 9.4 M         +0.0037          +0.0040
-#   width 5.1 M -> 11.4 M        +0.0026          +0.0039
-#
-# Adding to the objective did not work. Adding parameters did not work. The one
-# direction never tried is SUBTRACTION.
-#
-# The argument: RED-CNN in the reference table reaches VIF 0.221 trained on
-# nothing but MSE - the most smoothing objective available. If a plain MSE model
-# beats a hybrid-loss model on VIF, the extra terms are not merely useless, they
-# are suspects. SSIM is a LOCAL CONTRAST criterion: it is well satisfied by
-# output that is locally smooth with the right local mean and variance, which is
-# close to the opposite of what VIF rewards. At lambda 0.6 against Charbonnier's
-# 1.0 it is not a minor regulariser.
-#
-# Run order, cheapest first, one variable at a time, always at width 32 with
-# (1,1,1,1) so it is comparable to the 5.14 M row above:
-#
-#   LAMBDA_SSIM=0 LAMBDA_EDGE=0    pure Charbonnier - the direct RED-CNN analogue
-#   LAMBDA_SSIM=0.2                is the effect monotone in the SSIM weight?
-#   LAMBDA_EDGE=0                  isolate the Sobel term
-#
-# If pure Charbonnier raises chest VIF while costing SSIM, the trade-off is real
-# and the weights become a tunable axis. If it changes nothing, the objective is
-# fully exonerated and the remaining suspects are the output head and the input
-# representation.
+# But note that 0.6 -> 0.2 did nothing and all of the effect appeared between
+# 0.2 and 0. That is threshold behaviour, not a tunable axis, and the magnitude
+# is the same +0.004 that width and depth produced. Keep the defaults: chest
+# SSIM is already below target and cannot afford -0.0069 for +0.0044 of VIF.
 # ---------------------------------------------------------------------------
 
 # Multi-scale SSIM (5 levels) in place of the single-scale term.
