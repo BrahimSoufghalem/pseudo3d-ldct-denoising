@@ -20,15 +20,22 @@ OPERATING-POINT SWEEP (--blend)
 -------------------------------
 `--blend a1,a2,...` evaluates alpha * prediction + (1 - alpha) * ldct_input for
 each alpha, reusing a single forward pass and a single baseline pass per slice.
-This measures the model's own PSNR/VIF trade-off curve without retraining. If
-VIF peaks below alpha = 1 the model is over-smoothing, which is a very
-different diagnosis from being capacity- or architecture-limited.
+Because the network is residual, this is exactly a denoising-strength knob:
+
+    alpha * (x + r) + (1 - alpha) * x  =  x + alpha * r
+
+alpha < 1 holds part of the input back (weaker denoising); alpha > 1 "over-
+applies" the predicted residual (stronger denoising). The sweep measures the
+model's own trade-off curve without retraining. If VIF peaks below alpha = 1
+the model is over-smoothing; if it peaks above 1 the residual is systematically
+under-applied; if it peaks exactly at 1 the operating point is already optimal
+and the deficit lies elsewhere.
 
 Usage:
     python evaluate.py --input-mode 2.5d --mamba-mode full
     python evaluate.py --model runs/25d_full/best_model.pt --save-images
     python evaluate.py --model runs_charb/2d_basic/best_model.pt --no-amp \\
-        --blend 0.7,0.8,0.9,1.0 --output eval_blend
+        --blend 1.0,1.1,1.2,1.35 --output eval_blend_hi
 """
 
 import argparse
@@ -56,6 +63,12 @@ from metrics import (
 )
 
 import pydicom
+
+
+# Upper bound for --blend. Values above 1.0 over-apply the residual, which is a
+# legitimate thing to measure; values much above ~1.5 are meaningless because
+# the output saturates against the [0, 1] clamp.
+MAX_BLEND = 2.0
 
 
 # ═══════════════════════════════════════════
@@ -86,8 +99,8 @@ def parse_blends(raw):
             a = float(part)
         except ValueError:
             raise ValueError(f"--blend expects comma-separated floats, got '{raw}'") from None
-        if not 0.0 <= a <= 1.0:
-            raise ValueError(f"--blend values must lie in [0, 1], got {a}")
+        if not 0.0 <= a <= MAX_BLEND:
+            raise ValueError(f"--blend values must lie in [0, {MAX_BLEND:g}], got {a}")
         if a not in values:
             values.append(a)
     if not values:
@@ -110,8 +123,8 @@ def evaluate_patient(pid, patient_dir, model, device, input_mode="2.5d",
     remaining gap is a capacity problem or an objective-function problem.
 
     When several `blends` are given, the model runs ONCE per slice and the
-    prediction is mixed back towards the input at each alpha, so the sweep is
-    almost free relative to a single evaluation.
+    residual is rescaled at each alpha, so the sweep is almost free relative to
+    a single evaluation.
 
     Returns one result row per alpha.
     """
@@ -326,12 +339,13 @@ def print_summary(df, title=None, verdict=True):
 def print_blend_curve(df, blends):
     """Print the PSNR/VIF trade-off curve across blend factors.
 
-    This is the whole point of the sweep. Read the VIF columns first: if they
-    peak below alpha = 1 the model is over-smoothing, and filtering strength -
-    not capacity, not architecture - is the binding constraint.
+    Read the VIF columns first. A peak below alpha = 1 means the model is
+    over-smoothing; a peak above 1 means the residual is under-applied; a peak
+    exactly at 1 means the operating point is already optimal and the deficit
+    is not a filtering-strength problem at all.
     """
     print("\n" + "=" * 92)
-    print("BLEND SWEEP: alpha * prediction + (1 - alpha) * LDCT input")
+    print("BLEND SWEEP: alpha * prediction + (1 - alpha) * LDCT input  ==  x + alpha * residual")
     print("=" * 92)
     print(
         f"\n{'alpha':>6} | {'PSNR C':>8} {'SSIM C':>8} {'VIF C':>8} | "
@@ -362,23 +376,46 @@ def print_blend_curve(df, blends):
     a_vif_c = max(blends, key=lambda a: best[a]["vif_c"])
     a_vif_a = max(blends, key=lambda a: best[a]["vif_a"])
     a_psnr_c = max(blends, key=lambda a: best[a]["psnr_c"])
+    lo, hi = min(blends), max(blends)
 
     print(f"\n  VIF peaks at   alpha = {a_vif_c:.2f} (chest), {a_vif_a:.2f} (abdomen)")
     print(f"  PSNR peaks at  alpha = {a_psnr_c:.2f} (chest)")
 
-    if max(a_vif_c, a_vif_a) < max(blends):
+    peak = max(a_vif_c, a_vif_a)
+
+    if peak < 1.0:
         print(
             "\n  READING: VIF is maximised by holding some of the input back, so the model is\n"
-            "  OVER-SMOOTHING at full strength. The constraint is the operating point, not the\n"
-            "  architecture. Reducing denoising strength - or training towards a lower one - is\n"
-            "  a lever that costs no parameters."
+            "  OVER-SMOOTHING. The constraint is the operating point, not the architecture.\n"
+            "  Reducing denoising strength - or training towards a lower one - costs no\n"
+            "  parameters."
+        )
+    elif peak > 1.0:
+        print(
+            "\n  READING: VIF is maximised ABOVE alpha = 1, so the model systematically\n"
+            "  UNDER-APPLIES its own residual. Rescaling the output is free; check the SSIM\n"
+            "  and PSNR columns at the same alpha before adopting it, since the three metrics\n"
+            "  do not have to peak together."
         )
     else:
         print(
-            "\n  READING: VIF is highest at full strength, so the model is NOT over-smoothing.\n"
-            "  The over-smoothing hypothesis is dead and the deficit is genuinely a matter of\n"
-            "  how much information the model recovers, not of how hard it filters."
+            "\n  READING: VIF is highest at exactly alpha = 1, so the model is neither over-\n"
+            "  smoothing nor under-applying its residual. The operating point is already\n"
+            "  optimal and the deficit is genuinely about how much information the model\n"
+            "  recovers, not about how hard it filters."
         )
+
+    if peak >= hi and hi < MAX_BLEND:
+        print(
+            f"\n  NOTE: the optimum sits at the top of the swept range ({hi:g}). The peak may lie\n"
+            f"  beyond it - extend the sweep before concluding."
+        )
+    if peak <= lo and lo > 0.0:
+        print(
+            f"\n  NOTE: the optimum sits at the bottom of the swept range ({lo:g}). Extend the\n"
+            f"  sweep downwards before concluding."
+        )
+
     print("=" * 92)
 
 
@@ -397,8 +434,9 @@ def main():
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
         "--blend", type=str, default="1.0",
-        help="Comma-separated blend factors alpha in [0, 1]: output = alpha * prediction + "
-             "(1 - alpha) * LDCT input. Several alphas share one forward pass. Default 1.0."
+        help=f"Comma-separated blend factors alpha in [0, {MAX_BLEND:g}]: output = x + alpha * residual, "
+             "i.e. alpha * prediction + (1 - alpha) * LDCT input. Values above 1 over-apply the "
+             "residual. Several alphas share one forward pass. Default 1.0."
     )
     args = parser.parse_args()
 
