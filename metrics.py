@@ -30,7 +30,16 @@ CW = CLINICAL_WINDOWS
 
 
 def apply_center_width(x: np.ndarray, center: float, width: float, out_range=(0.0, 1.0)) -> np.ndarray:
-    """Apply clinical center/width windowing to an array in the HU+1024 domain."""
+    """Apply clinical center/width windowing to an array in the HU+1024 domain.
+
+    Metric code is NumPy based, while training-time validation may pass a CUDA
+    Tensor or MONAI MetaTensor. Convert explicitly here so every caller follows
+    one safe CPU boundary instead of relying on Tensor.__array__.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    else:
+        x = np.asarray(x)
     center = float(center)
     width = float(width)
     lower = center - 0.5 - (width - 1.0) / 2.0
