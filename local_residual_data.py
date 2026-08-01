@@ -11,7 +11,7 @@ import random
 from collections import Counter
 
 import torch
-from monai.data import CacheDataset, Dataset, DataLoader
+from monai.data import CacheDataset, Dataset, DataLoader, PydicomReader
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, RandSpatialCropSamplesd,
     ResizeWithPadOrCropd, ToTensord,
@@ -54,9 +54,20 @@ class BenchmarkMeanStdd:
         return data
 
 
+def _benchmark_reader():
+    """Match pydicom.pixel_array orientation used by ldct-benchmark.
+
+    MONAI's PydicomReader applies RescaleSlope/Intercept correctly, but its
+    default ``swap_ij=True`` transposes the spatial axes. The benchmark and our
+    full-resolution evaluator use pydicom arrays without that swap. Keeping the
+    default here would train on transposed anatomy and test on unswapped anatomy.
+    """
+    return PydicomReader(swap_ij=False)
+
+
 def _train_transform(patch_size):
     return Compose([
-        LoadImaged(keys=["image", "label"], reader="PydicomReader"),
+        LoadImaged(keys=["image", "label"], reader=_benchmark_reader()),
         EnsureChannelFirstd(keys=["image", "label"]),
         BenchmarkMeanStdd(),
         RandSpatialCropSamplesd(
@@ -69,7 +80,7 @@ def _train_transform(patch_size):
 
 def _val_transform(patch_size):
     return Compose([
-        LoadImaged(keys=["image", "label"], reader="PydicomReader"),
+        LoadImaged(keys=["image", "label"], reader=_benchmark_reader()),
         EnsureChannelFirstd(keys=["image", "label"]),
         BenchmarkMeanStdd(),
         ResizeWithPadOrCropd(
@@ -160,6 +171,7 @@ def prepare_local_residual_data(
     print(f"Val slices     : {len(val_files)} | deterministic center crop")
     print(f"Patches        : train {train_patch_size} | val {val_patch_size}")
     print(f"Train cycle    : {iterations_before_val} iterations x batch {train_batch_size}")
+    print("DICOM orientation: PydicomReader(swap_ij=False), aligned with benchmark/evaluation")
     print(
         "Standardization : (HU + 1024 - "
         f"{BENCHMARK_PIXEL_MEAN:.12f}) / {BENCHMARK_PIXEL_STD:.12f}"
