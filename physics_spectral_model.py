@@ -8,8 +8,6 @@ returns a correction residual and callers form ``denoised = LDCT + residual``.
 Internally the network predicts noise, therefore residual = -predicted_noise.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -95,17 +93,23 @@ class FullResolutionBlock(nn.Module):
 
 
 class ResidualGroup(nn.Module):
+    """A sequence of full-resolution blocks with no second attenuation layer.
+
+    The first implementation wrapped blocks that already used a 0.1 residual
+    scale in another 0.1-scaled group residual. That reduced the effective deep
+    path to roughly one percent and produced a shallow-filter failure signature
+    (chest/abdomen VIF 0.1551/0.4029). One scale per block is sufficient.
+    """
+
     def __init__(self, channels, dilations, residual_scale=0.1):
         super().__init__()
         self.blocks = nn.Sequential(*[
             FullResolutionBlock(channels, d, residual_scale)
             for d in dilations
         ])
-        self.group_scale = nn.Parameter(torch.tensor(float(residual_scale)))
 
     def forward(self, x):
-        z = self.blocks(x)
-        return x + self.group_scale * (z - x)
+        return self.blocks(x)
 
 
 class PhysicsSpectralNet(nn.Module):
@@ -164,12 +168,12 @@ class PhysicsSpectralNet(nn.Module):
         nn.init.zeros_(self.noise_head.bias)
 
         if verbose:
-            rf = self.receptive_field()
             print(
                 "Initializing PhysicsSpectralNet | input=2d (1ch) | "
                 f"channels={self.channels} | groups={self.n_groups} | "
                 f"blocks={self.n_groups * len(self.dilations)} | "
-                f"spectral={'on' if self.spectral_enabled else 'off'} | RF~{rf}"
+                f"spectral={'on' if self.spectral_enabled else 'off'} | "
+                f"RF~{self.receptive_field()} | group-scale=removed"
             )
 
     def receptive_field(self):
@@ -187,6 +191,23 @@ class PhysicsSpectralNet(nn.Module):
         if self.spectral_enabled:
             cfg.update(self.decomposition.settings)
         return cfg
+
+    def scale_diagnostics(self):
+        block_values = torch.cat([
+            block.scale.detach().float().reshape(-1)
+            for group in self.groups
+            for block in group.blocks
+        ])
+        result = {
+            "block_scale_mean": float(block_values.mean()),
+            "block_scale_abs_mean": float(block_values.abs().mean()),
+            "head_weight_norm": float(self.noise_head.weight.detach().float().norm()),
+        }
+        if self.spectral_enabled:
+            spectral = self.spectral_scales.detach().float()
+            result["spectral_scale_mean"] = float(spectral.mean())
+            result["spectral_scale_abs_mean"] = float(spectral.abs().mean())
+        return result
 
     def spectral_features(self, x):
         low, mid, high = self.decomposition(x)

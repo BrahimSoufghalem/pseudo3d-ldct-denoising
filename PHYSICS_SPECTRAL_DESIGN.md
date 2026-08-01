@@ -95,7 +95,8 @@ The network remains at full spatial resolution from input to output.
    every residual group through a learned scalar initially equal to 0.1.
 5. Four groups each contain dilation 1/2/3/4 blocks. Every block combines a
    dilated 3x3 context convolution with a local 3x3 convolution. No normalisation
-   is used.
+   is used. Each block has one learnable residual scale initially equal to 0.1;
+   there is deliberately no second group-level attenuation.
 6. A zero-initialised 5x5 head predicts noise. The repository-facing output is
    its negative, so existing code forms `denoised = LDCT + correction`.
 
@@ -105,6 +106,33 @@ BatchNorm or patient-specific conditioning.
 The Gaussian cutoffs are initial engineering values. The medical-physics phase
 must replace them with values calibrated from training-set signal/noise spectra;
 this is explicitly not hidden as a learned or arbitrary claim.
+
+## First implementation failure and correction
+
+The first MSE-only implementation was evaluated around epoch 14:
+
+```text
+Chest   PSNR 27.23 | SSIM 0.5602 | VIF 0.1551
+Abdomen PSNR 32.15 | SSIM 0.8991 | VIF 0.4029
+```
+
+This failed the pre-registered `VIF >= 0.187` criterion and underperformed the
+old model. The implementation had a 0.1 residual scale inside every block and a
+second 0.1 scale around each complete group, reducing the effective deep-trunk
+contribution to roughly one percent. The outer scale was removed. Training now
+prints the mean block scale, spectral scale and head-weight norm every epoch.
+
+Before another full run, use the fixed-patch memorisation test:
+
+```bash
+HU_RANGE_PRESET=benchmark python train_physics.py \
+  --epochs 100 --overfit-samples 32 --batch-size 16 \
+  --lambda-nps 0 --lambda-hu 0 --output-root runs_physics_overfit
+```
+
+The same 32 augmented patches are materialised once and reused for train and
+validation. Their MSE should fall dramatically. A failure to memorise is an
+implementation/optimisation failure, not evidence against the physical idea.
 
 ## Loss ablations
 

@@ -1,6 +1,7 @@
 """Train PhysicsSpectralNet from scratch on the fair ldct-benchmark pipeline."""
 
 import argparse
+import math
 import os
 import statistics
 import time
@@ -14,7 +15,7 @@ from dataset import prepareCT2D
 from metrics import compute_psnr_windowed, compute_ssim_windowed, compute_rmse_hu, denormalize_to_hu_offset
 from physics_losses import PhysicsInformedCTLoss
 from physics_spectral_model import build_physics_model
-from utils import setup_reproducibility, get_device, get_state_dict, load_state_into
+from utils import setup_reproducibility, get_device, get_state_dict
 
 
 def args_parser():
@@ -30,12 +31,59 @@ def args_parser():
     p.add_argument("--groups", type=int, default=4)
     p.add_argument("--no-spectral", action="store_true")
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument(
+        "--overfit-samples", type=int, default=0,
+        help="materialize exactly this many augmented training samples and reuse "
+             "them for both train and validation; 0 disables the sanity test",
+    )
     return p.parse_args()
 
 
 def run_dir(args):
     tag = "spatial" if args.no_spectral else "physics_spectral"
-    return os.path.join(args.output_root, f"2d_{tag}_nps{args.lambda_nps:g}_hu{args.lambda_hu:g}")
+    suffix = f"_overfit{args.overfit_samples}" if args.overfit_samples > 0 else ""
+    return os.path.join(
+        args.output_root,
+        f"2d_{tag}_nps{args.lambda_nps:g}_hu{args.lambda_hu:g}{suffix}",
+    )
+
+
+def _slice_batch(batch, take):
+    """Copy the first `take` samples while preserving MONAI metadata values."""
+    batch_size = int(batch["image"].shape[0])
+    result = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch_size:
+            result[key] = value[:take].detach().cpu().clone()
+        elif isinstance(value, list) and len(value) == batch_size:
+            result[key] = value[:take]
+        elif isinstance(value, tuple) and len(value) == batch_size:
+            result[key] = value[:take]
+        else:
+            result[key] = value
+    return result
+
+
+def materialize_overfit_batches(loader, n_samples):
+    """Freeze exact random crops so memorisation, not augmentation, is tested."""
+    if n_samples <= 0:
+        return loader
+    frozen = []
+    remaining = int(n_samples)
+    for batch in loader:
+        take = min(remaining, int(batch["image"].shape[0]))
+        frozen.append(_slice_batch(batch, take))
+        remaining -= take
+        if remaining <= 0:
+            break
+    actual = sum(int(batch["image"].shape[0]) for batch in frozen)
+    if actual == 0:
+        raise RuntimeError("Could not materialize any overfit samples")
+    print(
+        f"OVERFIT SANITY MODE: froze {actual} exact augmented samples in "
+        f"{len(frozen)} batches; the same batches are used for train and val."
+    )
+    return frozen
 
 
 def step_loss(loss_fn, pred_res, inp, target):
@@ -133,6 +181,10 @@ def main():
     train_loader, val_loader = prepareCT2D(
         input_mode="2d", train_batch_size=args.batch_size,
     )
+    if args.overfit_samples > 0:
+        frozen = materialize_overfit_batches(train_loader, args.overfit_samples)
+        train_loader = frozen
+        val_loader = frozen
 
     best_psnr = -float("inf")
     start = time.time()
@@ -141,6 +193,7 @@ def main():
         tr = train_epoch(model, train_loader, loss_fn, optimizer, device, args.grad_clip)
         va = validate(model, val_loader, loss_fn, device)
         scheduler.step()
+        diag = model.scale_diagnostics()
         meta = {
             "architecture": "physics_spectral",
             "model_config": model.model_config(),
@@ -149,11 +202,13 @@ def main():
             "eval_data_range": cfg.EVAL_DATA_RANGE,
             "loss": loss_fn.describe(),
             "input_mode": "2d",
+            "overfit_samples": args.overfit_samples,
             "benchmark_contract": "ldct-benchmark: windowed PSNR/SSIM, unwindowed clipped RMSE/VIF",
         }
         payload = {
             "model_state_dict": get_state_dict(model), "meta": meta,
             "epoch": epoch, "psnr": va["psnr"], "ssim": va["ssim"],
+            "diagnostics": diag,
         }
         torch.save(payload, os.path.join(root, "last_model.pt"))
         if va["psnr"] > best_psnr:
@@ -166,18 +221,28 @@ def main():
 
         dpsnr = va["psnr"] - va["baseline"]
         elapsed = time.time() - t0
+        spec_text = (
+            f" spec={diag['spectral_scale_mean']:.3f}"
+            if "spectral_scale_mean" in diag else ""
+        )
         print(
             f"Epoch [{epoch+1:03d}/{args.epochs}] Train {tr['loss']:.6f} | "
             f"Val {va['loss']:.6f} | PSNR {va['psnr']:.3f} | dPSNR {dpsnr:+.3f} | "
             f"SSIM {va['ssim']:.5f} | RMSE {va['rmse']:.2f} | "
             f"MSE {tr['MSE']:.6f} NPS {tr['NPS']:.3f} HU {tr['HU']:.6f} | "
-            f"|g|med {tr['gnorm']:.2f} | LR {optimizer.param_groups[0]['lr']:.2e} | {elapsed:.1f}s"
+            f"|g|med {tr['gnorm']:.4f} | scales block={diag['block_scale_mean']:.3f}" 
+            f"{spec_text} head={diag['head_weight_norm']:.3f} | "
+            f"LR {optimizer.param_groups[0]['lr']:.2e} | {elapsed:.1f}s"
         )
         writer.add_scalars("Loss", {"train": tr["loss"], "val": va["loss"]}, epoch + 1)
         writer.add_scalar("Metrics/PSNR", va["psnr"], epoch + 1)
         writer.add_scalar("Metrics/SSIM", va["ssim"], epoch + 1)
         writer.add_scalar("Physics/NPS", tr["NPS"], epoch + 1)
         writer.add_scalar("Physics/HU", tr["HU"], epoch + 1)
+        writer.add_scalar("Diagnostics/BlockScaleMean", diag["block_scale_mean"], epoch + 1)
+        writer.add_scalar("Diagnostics/HeadWeightNorm", diag["head_weight_norm"], epoch + 1)
+        if "spectral_scale_mean" in diag:
+            writer.add_scalar("Diagnostics/SpectralScaleMean", diag["spectral_scale_mean"], epoch + 1)
 
     print(f"Training complete in {time.strftime('%H:%M:%S', time.gmtime(time.time()-start))}")
     print(f"Best PSNR: {best_psnr:.3f} | outputs: {root}")
