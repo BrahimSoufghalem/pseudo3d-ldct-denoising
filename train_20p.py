@@ -2,10 +2,14 @@
 
 Usage
 -----
-# Train all three sequentially:
+# Local (default paths):
     HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn
-    HU_RANGE_PRESET=benchmark python train_20p.py --arch resnet
-    HU_RANGE_PRESET=benchmark python train_20p.py --arch local_residual
+
+# Kaggle (dataset root flat structure):
+    HU_RANGE_PRESET=benchmark python train_20p.py \
+        --arch redcnn \
+        --data-dir /kaggle/input/ldct-20p \
+        --num-workers 2
 
 All three models use identical:
   - Data pipeline (same 20 patients, same sampling, same mean/std)
@@ -33,13 +37,11 @@ from local_residual_data import (
 )
 from local_residual_model import build_local_residual_model
 from metrics import compute_psnr_windowed, compute_ssim_windowed, compute_rmse_hu
-from twenty_patient_split import TRAIN_20P, VAL_20P, TEST_20P
+from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
 
 # ── Override the patient split at import time ────────────────────────────────
-# local_residual_data.prepare_local_residual_data uses cfg.EXPECTED_TRAIN and
-# cfg.EXPECTED_VAL. We monkey-patch them here so no other module is touched.
 cfg.EXPECTED_TRAIN = TRAIN_20P
 cfg.EXPECTED_VAL = VAL_20P
 
@@ -50,6 +52,12 @@ def parse_args():
         "--arch", required=True,
         choices=["redcnn", "resnet", "local_residual"],
         help="Architecture to train",
+    )
+    p.add_argument(
+        "--data-dir", default=cfg.DATA_DIR,
+        help="Root folder containing train+val patient sub-dirs "
+             "(default: cfg.DATA_DIR = 'dataset'). "
+             "On Kaggle use /kaggle/input/ldct-20p",
     )
     p.add_argument("--max-iterations", type=int, default=20_000)
     p.add_argument("--iterations-before-val", type=int, default=1_000)
@@ -138,16 +146,15 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  20-patient experiment | arch={args.arch.upper()}")
-    print(f"  Output : {out_dir}")
+    print(f"  Data dir : {args.data_dir}")
+    print(f"  Output   : {out_dir}")
     print(f"{'='*60}\n")
 
     model = build_model(args.arch, device)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, betas=(0.9, 0.999)
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
     train_loader, val_loader = prepare_local_residual_data(
+        in_dir=args.data_dir,
         train_patch_size=args.patch_size,
         val_patch_size=args.val_patch_size,
         train_batch_size=args.batch_size,
