@@ -2,21 +2,18 @@
 
 Usage
 -----
-# Train RED-CNN:
+# Train on Kaggle T4 (groups=1 default, fast):
     HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch redcnn --data-dir /kaggle/input/datasets/brahimha/ldct-20p
+        --arch redcnn --data-dir /kaggle/input/...
 
-# Train LocalResidual (our model):
     HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch local_residual --data-dir /kaggle/input/datasets/brahimha/ldct-20p
+        --arch local_residual --data-dir /kaggle/input/...
 
 # Resume if interrupted:
-    HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch local_residual --data-dir /kaggle/input/datasets/brahimha/ldct-20p \
-        --resume
+    ... same command + --resume
 
-All models use identical protocol:
-  Loss: MSE | Optimizer: Adam lr=1e-4 | Precision: FP32 | 20k iterations
+# On Blackwell/Ampere (restore groups=8):
+    ... --groups 8
 """
 
 import argparse
@@ -49,11 +46,10 @@ def parse_args():
     p.add_argument(
         "--arch", required=True,
         choices=["redcnn", "resnet", "local_residual"],
-        help="Architecture: redcnn | local_residual (resnet available but slow on T4)",
     )
     p.add_argument(
         "--data-dir", default=cfg.DATA_DIR,
-        help="Root folder with train+val patient sub-dirs (default: cfg.DATA_DIR)",
+        help="Root folder with train+val patient sub-dirs",
     )
     p.add_argument("--max-iterations", type=int, default=20_000)
     p.add_argument("--iterations-before-val", type=int, default=1_000)
@@ -65,15 +61,20 @@ def parse_args():
     p.add_argument("--cache-rate", type=float, default=1.0)
     p.add_argument("--output-root", default="runs_20p")
     p.add_argument(
+        "--groups", type=int, default=1,
+        help="Groups for LocalResidual middle conv. "
+             "Default=1 (fast on T4). Use 8 on Blackwell/Ampere.",
+    )
+    p.add_argument(
         "--resume", action="store_true",
         help="Resume training from checkpoint.pt if it exists",
     )
     return p.parse_args()
 
 
-def build_model(arch: str, device):
+def build_model(arch: str, device, groups: int = 1):
     if arch == "local_residual":
-        return build_local_residual_model(device, channels=128, blocks=10, groups=8)
+        return build_local_residual_model(device, channels=128, blocks=10, groups=groups)
     return build_benchmark_model(arch, device)
 
 
@@ -94,10 +95,10 @@ def validate(model, loader, device):
         body = batch.get("body_type", ["Abdomen"] * pred.shape[0])
         for i in range(pred.shape[0]):
             bt = "Chest" if str(body[i]).lower().startswith("c") else "Abdomen"
-            sums["psnr"]         += compute_psnr_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
+            sums["psnr"]          += compute_psnr_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
             sums["baseline_psnr"] += compute_psnr_windowed(x_px[i].squeeze(),  y_px[i].squeeze(), bt)
-            sums["ssim"]         += compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
-            sums["rmse"]         += compute_rmse_hu(pred_px[i].squeeze(),       y_px[i].squeeze())
+            sums["ssim"]          += compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
+            sums["rmse"]          += compute_rmse_hu(pred_px[i].squeeze(),       y_px[i].squeeze())
             samples += 1
     n_b = max(1, batches)
     n_s = max(1, samples)
@@ -148,12 +149,14 @@ def main():
     print(f"  20-patient experiment | arch={args.arch.upper()}")
     print(f"  Data dir : {args.data_dir}")
     print(f"  Output   : {out_dir}")
+    if args.arch == "local_residual":
+        print(f"  Groups   : {args.groups} {'(T4-optimised)' if args.groups == 1 else '(benchmark groups)'}")
     print(f"{'='*60}\n")
 
-    model     = build_model(args.arch, device)
+    model     = build_model(args.arch, device, groups=args.groups)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-    # ── Resume from checkpoint ────────────────────────────────────
+    # ── Resume ───────────────────────────────────────────────────
     iteration = 0
     best_ssim = -float("inf")
     if args.resume and os.path.exists(ckpt_path):
@@ -163,15 +166,15 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state"])
         iteration = int(ckpt.get("iteration", 0))
         best_ssim = float(ckpt.get("ssim", -float("inf")))
-        print(f"  Resumed at iteration {iteration} | best SSIM so far {best_ssim:.5f}")
+        print(f"  Resumed at iteration {iteration} | best SSIM {best_ssim:.5f}")
     elif args.resume:
-        print(f"  --resume set but no checkpoint found at {ckpt_path}. Starting fresh.")
+        print(f"  --resume set but no checkpoint at {ckpt_path}. Starting fresh.")
 
     if iteration >= args.max_iterations:
-        print(f"  Training already complete ({iteration}/{args.max_iterations}). Nothing to do.")
+        print(f"  Training already complete ({iteration}/{args.max_iterations}).")
         return
 
-    # ── Data loaders ──────────────────────────────────────────
+    # ── Data ──────────────────────────────────────────────────
     train_loader, val_loader = prepare_local_residual_data(
         in_dir=args.data_dir,
         train_patch_size=args.patch_size,
@@ -203,6 +206,7 @@ def main():
 
         meta = {
             "architecture": args.arch,
+            "groups": args.groups,
             "normalization": "benchmark_meanstd",
             "pixel_mean": BENCHMARK_PIXEL_MEAN,
             "pixel_std": BENCHMARK_PIXEL_STD,
@@ -226,7 +230,6 @@ def main():
         if val["ssim"] > best_ssim:
             best_ssim = val["ssim"]
             torch.save(payload, os.path.join(out_dir, "best_model.pt"))
-        # Always save full checkpoint for resume
         torch.save(
             {**payload, "optimizer_state": optimizer.state_dict()},
             ckpt_path,
