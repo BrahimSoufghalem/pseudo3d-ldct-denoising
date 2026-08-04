@@ -2,23 +2,21 @@
 
 Usage
 -----
-# Local (default paths):
-    HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn
-
-# Kaggle (dataset root flat structure):
+# Train RED-CNN:
     HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch redcnn \
-        --data-dir /kaggle/input/ldct-20p \
-        --num-workers 2
+        --arch redcnn --data-dir /kaggle/input/datasets/brahimha/ldct-20p
 
-All three models use identical:
-  - Data pipeline (same 20 patients, same sampling, same mean/std)
-  - Preprocessing  (PydicomReader swap_ij=False, benchmark mean/std)
-  - Loss           (MSE)
-  - Optimizer      (Adam lr=1e-4, beta1=0.9, beta2=0.999)
-  - Precision      (FP32)
-  - Iterations     (20 000 total, val every 1 000)
-  - Checkpoint     (best validation SSIM)
+# Train LocalResidual (our model):
+    HU_RANGE_PRESET=benchmark python train_20p.py \
+        --arch local_residual --data-dir /kaggle/input/datasets/brahimha/ldct-20p
+
+# Resume if interrupted:
+    HU_RANGE_PRESET=benchmark python train_20p.py \
+        --arch local_residual --data-dir /kaggle/input/datasets/brahimha/ldct-20p \
+        --resume
+
+All models use identical protocol:
+  Loss: MSE | Optimizer: Adam lr=1e-4 | Precision: FP32 | 20k iterations
 """
 
 import argparse
@@ -41,7 +39,7 @@ from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
 
-# ── Override the patient split at import time ────────────────────────────────
+# ── Override the patient split ────────────────────────────────────────
 cfg.EXPECTED_TRAIN = TRAIN_20P
 cfg.EXPECTED_VAL = VAL_20P
 
@@ -51,13 +49,11 @@ def parse_args():
     p.add_argument(
         "--arch", required=True,
         choices=["redcnn", "resnet", "local_residual"],
-        help="Architecture to train",
+        help="Architecture: redcnn | local_residual (resnet available but slow on T4)",
     )
     p.add_argument(
         "--data-dir", default=cfg.DATA_DIR,
-        help="Root folder containing train+val patient sub-dirs "
-             "(default: cfg.DATA_DIR = 'dataset'). "
-             "On Kaggle use /kaggle/input/ldct-20p",
+        help="Root folder with train+val patient sub-dirs (default: cfg.DATA_DIR)",
     )
     p.add_argument("--max-iterations", type=int, default=20_000)
     p.add_argument("--iterations-before-val", type=int, default=1_000)
@@ -68,6 +64,10 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--cache-rate", type=float, default=1.0)
     p.add_argument("--output-root", default="runs_20p")
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Resume training from checkpoint.pt if it exists",
+    )
     return p.parse_args()
 
 
@@ -89,24 +89,24 @@ def validate(model, loader, device):
         sums["mse"] += float(F.mse_loss(pred, y))
         batches += 1
         pred_px = denormalize_to_pixel(pred).clamp(0.0, cfg.EVAL_DATA_RANGE)
-        y_px = denormalize_to_pixel(y).clamp(0.0, cfg.EVAL_DATA_RANGE)
-        x_px = denormalize_to_pixel(x).clamp(0.0, cfg.EVAL_DATA_RANGE)
+        y_px    = denormalize_to_pixel(y).clamp(0.0, cfg.EVAL_DATA_RANGE)
+        x_px    = denormalize_to_pixel(x).clamp(0.0, cfg.EVAL_DATA_RANGE)
         body = batch.get("body_type", ["Abdomen"] * pred.shape[0])
         for i in range(pred.shape[0]):
             bt = "Chest" if str(body[i]).lower().startswith("c") else "Abdomen"
-            sums["psnr"] += compute_psnr_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
-            sums["baseline_psnr"] += compute_psnr_windowed(x_px[i].squeeze(), y_px[i].squeeze(), bt)
-            sums["ssim"] += compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
-            sums["rmse"] += compute_rmse_hu(pred_px[i].squeeze(), y_px[i].squeeze())
+            sums["psnr"]         += compute_psnr_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
+            sums["baseline_psnr"] += compute_psnr_windowed(x_px[i].squeeze(),  y_px[i].squeeze(), bt)
+            sums["ssim"]         += compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
+            sums["rmse"]         += compute_rmse_hu(pred_px[i].squeeze(),       y_px[i].squeeze())
             samples += 1
     n_b = max(1, batches)
     n_s = max(1, samples)
     return {
-        "mse": sums["mse"] / n_b,
-        "psnr": sums["psnr"] / n_s,
+        "mse":   sums["mse"] / n_b,
+        "psnr":  sums["psnr"] / n_s,
         "dpsnr": (sums["psnr"] - sums["baseline_psnr"]) / n_s,
-        "ssim": sums["ssim"] / n_s,
-        "rmse": sums["rmse"] / n_s,
+        "ssim":  sums["ssim"] / n_s,
+        "rmse":  sums["rmse"] / n_s,
     }
 
 
@@ -134,15 +134,15 @@ def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
         raise RuntimeError(
-            "Set HU_RANGE_PRESET=benchmark before running this script.\n"
-            "Example: HU_RANGE_PRESET=benchmark python train_20p.py --arch resnet"
+            "Set HU_RANGE_PRESET=benchmark.\n"
+            "Example: HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn"
         )
 
     setup_reproducibility()
     device = get_device()
-
     out_dir = os.path.join(args.output_root, args.arch)
     os.makedirs(out_dir, exist_ok=True)
+    ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
     print(f"\n{'='*60}")
     print(f"  20-patient experiment | arch={args.arch.upper()}")
@@ -150,9 +150,28 @@ def main():
     print(f"  Output   : {out_dir}")
     print(f"{'='*60}\n")
 
-    model = build_model(args.arch, device)
+    model     = build_model(args.arch, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
+    # ── Resume from checkpoint ────────────────────────────────────
+    iteration = 0
+    best_ssim = -float("inf")
+    if args.resume and os.path.exists(ckpt_path):
+        print(f"  Resuming from {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        iteration = int(ckpt.get("iteration", 0))
+        best_ssim = float(ckpt.get("ssim", -float("inf")))
+        print(f"  Resumed at iteration {iteration} | best SSIM so far {best_ssim:.5f}")
+    elif args.resume:
+        print(f"  --resume set but no checkpoint found at {ckpt_path}. Starting fresh.")
+
+    if iteration >= args.max_iterations:
+        print(f"  Training already complete ({iteration}/{args.max_iterations}). Nothing to do.")
+        return
+
+    # ── Data loaders ──────────────────────────────────────────
     train_loader, val_loader = prepare_local_residual_data(
         in_dir=args.data_dir,
         train_patch_size=args.patch_size,
@@ -168,11 +187,11 @@ def main():
     print(f"Optimizer        : Adam(lr={args.lr:.2e}, b1=0.9, b2=0.999)")
     print(f"Precision        : FP32")
     print(f"Checkpoint metric: validation SSIM")
+    if iteration > 0:
+        print(f"Starting from    : iteration {iteration}/{args.max_iterations}")
 
-    iteration = 0
-    best_ssim = -float("inf")
     start = time.time()
-    cycle = 0
+    cycle = iteration // args.iterations_before_val
 
     while iteration < args.max_iterations:
         cycle += 1
@@ -207,9 +226,10 @@ def main():
         if val["ssim"] > best_ssim:
             best_ssim = val["ssim"]
             torch.save(payload, os.path.join(out_dir, "best_model.pt"))
+        # Always save full checkpoint for resume
         torch.save(
             {**payload, "optimizer_state": optimizer.state_dict()},
-            os.path.join(out_dir, "checkpoint.pt"),
+            ckpt_path,
         )
 
         elapsed = time.time() - t0
