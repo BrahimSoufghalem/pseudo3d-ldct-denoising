@@ -1,4 +1,4 @@
-"""Evaluate and compare RED-CNN, ResNet, and LocalResidual on the 20-patient test set.
+"""Evaluate and compare RED-CNN and LocalResidual on the 20-patient test set.
 
 Usage
 -----
@@ -6,7 +6,6 @@ Usage
 
 Requires that models have been trained first via train_20p.py:
     runs_20p/redcnn/best_model.pt
-    runs_20p/resnet/best_model.pt
     runs_20p/local_residual/best_model.pt
 """
 
@@ -44,18 +43,24 @@ ARCH_MAP = {
 def load_checkpoint(path, arch: str, device):
     state = torch.load(path, map_location=device, weights_only=False)
     meta = state.get("meta", {}) if isinstance(state, dict) else {}
+
     if abs(float(meta.get("pixel_mean", BENCHMARK_PIXEL_MEAN)) - BENCHMARK_PIXEL_MEAN) > 1e-6:
         raise RuntimeError(f"[{arch}] pixel_mean mismatch in checkpoint")
     if abs(float(meta.get("pixel_std", BENCHMARK_PIXEL_STD)) - BENCHMARK_PIXEL_STD) > 1e-6:
         raise RuntimeError(f"[{arch}] pixel_std mismatch in checkpoint")
+
     if arch == "redcnn":
         model = RedCNN().to(device)
     elif arch == "resnet":
         model = ResNet().to(device)
     elif arch == "local_residual":
-        model = build_local_residual_model(device, channels=128, blocks=10, groups=8)
+        # Read groups from meta so we match exactly how the model was trained.
+        # Defaults to 1 (T4-trained). Use groups=8 on Blackwell/Ampere checkpoints.
+        groups = int(meta.get("groups", 1))
+        model = build_local_residual_model(device, channels=128, blocks=10, groups=groups)
     else:
         raise ValueError(arch)
+
     weights = state.get("model_state_dict", state)
     model.load_state_dict(weights, strict=True)
     model.eval()
@@ -64,7 +69,7 @@ def load_checkpoint(path, arch: str, device):
 
 @torch.no_grad()
 def evaluate_patient(pid, patient_dir, model, device):
-    low = sort_by_instance_number(glob(str(patient_dir / "Low_Dose" / "*.dcm")))
+    low  = sort_by_instance_number(glob(str(patient_dir / "Low_Dose"  / "*.dcm")))
     full = sort_by_instance_number(glob(str(patient_dir / "Full_Dose" / "*.dcm")))
     if len(low) != len(full):
         raise RuntimeError(f"[{pid}] slice mismatch: {len(low)} vs {len(full)}")
@@ -72,10 +77,10 @@ def evaluate_patient(pid, patient_dir, model, device):
     scores = {k: [] for k in ("psnr", "ssim", "rmse", "vif",
                                "base_psnr", "base_ssim", "base_rmse", "base_vif")}
     for low_path, full_path in tqdm(zip(low, full), total=len(low), desc=f"  {pid}", leave=False):
-        low_hu = load_dicom_tensor(low_path).to(device)
+        low_hu  = load_dicom_tensor(low_path).to(device)
         full_hu = load_dicom_tensor(full_path).to(device)
-        x = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
-        pred_z = model(x)
+        x       = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
+        pred_z  = model(x)
         pred_px = denormalize_to_pixel(pred_z.squeeze()).clamp(0.0, cfg.EVAL_DATA_RANGE)
         full_px = (full_hu + 1024.0).clamp(0.0, cfg.EVAL_DATA_RANGE)
         low_px  = (low_hu  + 1024.0).clamp(0.0, cfg.EVAL_DATA_RANGE)
@@ -129,8 +134,8 @@ def print_comparison(all_dfs: dict):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--runs-root", default="runs_20p")
-    p.add_argument("--test-dir", default=cfg.TEST_DIR)
-    p.add_argument("--output", default="eval_20p")
+    p.add_argument("--test-dir",  default=cfg.TEST_DIR)
+    p.add_argument("--output",    default="eval_20p")
     args = p.parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
         raise RuntimeError("Run with HU_RANGE_PRESET=benchmark")
@@ -138,12 +143,14 @@ def main():
     device = get_device()
     out_path = Path(args.output)
     out_path.mkdir(parents=True, exist_ok=True)
+
     test_patients = sorted([
-        p for p in Path(args.test_dir).iterdir()
-        if p.is_dir() and p.name in TEST_20P
-        and (p / "Low_Dose").exists() and (p / "Full_Dose").exists()
+        d for d in Path(args.test_dir).iterdir()
+        if d.is_dir() and d.name in TEST_20P
+        and (d / "Low_Dose").exists() and (d / "Full_Dose").exists()
     ])
-    print(f"Test patients: {[p.name for p in test_patients]}")
+    print(f"Test patients: {[d.name for d in test_patients]}")
+
     all_dfs = {}
     for arch in ["redcnn", "resnet", "local_residual"]:
         ckpt = Path(args.runs_root) / arch / "best_model.pt"
@@ -151,15 +158,21 @@ def main():
             print(f"  Skipping {arch}: {ckpt} not found")
             continue
         print(f"\nEvaluating {ARCH_MAP[arch]} ...")
-        model = load_checkpoint(str(ckpt), arch, device)
-        rows = [evaluate_patient(p.name, p, model, device) for p in test_patients]
+        try:
+            model = load_checkpoint(str(ckpt), arch, device)
+        except Exception as e:
+            print(f"  ERROR loading {arch}: {e}")
+            continue
+        rows = [evaluate_patient(d.name, d, model, device) for d in test_patients]
         df = pd.DataFrame(rows)
         df["Model"] = ARCH_MAP[arch]
         all_dfs[arch] = df
         df.to_csv(out_path / f"{arch}_results.csv", index=False)
+
     if not all_dfs:
         print("No checkpoints found. Train first with train_20p.py.")
         return
+
     print_comparison(all_dfs)
     pd.concat(all_dfs.values(), ignore_index=True).to_csv(
         out_path / "comparison_20p.csv", index=False
