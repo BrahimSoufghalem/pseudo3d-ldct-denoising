@@ -1,13 +1,14 @@
-"""Unified 20-patient trainer for RED-CNN, ResNet, and LocalResidual.
+"""Unified trainer for RED-CNN, ResNet, and LocalResidual.
 
 Usage
 -----
-# Train on Kaggle T4 (groups=1 default, fast):
+# Full 100-patient training (default):
     HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch redcnn --data-dir /kaggle/input/...
+        --arch local_residual --data-dir /path/to/data
 
+# Reproduce the 20-patient Kaggle experiment:
     HU_RANGE_PRESET=benchmark python train_20p.py \
-        --arch local_residual --data-dir /kaggle/input/...
+        --arch local_residual --data-dir /path/to/data --split 20p
 
 # Resume if interrupted:
     ... same command + --resume
@@ -36,40 +37,52 @@ from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
 
-# ── Override the patient split ────────────────────────────────────────
-cfg.EXPECTED_TRAIN = TRAIN_20P
-cfg.EXPECTED_VAL = VAL_20P
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="20-patient fair comparison trainer")
+    p = argparse.ArgumentParser(
+        description="Fair comparison trainer — supports 20-patient and full 100-patient splits"
+    )
     p.add_argument(
         "--arch", required=True,
         choices=["redcnn", "resnet", "local_residual"],
     )
     p.add_argument(
         "--data-dir", default=cfg.DATA_DIR,
-        help="Root folder with train+val patient sub-dirs",
+        help="Root folder containing patient sub-directories",
     )
-    p.add_argument("--max-iterations", type=int, default=20_000)
-    p.add_argument("--iterations-before-val", type=int, default=1_000)
+    p.add_argument(
+        "--split", choices=["20p", "100p"], default="100p",
+        help="Patient split to use. '100p' uses the full config split (default). "
+             "'20p' uses the 20-patient Kaggle experiment subset.",
+    )
+    p.add_argument("--max-iterations", type=int, default=100_000)
+    p.add_argument("--iterations-before-val", type=int, default=2_500)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--patch-size", type=int, default=64)
     p.add_argument("--val-patch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--cache-rate", type=float, default=1.0)
-    p.add_argument("--output-root", default="runs_20p")
+    p.add_argument("--output-root", default="runs")
     p.add_argument(
         "--groups", type=int, default=1,
         help="Groups for LocalResidual middle conv. "
-             "Default=1 (fast on T4). Use 8 on Blackwell/Ampere.",
+             "Default=1 (fast on T4/Turing). Use 8 on Blackwell/Ampere.",
     )
     p.add_argument(
         "--resume", action="store_true",
         help="Resume training from checkpoint.pt if it exists",
     )
     return p.parse_args()
+
+
+def apply_split(split: str):
+    """Override cfg.EXPECTED_TRAIN/VAL according to the requested split."""
+    if split == "20p":
+        cfg.EXPECTED_TRAIN = TRAIN_20P
+        cfg.EXPECTED_VAL = VAL_20P
+        return len(TRAIN_20P), len(VAL_20P)
+    # "100p" — use whatever is already in config.py (full split)
+    return len(cfg.EXPECTED_TRAIN), len(cfg.EXPECTED_VAL)
 
 
 def build_model(arch: str, device, groups: int = 1):
@@ -139,24 +152,29 @@ def main():
             "Example: HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn"
         )
 
+    n_train, n_val = apply_split(args.split)
+
     setup_reproducibility()
-    device = get_device()
-    out_dir = os.path.join(args.output_root, args.arch)
+    device   = get_device()
+    out_dir  = os.path.join(args.output_root, args.arch)
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
     print(f"\n{'='*60}")
-    print(f"  20-patient experiment | arch={args.arch.upper()}")
-    print(f"  Data dir : {args.data_dir}")
-    print(f"  Output   : {out_dir}")
+    print(f"  Experiment | arch={args.arch.upper()} | split={args.split}")
+    print(f"  Train patients : {n_train}")
+    print(f"  Val   patients : {n_val}")
+    print(f"  Data dir       : {args.data_dir}")
+    print(f"  Output         : {out_dir}")
     if args.arch == "local_residual":
-        print(f"  Groups   : {args.groups} {'(T4-optimised)' if args.groups == 1 else '(benchmark groups)'}")
+        print(f"  Groups         : {args.groups} "
+              f"{'(T4-optimised)' if args.groups == 1 else '(benchmark groups)'}")
     print(f"{'='*60}\n")
 
     model     = build_model(args.arch, device, groups=args.groups)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-    # ── Resume ───────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────
     iteration = 0
     best_ssim = -float("inf")
     if args.resume and os.path.exists(ckpt_path):
@@ -174,7 +192,7 @@ def main():
         print(f"  Training already complete ({iteration}/{args.max_iterations}).")
         return
 
-    # ── Data ──────────────────────────────────────────────────
+    # ── Data ───────────────────────────────────────────────
     train_loader, val_loader = prepare_local_residual_data(
         in_dir=args.data_dir,
         train_patch_size=args.patch_size,
@@ -205,26 +223,27 @@ def main():
         val = validate(model, val_loader, device)
 
         meta = {
-            "architecture": args.arch,
-            "groups": args.groups,
-            "normalization": "benchmark_meanstd",
-            "pixel_mean": BENCHMARK_PIXEL_MEAN,
-            "pixel_std": BENCHMARK_PIXEL_STD,
-            "pixel_domain": "HU+1024",
-            "hu_preset": cfg.HU_RANGE_PRESET,
+            "architecture":    args.arch,
+            "split":           args.split,
+            "groups":          args.groups,
+            "normalization":   "benchmark_meanstd",
+            "pixel_mean":      BENCHMARK_PIXEL_MEAN,
+            "pixel_std":       BENCHMARK_PIXEL_STD,
+            "pixel_domain":    "HU+1024",
+            "hu_preset":       cfg.HU_RANGE_PRESET,
             "eval_data_range": cfg.EVAL_DATA_RANGE,
-            "loss": "MSE",
-            "input_mode": "2d",
-            "n_train_patients": len(TRAIN_20P),
-            "n_val_patients": len(VAL_20P),
+            "loss":            "MSE",
+            "input_mode":      "2d",
+            "n_train_patients": n_train,
+            "n_val_patients":   n_val,
         }
         payload = {
             "model_state_dict": get_state_dict(model),
-            "meta": meta,
+            "meta":      meta,
             "iteration": iteration,
-            "ssim": val["ssim"],
-            "psnr": val["psnr"],
-            "val_mse": val["mse"],
+            "ssim":      val["ssim"],
+            "psnr":      val["psnr"],
+            "val_mse":   val["mse"],
         }
         torch.save(payload, os.path.join(out_dir, "last_model.pt"))
         if val["ssim"] > best_ssim:
