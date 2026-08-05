@@ -1,11 +1,10 @@
-"""Dense local residual network - direct reconstruction (v2).
+"""Dense local residual-noise control trained independently from scratch.
 
-v1: noise subtraction  →  output = input - noise_map
-v2: direct output      →  output = f(input)          [current, like RED-CNN]
+v1: noise subtraction  →  output = input - noise_map   [current, best result]
+v2: direct output      →  tested, performed worse than v1 on 20 patients
 
-Same blocks, same parameter count. Only the final mapping changed.
-Trained from scratch with no pretrained weights, teacher, attention,
-dilation, pooling, Mamba, NAFNet, or spectral branch.
+Uses no pretrained weights, teacher, attention, dilation, pooling,
+Mamba, NAFNet, or spectral branch.
 """
 
 import torch.nn as nn
@@ -27,16 +26,12 @@ class LocalResidualBlock(nn.Module):
         )
 
     def forward(self, x):
+        # Full-strength residual; deliberately no learned or fixed scale.
         return x + self.branch(x)
 
 
 class LocalResidualNet(nn.Module):
-    """Directly predict denoised LDCT from standardized input (v2).
-
-    Unlike v1 (noise subtraction), the network learns the clean image
-    mapping f(x) directly, the same as RED-CNN. The residual blocks
-    are kept unchanged.
-    """
+    """Predict standardized noise and subtract it from standardized LDCT (v1)."""
 
     def __init__(self, channels=128, blocks=10, groups=8, verbose=True):
         super().__init__()
@@ -53,31 +48,35 @@ class LocalResidualNet(nn.Module):
         self.out_conv = nn.Conv2d(self.channels, 1, 3, padding=1)
         if verbose:
             print(
-                "Initializing LocalResidualNet v2 | 2D | "
+                "Initializing LocalResidualNet v1 | 2D | "
                 f"channels={self.channels} | blocks={self.n_blocks} | "
                 f"groups={self.conv_groups} | RF~{self.receptive_field()} | "
-                "direct-reconstruction | residual-scale=none"
+                "noise-subtraction | residual-scale=none"
             )
 
     def receptive_field(self):
+        # 9x9 input + two 3x3 convolutions per block + 3x3 output.
         return 1 + 8 + self.n_blocks * 4 + 2
 
     def model_config(self):
         return {
-            "channels":   self.channels,
-            "blocks":     self.n_blocks,
-            "groups":     self.conv_groups,
-            "output_mode": "direct",
+            "channels":    self.channels,
+            "blocks":      self.n_blocks,
+            "groups":      self.conv_groups,
+            "output_mode": "noise_subtraction",
         }
 
-    def forward(self, x):
-        """Direct reconstruction: predict denoised image, not noise map."""
+    def predict_noise(self, x):
         if x.ndim != 4 or x.shape[1] != 1:
-            raise ValueError(f"Expected [B,1,H,W], got {tuple(x.shape)}")
+            raise ValueError(f"Expected standardized [B,1,H,W], got {tuple(x.shape)}")
         z = self.in_conv(x)
         for block in self.blocks:
             z = block(z)
         return self.out_conv(z)
+
+    def forward(self, x):
+        """Noise subtraction: predict noise map then subtract from input."""
+        return x - self.predict_noise(x)
 
 
 def build_local_residual_model(device, **kwargs):
