@@ -3,11 +3,11 @@
 Usage
 -----
 # Full 100-patient split (default, 10 test patients):
-    HU_RANGE_PRESET=benchmark python evaluate_20p.py \
+    HU_RANGE_PRESET=benchmark python evaluate_20p.py \\
         --test-dir /path/to/test --runs-root runs_100p --output eval_100p
 
 # Reproduce the 20-patient Kaggle experiment (5 test patients):
-    HU_RANGE_PRESET=benchmark python evaluate_20p.py \
+    HU_RANGE_PRESET=benchmark python evaluate_20p.py \\
         --test-dir /path/to/test --runs-root runs_20p --output eval_20p --split 20p
 """
 
@@ -43,10 +43,8 @@ ARCH_MAP = {
 
 
 def get_test_set(split: str) -> set:
-    """Return the set of patient IDs to evaluate on."""
     if split == "20p":
         return TEST_20P
-    # 100p — use the full test split from config.py
     return cfg.EXPECTED_TEST
 
 
@@ -64,10 +62,27 @@ def load_checkpoint(path: str, arch: str, device):
     elif arch == "resnet":
         model = ResNet().to(device)
     elif arch == "local_residual":
-        # Read groups from checkpoint meta so we match the training config.
-        # Defaults to 1 (T4 / groups=1 training). Use 8 for Blackwell/Ampere runs.
-        groups = int(meta.get("groups", 1))
-        model  = build_local_residual_model(device, channels=128, blocks=10, groups=groups)
+        # Read ALL architecture flags from meta so the rebuilt model
+        # matches exactly what was trained — including optional components.
+        groups        = int(meta.get("groups",        1))
+        use_hu_gate   = bool(meta.get("use_hu_gate",   False))
+        use_freq_boost = bool(meta.get("use_freq_boost", False))
+
+        # Log which components are active so the user can verify.
+        active = []
+        if use_hu_gate:    active.append("hu-gate")
+        if use_freq_boost: active.append("freq-boost")
+        tag = f" [{'+'.join(active)}]" if active else " [baseline]"
+        print(f"  Rebuilding LocalResidualNet | groups={groups}{tag}")
+
+        model = build_local_residual_model(
+            device,
+            channels=128,
+            blocks=10,
+            groups=groups,
+            use_hu_gate=use_hu_gate,
+            use_freq_boost=use_freq_boost,
+        )
     else:
         raise ValueError(f"Unknown arch: {arch}")
 
@@ -155,15 +170,10 @@ def print_comparison(all_dfs: dict, split: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--runs-root", default="runs",
-                   help="Root folder containing arch sub-dirs with best_model.pt")
-    p.add_argument("--test-dir",  default=cfg.TEST_DIR,
-                   help="Folder containing test patient sub-directories")
-    p.add_argument("--output",    default="eval_results",
-                   help="Output folder for CSV reports")
-    p.add_argument("--split", choices=["20p", "100p"], default="100p",
-                   help="Patient split. '100p' uses cfg.EXPECTED_TEST (default). "
-                        "'20p' uses the 20-patient subset.")
+    p.add_argument("--runs-root", default="runs")
+    p.add_argument("--test-dir",  default=cfg.TEST_DIR)
+    p.add_argument("--output",    default="eval_results")
+    p.add_argument("--split", choices=["20p", "100p"], default="100p")
     args = p.parse_args()
 
     if cfg.HU_RANGE_PRESET != "benchmark":
