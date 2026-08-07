@@ -1,28 +1,17 @@
-"""Unified trainer supporting five independently toggleable improvements.
+"""Unified trainer supporting six independently toggleable improvements.
 
 Usage
 -----
-# Baseline (all improvements OFF):
+# Baseline:
     HU_RANGE_PRESET=benchmark python train_20p.py --arch local_residual \\
         --data-dir /path/to/data
 
-# Only HU-gate:
-    ... --use-hu-gate
+# Only parallel multi-resolution branches:
+    ... --use-multi-res
 
-# Only mu-aware FiLM modulation at midpoint:
-    ... --use-mu-mod
-
-# Only dilated multi-scale context:
-    ... --use-dilation
-
-# Only frequency boost:
-    ... --use-freq-boost
-
-# Only HU-bin loss (weight 0.1):
-    ... --hu-bin-loss 0.1
-
-# All five together:
-    ... --use-hu-gate --use-mu-mod --use-dilation --use-freq-boost --hu-bin-loss 0.1
+# All six improvements:
+    ... --use-hu-gate --use-mu-mod --use-multi-res --use-dilation \\
+        --use-freq-boost --hu-bin-loss 0.1
 
 # 20-patient Kaggle experiment:
     ... --split 20p
@@ -54,18 +43,12 @@ from utils import setup_reproducibility, get_device, get_state_dict
 # ──────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fair comparison trainer with five optional physics improvements"
+        description="Fair comparison trainer with six optional physics improvements"
     )
-    # ── Required
     p.add_argument("--arch", required=True,
                    choices=["redcnn", "resnet", "local_residual"])
-
-    # ── Data & split
     p.add_argument("--data-dir", default=cfg.DATA_DIR)
-    p.add_argument("--split", choices=["20p", "100p"], default="100p",
-                   help="'100p' = full config split (default), '20p' = Kaggle subset")
-
-    # ── Training schedule
+    p.add_argument("--split", choices=["20p", "100p"], default="100p")
     p.add_argument("--max-iterations",        type=int,   default=100_000)
     p.add_argument("--iterations-before-val", type=int,   default=2_500)
     p.add_argument("--batch-size",            type=int,   default=64)
@@ -76,57 +59,53 @@ def parse_args():
     p.add_argument("--cache-rate",            type=float, default=1.0)
     p.add_argument("--output-root",           default="runs")
     p.add_argument("--groups",                type=int,   default=1,
-                   help="Groups for middle conv. Default=1 (T4). Use 8 on Blackwell/Ampere.")
+                   help="Groups for middle conv. Default=1 (T4).")
     p.add_argument("--resume", action="store_true")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # IMPROVEMENT FLAGS — all default to OFF
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Improvement flags — all default OFF ─────────────────────────────────
     p.add_argument(
         "--use-hu-gate", action="store_true",
         help="[1] SE-like HU-context gating inside each block.",
     )
     p.add_argument(
         "--use-mu-mod", action="store_true",
-        help="[2] mu-aware FiLM modulation (gamma*F+beta) inserted at --mu-split. "
-             "Generates tissue-aware scale/shift from global HU context of input.",
+        help="[2] mu-aware FiLM modulation at network midpoint.",
     )
     p.add_argument(
         "--mu-split", type=int, default=None,
-        help="Block index after which mu-mod is applied (default: blocks//2 = 5). "
-             "Must be in [1, blocks-1].",
+        help="Block after which mu-mod is applied (default: blocks//2=5).",
+    )
+    p.add_argument(
+        "--use-multi-res", action="store_true",
+        help="[3] Parallel multi-resolution branches: full + down-x2 + down-x4. "
+             "Network sees fine details (full res), medium structures (x2), "
+             "and large structures (x4) simultaneously.",
     )
     p.add_argument(
         "--use-dilation", action="store_true",
-        help="[3] Lightweight dilated depthwise conv (dilation=2) per block.",
+        help="[4] Lightweight dilated depthwise conv (dilation=2) per block.",
     )
     p.add_argument(
         "--use-freq-boost", action="store_true",
-        help="[4] Learnable Laplacian high-freq boost inside each block.",
+        help="[5] Learnable Laplacian high-freq boost inside each block.",
     )
     p.add_argument(
         "--hu-bin-loss", type=float, default=0.0, metavar="WEIGHT",
-        help="[5] Weight of HU-bin bias loss added to MSE. 0.0 = disabled.",
+        help="[6] HU-bin systematic-bias penalty weight. 0.0 = disabled.",
     )
-    p.add_argument(
-        "--hu-bin-bins", type=int, default=16,
-    )
+    p.add_argument("--hu-bin-bins", type=int, default=16)
     return p.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────────────────
-def hu_bin_bias_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    n_bins: int = 16,
-) -> torch.Tensor:
+def hu_bin_bias_loss(pred, target, n_bins=16):
     t_min = target.detach().min()
     t_max = target.detach().max()
     if (t_max - t_min).item() < 1e-6:
         return pred.new_zeros(())
     edges = torch.linspace(t_min.item(), t_max.item(), n_bins + 1,
                            device=target.device)
-    loss  = pred.new_zeros(())
+    loss = pred.new_zeros(())
     count = 0
     for i in range(n_bins):
         mask = (target >= edges[i]) & (target < edges[i + 1])
@@ -138,8 +117,7 @@ def hu_bin_bias_loss(
     return loss / max(1, count)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-def apply_split(split: str):
+def apply_split(split):
     if split == "20p":
         cfg.EXPECTED_TRAIN = TRAIN_20P
         cfg.EXPECTED_VAL   = VAL_20P
@@ -147,7 +125,7 @@ def apply_split(split: str):
     return len(cfg.EXPECTED_TRAIN), len(cfg.EXPECTED_VAL)
 
 
-def build_model(arch: str, device, args):
+def build_model(arch, device, args):
     if arch == "local_residual":
         return build_local_residual_model(
             device,
@@ -159,6 +137,7 @@ def build_model(arch: str, device, args):
             use_dilation=args.use_dilation,
             use_mu_mod=args.use_mu_mod,
             mu_split=args.mu_split,
+            use_multi_res=args.use_multi_res,
         )
     return build_benchmark_model(arch, device)
 
@@ -197,7 +176,7 @@ def validate(model, loader, device):
 
 
 def train_cycle(model, loader, optimizer, device, iteration, max_iter,
-                hu_bin_loss_weight: float = 0.0, hu_bin_bins: int = 16):
+                hu_bin_loss_weight=0.0, hu_bin_bins=16):
     model.train()
     total = count = 0.0
     bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
@@ -238,15 +217,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
-    # ── Banner ──────────────────────────────────────────────────────────
+    # ── Banner
     active = []
     if args.use_hu_gate:       active.append("HU-gate")
-    if args.use_mu_mod:
-        split_str = str(args.mu_split) if args.mu_split else "auto"
-        active.append(f"mu-mod@{split_str}")
+    if args.use_mu_mod:        active.append(f"mu-mod@{args.mu_split or 'auto'}")
+    if args.use_multi_res:     active.append("Multi-Res(3+3+3|1)")
     if args.use_dilation:      active.append("Dilation-2")
     if args.use_freq_boost:    active.append("Freq-boost")
-    if args.hu_bin_loss > 0.0: active.append(f"HU-bin-loss(w={args.hu_bin_loss})")
+    if args.hu_bin_loss > 0.0: active.append(f"HU-bin(w={args.hu_bin_loss})")
     active_str = ", ".join(active) if active else "none (baseline)"
 
     print(f"\n{'='*64}")
@@ -254,15 +232,11 @@ def main():
     print(f"  Train patients : {n_train}  |  Val patients: {n_val}")
     print(f"  Data dir       : {args.data_dir}")
     print(f"  Output         : {out_dir}")
-    if args.arch == "local_residual":
-        print(f"  Groups         : {args.groups} "
-              f"{'(T4)' if args.groups == 1 else '(Blackwell/Ampere)'}")
     print(f"{'='*64}\n")
 
     model     = build_model(args.arch, device, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-    # ── Resume ──────────────────────────────────────────────────────────
     iteration = 0
     best_ssim = -float("inf")
     if args.resume and os.path.exists(ckpt_path):
@@ -280,7 +254,6 @@ def main():
         print(f"  Training already complete ({iteration}/{args.max_iterations}).")
         return
 
-    # ── Data ──────────────────────────────────────────────────────────
     train_loader, val_loader = prepare_local_residual_data(
         in_dir=args.data_dir,
         train_patch_size=args.patch_size,
@@ -294,15 +267,13 @@ def main():
 
     loss_desc = "MSE"
     if args.hu_bin_loss > 0.0:
-        loss_desc += f" + {args.hu_bin_loss} × HU-bin-bias({args.hu_bin_bins} bins)"
-    print(f"Loss             : {loss_desc}")
-    print(f"Optimizer        : Adam(lr={args.lr:.2e}, b1=0.9, b2=0.999)")
-    print(f"Checkpoint metric: validation SSIM")
-    if iteration > 0:
-        print(f"Starting from    : iter {iteration}/{args.max_iterations}")
+        loss_desc += f" + {args.hu_bin_loss} x HU-bin-bias({args.hu_bin_bins} bins)"
+    print(f"Loss      : {loss_desc}")
+    print(f"Optimizer : Adam(lr={args.lr:.2e})")
 
     start = time.time()
     cycle = iteration // args.iterations_before_val
+    eff_mu_split = args.mu_split if args.mu_split is not None else 10 // 2
 
     while iteration < args.max_iterations:
         cycle += 1
@@ -315,9 +286,6 @@ def main():
         )
         val = validate(model, val_loader, device)
 
-        # Resolve effective mu_split for meta storage
-        eff_mu_split = args.mu_split if args.mu_split is not None else 10 // 2
-
         meta = {
             "architecture":    args.arch,
             "split":           args.split,
@@ -327,6 +295,7 @@ def main():
             "use_dilation":    args.use_dilation,
             "use_mu_mod":      args.use_mu_mod,
             "mu_split":        eff_mu_split,
+            "use_multi_res":   args.use_multi_res,
             "hu_bin_loss":     args.hu_bin_loss,
             "normalization":   "benchmark_meanstd",
             "pixel_mean":      BENCHMARK_PIXEL_MEAN,
