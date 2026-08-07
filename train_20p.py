@@ -1,4 +1,4 @@
-"""Unified trainer supporting three independently toggleable improvements.
+"""Unified trainer supporting four independently toggleable improvements.
 
 Usage
 -----
@@ -9,14 +9,17 @@ Usage
 # Only HU-gate:
     ... --use-hu-gate
 
+# Only dilated multi-scale context:
+    ... --use-dilation
+
 # Only frequency boost:
     ... --use-freq-boost
 
 # Only HU-bin loss (weight 0.1):
     ... --hu-bin-loss 0.1
 
-# All three together:
-    ... --use-hu-gate --use-freq-boost --hu-bin-loss 0.1
+# All four together:
+    ... --use-hu-gate --use-dilation --use-freq-boost --hu-bin-loss 0.1
 
 # 20-patient Kaggle experiment:
     ... --split 20p
@@ -48,7 +51,7 @@ from utils import setup_reproducibility, get_device, get_state_dict
 # ──────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fair comparison trainer with three optional physics improvements"
+        description="Fair comparison trainer with four optional physics improvements"
     )
     # ── Required
     p.add_argument("--arch", required=True,
@@ -60,16 +63,16 @@ def parse_args():
                    help="'100p' = full config split (default), '20p' = Kaggle subset")
 
     # ── Training schedule
-    p.add_argument("--max-iterations",       type=int,   default=100_000)
-    p.add_argument("--iterations-before-val",type=int,   default=2_500)
-    p.add_argument("--batch-size",           type=int,   default=64)
-    p.add_argument("--patch-size",           type=int,   default=64)
-    p.add_argument("--val-patch-size",       type=int,   default=128)
-    p.add_argument("--lr",                   type=float, default=1e-4)
-    p.add_argument("--num-workers",          type=int,   default=2)
-    p.add_argument("--cache-rate",           type=float, default=1.0)
-    p.add_argument("--output-root",          default="runs")
-    p.add_argument("--groups",               type=int,   default=1,
+    p.add_argument("--max-iterations",        type=int,   default=100_000)
+    p.add_argument("--iterations-before-val", type=int,   default=2_500)
+    p.add_argument("--batch-size",            type=int,   default=64)
+    p.add_argument("--patch-size",            type=int,   default=64)
+    p.add_argument("--val-patch-size",        type=int,   default=128)
+    p.add_argument("--lr",                    type=float, default=1e-4)
+    p.add_argument("--num-workers",           type=int,   default=2)
+    p.add_argument("--cache-rate",            type=float, default=1.0)
+    p.add_argument("--output-root",           default="runs")
+    p.add_argument("--groups",                type=int,   default=1,
                    help="Groups for middle conv. Default=1 (T4). Use 8 on Blackwell/Ampere.")
     p.add_argument("--resume", action="store_true")
 
@@ -78,17 +81,21 @@ def parse_args():
     # ──────────────────────────────────────────────────────────────────────────
     p.add_argument(
         "--use-hu-gate", action="store_true",
-        help="[Improvement 1] SE-like HU-context gating inside each block. "
-             "Learns to apply different filtering strength per HU range.",
+        help="[Improvement 1] SE-like HU-context gating inside each block.",
+    )
+    p.add_argument(
+        "--use-dilation", action="store_true",
+        help="[Improvement 2] Lightweight dilated depthwise conv (dilation=2) per block. "
+             "Gives 5x5 effective RF alongside the 3x3 main branch — "
+             "adds multi-scale context without downsampling.",
     )
     p.add_argument(
         "--use-freq-boost", action="store_true",
-        help="[Improvement 2] Learnable Laplacian high-freq boost inside each block. "
-             "alpha=0 at init (no-op), grows toward preserving texture details.",
+        help="[Improvement 3] Learnable Laplacian high-freq boost inside each block.",
     )
     p.add_argument(
         "--hu-bin-loss", type=float, default=0.0, metavar="WEIGHT",
-        help="[Improvement 3] Weight of HU-bin bias loss added to MSE. "
+        help="[Improvement 4] Weight of HU-bin bias loss added to MSE. "
              "0.0 = disabled (default). Typical value: 0.1",
     )
     p.add_argument(
@@ -104,19 +111,11 @@ def hu_bin_bias_loss(
     target: torch.Tensor,
     n_bins: int = 16,
 ) -> torch.Tensor:
-    """Penalize systematic per-HU-bin bias (not random error — MSE handles that).
-
-    For each HU bin, computes the mean prediction error (signed bias) and
-    penalizes its square. A model that consistently over-smooths lung voxels
-    (low HU) will produce a large negative bias in those bins → high loss.
-
-    Works in standardized space, so no HU conversion is needed.
-    """
+    """Penalize systematic per-HU-bin bias (not random error — MSE handles that)."""
     t_min = target.detach().min()
     t_max = target.detach().max()
     if (t_max - t_min).item() < 1e-6:
         return pred.new_zeros(())
-
     edges = torch.linspace(t_min.item(), t_max.item(), n_bins + 1,
                            device=target.device)
     loss  = pred.new_zeros(())
@@ -149,6 +148,7 @@ def build_model(arch: str, device, args):
             groups=args.groups,
             use_hu_gate=args.use_hu_gate,
             use_freq_boost=args.use_freq_boost,
+            use_dilation=args.use_dilation,
         )
     return build_benchmark_model(arch, device)
 
@@ -156,7 +156,7 @@ def build_model(arch: str, device, args):
 @torch.no_grad()
 def validate(model, loader, device):
     model.eval()
-    sums   = dict(mse=0.0, psnr=0.0, ssim=0.0, rmse=0.0, baseline_psnr=0.0)
+    sums    = dict(mse=0.0, psnr=0.0, ssim=0.0, rmse=0.0, baseline_psnr=0.0)
     batches = samples = 0
     for batch in tqdm(loader, desc="  Val", leave=False, dynamic_ncols=True):
         x    = batch["image"].to(device, non_blocking=True)
@@ -197,15 +197,12 @@ def train_cycle(model, loader, optimizer, device, iteration, max_iter,
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-
         pred = model(x)
         loss = F.mse_loss(pred, y)
-
         if hu_bin_loss_weight > 0.0:
             loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(
                 pred, y, n_bins=hu_bin_bins
             )
-
         loss.backward()
         optimizer.step()
         iteration += 1
@@ -231,11 +228,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
-    # ── Banner ───────────────────────────────────────────────────────────
+    # ── Banner ──────────────────────────────────────────────────────────
     active = []
-    if args.use_hu_gate:          active.append("HU-gate")
-    if args.use_freq_boost:       active.append("Freq-boost")
-    if args.hu_bin_loss > 0.0:    active.append(f"HU-bin-loss(w={args.hu_bin_loss})")
+    if args.use_hu_gate:       active.append("HU-gate")
+    if args.use_dilation:      active.append("Dilation-2")
+    if args.use_freq_boost:    active.append("Freq-boost")
+    if args.hu_bin_loss > 0.0: active.append(f"HU-bin-loss(w={args.hu_bin_loss})")
     active_str = ", ".join(active) if active else "none (baseline)"
 
     print(f"\n{'='*64}")
@@ -251,7 +249,7 @@ def main():
     model     = build_model(args.arch, device, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-    # ── Resume ───────────────────────────────────────────────────────────
+    # ── Resume ──────────────────────────────────────────────────────────
     iteration = 0
     best_ssim = -float("inf")
     if args.resume and os.path.exists(ckpt_path):
@@ -269,7 +267,7 @@ def main():
         print(f"  Training already complete ({iteration}/{args.max_iterations}).")
         return
 
-    # ── Data ───────────────────────────────────────────────────────────
+    # ── Data ──────────────────────────────────────────────────────────
     train_loader, val_loader = prepare_local_residual_data(
         in_dir=args.data_dir,
         train_patch_size=args.patch_size,
@@ -310,6 +308,7 @@ def main():
             "groups":          args.groups,
             "use_hu_gate":     args.use_hu_gate,
             "use_freq_boost":  args.use_freq_boost,
+            "use_dilation":    args.use_dilation,
             "hu_bin_loss":     args.hu_bin_loss,
             "normalization":   "benchmark_meanstd",
             "pixel_mean":      BENCHMARK_PIXEL_MEAN,
