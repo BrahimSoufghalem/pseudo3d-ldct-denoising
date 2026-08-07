@@ -1,87 +1,90 @@
 """Dense local residual-noise network with optional physics-aware components.
 
-Five independently switchable improvements (all OFF by default):
+Six independently switchable improvements (all OFF by default):
   --use-hu-gate    : SE-like gating conditioned on HU context (per block)
   --use-dilation   : lightweight dilated depthwise context 5x5 RF (per block)
   --use-freq-boost : learnable Laplacian high-freq emphasis (per block)
   --use-mu-mod     : mu-aware FiLM modulation at network midpoint
+  --use-multi-res  : parallel multi-resolution branches (full + down-x2 + down-x4)
   --hu-bin-loss W  : HU-bin systematic-bias penalty (controlled in train_20p.py)
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ──────────────────────────────────────────────────────────────────────────
 class MuAwareModulation(nn.Module):
     """Physics-guided FiLM modulation: F_out = gamma(mu) * F + beta(mu)
 
-    Motivation
-    ----------
-    In CT, Hounsfield Units encode the X-ray attenuation coefficient mu:
-
-        HU = (mu_tissue - mu_water) / mu_water * 1000
-
-    Noise in CT is approximately Poisson-distributed, with variance
-    proportional to mu (denser tissue -> higher attenuation -> lower
-    photon count -> more noise). Tissue types cluster in distinct HU
-    ranges:
-        Lung        ~ -900 HU  (low mu, very noisy patches)
-        Fat         ~ -100 HU
-        Soft tissue ~   50 HU
-        Bone        ~ +400 HU  (high mu, lower noise)
-
-    A single physics-aware recalibration at the network midpoint lets
-    the network apply different denoising strengths per tissue without
-    needing to re-examine HU at every residual block.
-
-    Design
-    ------
-    - Inserted ONCE at blocks//2 (default: after block 5 of 10).
-    - gamma and beta are generated from the GLOBAL HU context of the
-      original standardized LDCT input (AdaptiveAvgPool -> two Conv1x1).
-    - Final layer initialized to zero -> (gamma=1, beta=0) at init,
-      so the module starts as a perfect identity and learns to deviate
-      only where the gradient pushes it.
-    - ~4 K extra parameters for channels=128 (0.13% overhead).
-
-    Why ONE point, not per-block?
-    - HU information is constant across blocks (same input x each time);
-      re-generating gamma/beta at every block is redundant.
-    - --use-hu-gate already performs per-block SE gating on input.
-    - After blocks//2, features carry semantic tissue context (not just
-      raw HU), so modulation is applied at the most informative depth.
+    HU values encode X-ray attenuation mu. Different tissues (lung ~-900,
+    soft tissue ~50, bone ~+400) have distinct noise characteristics.
+    A single FiLM point recalibrates features at a semantically meaningful
+    depth (after multi-res fusion, or at blocks//2 in sequential mode).
+    Initialized to identity (gamma=1, beta=0). ~4K params.
     """
 
     def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
         mid = max(1, channels // reduction)
         self.encoder = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),                       # [B, 1, 1, 1]
+            nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(1, mid, 1, bias=False),
             nn.ReLU(inplace=False),
-            nn.Conv2d(mid, channels * 2, 1, bias=True),   # [B, 2C, 1, 1]
+            nn.Conv2d(mid, channels * 2, 1, bias=True),
         )
-        # Zero-init -> gamma=1 (scale), beta=0 (shift) at start: identity.
         nn.init.zeros_(self.encoder[-1].weight)
         nn.init.zeros_(self.encoder[-1].bias)
 
+    def forward(self, z: torch.Tensor, x_input: torch.Tensor) -> torch.Tensor:
+        params      = self.encoder(x_input)
+        gamma, beta = params.chunk(2, dim=1)
+        return (gamma + 1.0) * z + beta
+
+
+# ──────────────────────────────────────────────────────────────────────────
+class MultiResolutionFusion(nn.Module):
+    """Fuses three parallel resolution branches via a learned 1x1 conv.
+
+    Three branches operate in parallel on the same feature map z0:
+        Full resolution  (z0)          -> LocalResidualBlocks -> z_full
+        Half resolution  (AvgPool x2)  -> LocalResidualBlocks -> z_half
+        Quarter res.     (AvgPool x4)  -> LocalResidualBlocks -> z_qtr
+
+    z_half and z_qtr are upsampled back to full resolution, concatenated,
+    then mixed by a learnable 1x1 conv.
+
+    What each branch sees:
+        Full  (~45px RF): fine noise texture, pixel-level details
+        Half  (~90px RF): medium structures (vessels, organ boundaries)
+        Qtr  (~180px RF): large structures (lung lobes, liver)
+
+    Fusion conv init: weight[c,c,0,0] = weight[c,C+c,0,0] = weight[c,2C+c,0,0] = 1/3
+    => near-identity start, gradient guides specialization.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.fuse = nn.Conv2d(channels * 3, channels, 1, bias=False)
+        nn.init.zeros_(self.fuse.weight)
+        with torch.no_grad():
+            C = channels
+            for c in range(C):
+                self.fuse.weight[c, c,       0, 0] = 1.0 / 3
+                self.fuse.weight[c, C + c,   0, 0] = 1.0 / 3
+                self.fuse.weight[c, 2*C + c, 0, 0] = 1.0 / 3
+
     def forward(
         self,
-        z: torch.Tensor,
-        x_input: torch.Tensor,
+        z_full: torch.Tensor,
+        z_half: torch.Tensor,
+        z_qtr:  torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            z       : intermediate feature map    [B, C, H, W]
-            x_input : original standardized LDCT  [B, 1, H, W]
-        Returns:
-            modulated feature map [B, C, H, W]
-        """
-        params      = self.encoder(x_input)          # [B, 2C, 1, 1]
-        gamma, beta = params.chunk(2, dim=1)          # each [B, C, 1, 1]
-        gamma       = gamma + 1.0                     # identity init: gamma=1
-        return gamma * z + beta
+        H, W = z_full.shape[2], z_full.shape[3]
+        up_half = F.interpolate(z_half, size=(H, W), mode="bilinear", align_corners=False)
+        up_qtr  = F.interpolate(z_qtr,  size=(H, W), mode="bilinear", align_corners=False)
+        return self.fuse(torch.cat([z_full, up_half, up_qtr], dim=1))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -103,7 +106,6 @@ class LocalResidualBlock(nn.Module):
         self.use_freq_boost = use_freq_boost
         self.use_dilation   = use_dilation
 
-        # ── Core branch ─────────────────────────────────────────────────────────
         self.branch = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
@@ -114,7 +116,6 @@ class LocalResidualBlock(nn.Module):
             nn.Conv2d(channels, channels, 1),
         )
 
-        # ── HU-aware gating (--use-hu-gate) ──────────────────────────────────
         if use_hu_gate:
             mid = max(1, channels // 4)
             self.hu_gate = nn.Sequential(
@@ -125,11 +126,9 @@ class LocalResidualBlock(nn.Module):
                 nn.Sigmoid(),
             )
 
-        # ── Dilated multi-scale context (--use-dilation) ──────────────────────
         if use_dilation:
             self.dil_conv  = nn.Conv2d(
-                channels, channels, 3,
-                padding=2, dilation=2,
+                channels, channels, 3, padding=2, dilation=2,
                 groups=channels, bias=False
             )
             self.dil_alpha = nn.Parameter(torch.zeros(channels, 1, 1))
@@ -137,7 +136,6 @@ class LocalResidualBlock(nn.Module):
             w[:, 0, 1, 1] = 1.0
             self.dil_conv.weight.data.copy_(w)
 
-        # ── Frequency boost (--use-freq-boost) ───────────────────────────────
         if use_freq_boost:
             self.freq_conv  = nn.Conv2d(
                 channels, channels, 3, padding=1, groups=channels, bias=False
@@ -161,7 +159,29 @@ class LocalResidualBlock(nn.Module):
 
 # ──────────────────────────────────────────────────────────────────────────
 class LocalResidualNet(nn.Module):
-    """Noise-subtraction net with optional per-block and mid-network physics."""
+    """Noise-subtraction net with optional per-block and mid-network physics.
+
+    With --use-multi-res the forward graph becomes:
+
+        in_conv  (9x9, 1->C)
+             |
+    +--------+------------+------------+
+    |                      |            |
+ Full-res              Down x2      Down x4
+    |                      |            |
+ b//3 blks            b//3 blks    b//3 blks
+    |                      |            |
+    +--------Fusion(concat+1x1)----------+
+                           |
+                  [mu-mod if enabled]
+                           |
+                    remaining blks
+                           |
+                        out_conv  (3x3, C->1)
+
+    Without --use-multi-res: original sequential path.
+    All block-level flags (hu-gate, dilation, freq-boost) work in both modes.
+    """
 
     def __init__(
         self,
@@ -173,35 +193,52 @@ class LocalResidualNet(nn.Module):
         use_dilation: bool = False,
         use_mu_mod: bool = False,
         mu_split: int = None,
+        use_multi_res: bool = False,
         verbose: bool = True,
     ):
         super().__init__()
-        self.channels       = int(channels)
-        self.n_blocks       = int(blocks)
-        self.conv_groups    = int(groups)
-        self.use_hu_gate    = bool(use_hu_gate)
-        self.use_freq_boost = bool(use_freq_boost)
-        self.use_dilation   = bool(use_dilation)
-        self.use_mu_mod     = bool(use_mu_mod)
+        self.channels      = int(channels)
+        self.n_blocks      = int(blocks)
+        self.conv_groups   = int(groups)
+        self.use_hu_gate   = bool(use_hu_gate)
+        self.use_freq_boost= bool(use_freq_boost)
+        self.use_dilation  = bool(use_dilation)
+        self.use_mu_mod    = bool(use_mu_mod)
+        self.use_multi_res = bool(use_multi_res)
         self.mu_split = int(mu_split) if mu_split is not None else self.n_blocks // 2
+
         if self.n_blocks < 1:
             raise ValueError("blocks must be >= 1")
-        if use_mu_mod and not (1 <= self.mu_split < self.n_blocks):
+        if use_mu_mod and not use_multi_res and not (1 <= self.mu_split < self.n_blocks):
             raise ValueError(
                 f"mu_split must be in [1, blocks-1], got {self.mu_split}"
             )
 
         self.in_conv  = nn.Conv2d(1, self.channels, 9, padding=4)
-        self.blocks   = nn.ModuleList([
-            LocalResidualBlock(
+        self.out_conv = nn.Conv2d(self.channels, 1, 3, padding=1)
+
+        def _blk():
+            return LocalResidualBlock(
                 self.channels, self.conv_groups,
                 use_hu_gate=self.use_hu_gate,
                 use_freq_boost=self.use_freq_boost,
                 use_dilation=self.use_dilation,
             )
-            for _ in range(self.n_blocks)
-        ])
-        self.out_conv = nn.Conv2d(self.channels, 1, 3, padding=1)
+
+        if use_multi_res:
+            # n_blocks // 3 per branch; remainder as final sequential blocks.
+            # n_blocks=10 => branch_n=3, final_n=1 => 3+3+3+1=10 total.
+            self.branch_n = max(1, self.n_blocks // 3)
+            self.final_n  = max(0, self.n_blocks - 3 * self.branch_n)
+
+            self.branch_full = nn.ModuleList([_blk() for _ in range(self.branch_n)])
+            self.branch_half = nn.ModuleList([_blk() for _ in range(self.branch_n)])
+            self.branch_qtr  = nn.ModuleList([_blk() for _ in range(self.branch_n)])
+            self.mr_fusion   = MultiResolutionFusion(self.channels)
+            self.final_seq   = nn.ModuleList([_blk() for _ in range(self.final_n)])
+            self.blocks = nn.ModuleList([])   # empty; avoids state-dict mismatch
+        else:
+            self.blocks = nn.ModuleList([_blk() for _ in range(self.n_blocks)])
 
         if use_mu_mod:
             self.mu_mod = MuAwareModulation(self.channels)
@@ -209,15 +246,19 @@ class LocalResidualNet(nn.Module):
         if verbose:
             extras = []
             if self.use_hu_gate:    extras.append("hu-gate")
-            if self.use_mu_mod:     extras.append(f"mu-mod@{self.mu_split}")
+            if self.use_multi_res:
+                extras.append(
+                    f"multi-res({self.branch_n}+{self.branch_n}+{self.branch_n}"
+                    f"|{self.final_n})"
+                )
+            if self.use_mu_mod:     extras.append("mu-mod")
             if self.use_dilation:   extras.append("dilation-2")
             if self.use_freq_boost: extras.append("freq-boost")
             tag = " | " + "+".join(extras) if extras else ""
             print(
                 f"Initializing LocalResidualNet | 2D | "
                 f"channels={self.channels} | blocks={self.n_blocks} | "
-                f"groups={self.conv_groups} | RF~{self.receptive_field()} | "
-                f"noise-subtraction{tag}"
+                f"groups={self.conv_groups} | noise-subtraction{tag}"
             )
 
     def receptive_field(self) -> int:
@@ -233,19 +274,49 @@ class LocalResidualNet(nn.Module):
             "use_dilation":   self.use_dilation,
             "use_mu_mod":     self.use_mu_mod,
             "mu_split":       self.mu_split,
+            "use_multi_res":  self.use_multi_res,
             "output_mode":    "noise_subtraction",
         }
 
     def predict_noise(self, x: torch.Tensor) -> torch.Tensor:
-        """Run encoder blocks, apply mu_mod at midpoint, return predicted noise."""
         if x.ndim != 4 or x.shape[1] != 1:
             raise ValueError(f"Expected [B,1,H,W], got {tuple(x.shape)}")
+
         z = self.in_conv(x)
-        for i, block in enumerate(self.blocks):
-            z = block(z)
-            # Apply mu_mod AFTER the mu_split-th block (1-indexed count)
-            if self.use_mu_mod and i == self.mu_split - 1:
-                z = self.mu_mod(z, x)   # x is the original standardized HU input
+
+        if self.use_multi_res:
+            # Branch 1 — full resolution
+            z_full = z
+            for blk in self.branch_full:
+                z_full = blk(z_full)
+
+            # Branch 2 — half resolution (AvgPool x2)
+            z_half = F.avg_pool2d(z, kernel_size=2, stride=2)
+            for blk in self.branch_half:
+                z_half = blk(z_half)
+
+            # Branch 3 — quarter resolution (AvgPool x4)
+            z_qtr = F.avg_pool2d(z, kernel_size=4, stride=4)
+            for blk in self.branch_qtr:
+                z_qtr = blk(z_qtr)
+
+            # Upsample + concat + 1x1 fusion
+            z = self.mr_fusion(z_full, z_half, z_qtr)
+
+            # mu-mod applied right after fusion
+            if self.use_mu_mod:
+                z = self.mu_mod(z, x)
+
+            # Final sequential blocks
+            for blk in self.final_seq:
+                z = blk(z)
+
+        else:
+            for i, blk in enumerate(self.blocks):
+                z = blk(z)
+                if self.use_mu_mod and i == self.mu_split - 1:
+                    z = self.mu_mod(z, x)
+
         return self.out_conv(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
