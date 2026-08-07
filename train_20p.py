@@ -1,4 +1,4 @@
-"""Unified trainer supporting four independently toggleable improvements.
+"""Unified trainer supporting five independently toggleable improvements.
 
 Usage
 -----
@@ -9,6 +9,9 @@ Usage
 # Only HU-gate:
     ... --use-hu-gate
 
+# Only mu-aware FiLM modulation at midpoint:
+    ... --use-mu-mod
+
 # Only dilated multi-scale context:
     ... --use-dilation
 
@@ -18,8 +21,8 @@ Usage
 # Only HU-bin loss (weight 0.1):
     ... --hu-bin-loss 0.1
 
-# All four together:
-    ... --use-hu-gate --use-dilation --use-freq-boost --hu-bin-loss 0.1
+# All five together:
+    ... --use-hu-gate --use-mu-mod --use-dilation --use-freq-boost --hu-bin-loss 0.1
 
 # 20-patient Kaggle experiment:
     ... --split 20p
@@ -51,7 +54,7 @@ from utils import setup_reproducibility, get_device, get_state_dict
 # ──────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fair comparison trainer with four optional physics improvements"
+        description="Fair comparison trainer with five optional physics improvements"
     )
     # ── Required
     p.add_argument("--arch", required=True,
@@ -81,26 +84,32 @@ def parse_args():
     # ──────────────────────────────────────────────────────────────────────────
     p.add_argument(
         "--use-hu-gate", action="store_true",
-        help="[Improvement 1] SE-like HU-context gating inside each block.",
+        help="[1] SE-like HU-context gating inside each block.",
+    )
+    p.add_argument(
+        "--use-mu-mod", action="store_true",
+        help="[2] mu-aware FiLM modulation (gamma*F+beta) inserted at --mu-split. "
+             "Generates tissue-aware scale/shift from global HU context of input.",
+    )
+    p.add_argument(
+        "--mu-split", type=int, default=None,
+        help="Block index after which mu-mod is applied (default: blocks//2 = 5). "
+             "Must be in [1, blocks-1].",
     )
     p.add_argument(
         "--use-dilation", action="store_true",
-        help="[Improvement 2] Lightweight dilated depthwise conv (dilation=2) per block. "
-             "Gives 5x5 effective RF alongside the 3x3 main branch — "
-             "adds multi-scale context without downsampling.",
+        help="[3] Lightweight dilated depthwise conv (dilation=2) per block.",
     )
     p.add_argument(
         "--use-freq-boost", action="store_true",
-        help="[Improvement 3] Learnable Laplacian high-freq boost inside each block.",
+        help="[4] Learnable Laplacian high-freq boost inside each block.",
     )
     p.add_argument(
         "--hu-bin-loss", type=float, default=0.0, metavar="WEIGHT",
-        help="[Improvement 4] Weight of HU-bin bias loss added to MSE. "
-             "0.0 = disabled (default). Typical value: 0.1",
+        help="[5] Weight of HU-bin bias loss added to MSE. 0.0 = disabled.",
     )
     p.add_argument(
         "--hu-bin-bins", type=int, default=16,
-        help="Number of HU bins for --hu-bin-loss (default: 16)",
     )
     return p.parse_args()
 
@@ -111,7 +120,6 @@ def hu_bin_bias_loss(
     target: torch.Tensor,
     n_bins: int = 16,
 ) -> torch.Tensor:
-    """Penalize systematic per-HU-bin bias (not random error — MSE handles that)."""
     t_min = target.detach().min()
     t_max = target.detach().max()
     if (t_max - t_min).item() < 1e-6:
@@ -149,6 +157,8 @@ def build_model(arch: str, device, args):
             use_hu_gate=args.use_hu_gate,
             use_freq_boost=args.use_freq_boost,
             use_dilation=args.use_dilation,
+            use_mu_mod=args.use_mu_mod,
+            mu_split=args.mu_split,
         )
     return build_benchmark_model(arch, device)
 
@@ -231,6 +241,9 @@ def main():
     # ── Banner ──────────────────────────────────────────────────────────
     active = []
     if args.use_hu_gate:       active.append("HU-gate")
+    if args.use_mu_mod:
+        split_str = str(args.mu_split) if args.mu_split else "auto"
+        active.append(f"mu-mod@{split_str}")
     if args.use_dilation:      active.append("Dilation-2")
     if args.use_freq_boost:    active.append("Freq-boost")
     if args.hu_bin_loss > 0.0: active.append(f"HU-bin-loss(w={args.hu_bin_loss})")
@@ -302,6 +315,9 @@ def main():
         )
         val = validate(model, val_loader, device)
 
+        # Resolve effective mu_split for meta storage
+        eff_mu_split = args.mu_split if args.mu_split is not None else 10 // 2
+
         meta = {
             "architecture":    args.arch,
             "split":           args.split,
@@ -309,6 +325,8 @@ def main():
             "use_hu_gate":     args.use_hu_gate,
             "use_freq_boost":  args.use_freq_boost,
             "use_dilation":    args.use_dilation,
+            "use_mu_mod":      args.use_mu_mod,
+            "mu_split":        eff_mu_split,
             "hu_bin_loss":     args.hu_bin_loss,
             "normalization":   "benchmark_meanstd",
             "pixel_mean":      BENCHMARK_PIXEL_MEAN,
