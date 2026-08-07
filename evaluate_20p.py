@@ -63,14 +63,19 @@ def load_checkpoint(path: str, arch: str, device):
         model = ResNet().to(device)
     elif arch == "local_residual":
         # Read ALL architecture flags from meta so the rebuilt model
-        # matches exactly what was trained — including all optional components.
+        # matches exactly what was trained.
         groups         = int(meta.get("groups",         1))
         use_hu_gate    = bool(meta.get("use_hu_gate",    False))
         use_freq_boost = bool(meta.get("use_freq_boost", False))
         use_dilation   = bool(meta.get("use_dilation",   False))
+        use_mu_mod     = bool(meta.get("use_mu_mod",     False))
+        mu_split       = meta.get("mu_split", None)
+        if mu_split is not None:
+            mu_split = int(mu_split)
 
         active = []
         if use_hu_gate:    active.append("hu-gate")
+        if use_mu_mod:     active.append(f"mu-mod@{mu_split}")
         if use_dilation:   active.append("dilation-2")
         if use_freq_boost: active.append("freq-boost")
         tag = f" [{'+'.join(active)}]" if active else " [baseline]"
@@ -84,6 +89,8 @@ def load_checkpoint(path: str, arch: str, device):
             use_hu_gate=use_hu_gate,
             use_freq_boost=use_freq_boost,
             use_dilation=use_dilation,
+            use_mu_mod=use_mu_mod,
+            mu_split=mu_split,
         )
     else:
         raise ValueError(f"Unknown arch: {arch}")
