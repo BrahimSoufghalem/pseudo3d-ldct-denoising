@@ -2,22 +2,29 @@
 
 Usage
 -----
-# Baseline:
+# Baseline (pure MSE):
     HU_RANGE_PRESET=benchmark python train_20p.py --arch local_residual \\
         --data-dir /path/to/data
+
+# L1 + SSIM loss (recommended, breaks MSE ceiling):
+    ... --ssim-weight 0.5 --l1-weight 0.5
 
 # Only parallel multi-resolution branches:
     ... --use-multi-res
 
-# All six improvements:
+# All improvements + new loss:
     ... --use-hu-gate --use-mu-mod --use-multi-res --use-dilation \\
-        --use-freq-boost --hu-bin-loss 0.1
+        --use-freq-boost --hu-bin-loss 0.1 \\
+        --ssim-weight 0.5 --l1-weight 0.5
 
 # 20-patient Kaggle experiment:
     ... --split 20p
 
 # Resume after interruption:
     ... --resume
+
+Install (once on Kaggle):
+    pip install pytorch-msssim   # required only when --ssim-weight > 0
 """
 
 import argparse
@@ -38,6 +45,13 @@ from local_residual_model import build_local_residual_model
 from metrics import compute_psnr_windowed, compute_ssim_windowed, compute_rmse_hu
 from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
+
+# Optional SSIM loss dependency
+try:
+    from pytorch_msssim import ssim as _pytorch_ssim
+    _HAS_MSSSIM = True
+except ImportError:
+    _HAS_MSSSIM = False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -77,9 +91,7 @@ def parse_args():
     )
     p.add_argument(
         "--use-multi-res", action="store_true",
-        help="[3] Parallel multi-resolution branches: full + down-x2 + down-x4. "
-             "Network sees fine details (full res), medium structures (x2), "
-             "and large structures (x4) simultaneously.",
+        help="[3] Parallel multi-resolution branches: full + down-x2 + down-x4.",
     )
     p.add_argument(
         "--use-dilation", action="store_true",
@@ -94,7 +106,81 @@ def parse_args():
         help="[6] HU-bin systematic-bias penalty weight. 0.0 = disabled.",
     )
     p.add_argument("--hu-bin-bins", type=int, default=16)
+
+    # ── Loss function flags ───────────────────────────────────────────────
+    p.add_argument(
+        "--ssim-weight", type=float, default=0.0, metavar="W",
+        help="[7] Weight of SSIM loss component. 0.0 = disabled (pure MSE). "
+             "Example: --ssim-weight 0.5 --l1-weight 0.5 => pure L1+SSIM. "
+             "Requires: pip install pytorch-msssim",
+    )
+    p.add_argument(
+        "--l1-weight", type=float, default=0.0, metavar="W",
+        help="[8] Weight of L1 (MAE) loss component. 0.0 = disabled. "
+             "Can be combined with --ssim-weight. "
+             "Remaining weight (1 - ssim_w - l1_w) goes to MSE.",
+    )
     return p.parse_args()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+def compute_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ssim_weight: float = 0.0,
+    l1_weight: float = 0.0,
+    hu_bin_loss_weight: float = 0.0,
+    hu_bin_bins: int = 16,
+) -> torch.Tensor:
+    """Combined loss: MSE + L1 + SSIM (+ optional HU-bin bias penalty).
+
+    Weights are automatically normalized so MSE+L1+SSIM components sum to 1:
+        mse_weight = max(0, 1.0 - ssim_weight - l1_weight)
+
+    Examples
+    --------
+    Pure MSE (default):       ssim_weight=0.0, l1_weight=0.0
+    Pure L1+SSIM (50/50):     ssim_weight=0.5, l1_weight=0.5
+    MSE+SSIM blend:           ssim_weight=0.3, l1_weight=0.0  (mse=0.7)
+    L1+SSIM dominant + HU:    ssim_weight=0.5, l1_weight=0.5, hu_bin_loss_weight=0.1
+    """
+    ssim_weight = float(ssim_weight)
+    l1_weight   = float(l1_weight)
+    mse_weight  = max(0.0, 1.0 - ssim_weight - l1_weight)
+
+    loss = pred.new_zeros(())
+
+    if mse_weight > 0.0:
+        loss = loss + mse_weight * F.mse_loss(pred, target)
+
+    if l1_weight > 0.0:
+        loss = loss + l1_weight * F.l1_loss(pred, target)
+
+    if ssim_weight > 0.0:
+        if not _HAS_MSSSIM:
+            raise RuntimeError(
+                "pytorch-msssim is required for --ssim-weight > 0.\n"
+                "Install with: pip install pytorch-msssim"
+            )
+        # Dynamic data_range from target batch for standardized HU inputs
+        with torch.no_grad():
+            data_range = float(
+                (target.max() - target.min()).clamp(min=1e-6).item()
+            )
+        ssim_val = _pytorch_ssim(
+            pred, target,
+            data_range=data_range,
+            size_average=True,
+            nonnegative_ssim=True,
+        )
+        loss = loss + ssim_weight * (1.0 - ssim_val)
+
+    if hu_bin_loss_weight > 0.0:
+        loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(
+            pred, target, n_bins=hu_bin_bins
+        )
+
+    return loss
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -105,7 +191,7 @@ def hu_bin_bias_loss(pred, target, n_bins=16):
         return pred.new_zeros(())
     edges = torch.linspace(t_min.item(), t_max.item(), n_bins + 1,
                            device=target.device)
-    loss = pred.new_zeros(())
+    loss  = pred.new_zeros(())
     count = 0
     for i in range(n_bins):
         mask = (target >= edges[i]) & (target < edges[i + 1])
@@ -175,8 +261,11 @@ def validate(model, loader, device):
     }
 
 
-def train_cycle(model, loader, optimizer, device, iteration, max_iter,
-                hu_bin_loss_weight=0.0, hu_bin_bins=16):
+def train_cycle(
+    model, loader, optimizer, device, iteration, max_iter,
+    ssim_weight=0.0, l1_weight=0.0,
+    hu_bin_loss_weight=0.0, hu_bin_bins=16,
+):
     model.train()
     total = count = 0.0
     bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
@@ -187,11 +276,13 @@ def train_cycle(model, loader, optimizer, device, iteration, max_iter,
         y = batch["label"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         pred = model(x)
-        loss = F.mse_loss(pred, y)
-        if hu_bin_loss_weight > 0.0:
-            loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(
-                pred, y, n_bins=hu_bin_bins
-            )
+        loss = compute_loss(
+            pred, y,
+            ssim_weight=ssim_weight,
+            l1_weight=l1_weight,
+            hu_bin_loss_weight=hu_bin_loss_weight,
+            hu_bin_bins=hu_bin_bins,
+        )
         loss.backward()
         optimizer.step()
         iteration += 1
@@ -210,12 +301,36 @@ def main():
             "Example: HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn"
         )
 
+    # Validate loss weights
+    if args.ssim_weight < 0 or args.l1_weight < 0:
+        raise ValueError("--ssim-weight and --l1-weight must be >= 0")
+    if args.ssim_weight + args.l1_weight > 1.0:
+        raise ValueError(
+            f"--ssim-weight ({args.ssim_weight}) + --l1-weight ({args.l1_weight}) "
+            f"must not exceed 1.0"
+        )
+    if args.ssim_weight > 0 and not _HAS_MSSSIM:
+        raise RuntimeError(
+            "pytorch-msssim is required for --ssim-weight > 0.\n"
+            "Install with: pip install pytorch-msssim"
+        )
+
     n_train, n_val = apply_split(args.split)
     setup_reproducibility()
     device    = get_device()
     out_dir   = os.path.join(args.output_root, args.arch)
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
+
+    # ── Build loss description
+    mse_w  = max(0.0, 1.0 - args.ssim_weight - args.l1_weight)
+    loss_parts = []
+    if mse_w > 0.0:          loss_parts.append(f"{mse_w:.2f}*MSE")
+    if args.l1_weight > 0.0: loss_parts.append(f"{args.l1_weight:.2f}*L1")
+    if args.ssim_weight > 0.0: loss_parts.append(f"{args.ssim_weight:.2f}*SSIM")
+    loss_desc = " + ".join(loss_parts) if loss_parts else "1.00*MSE"
+    if args.hu_bin_loss > 0.0:
+        loss_desc += f" + {args.hu_bin_loss}*HU-bin-bias({args.hu_bin_bins}bins)"
 
     # ── Banner
     active = []
@@ -232,6 +347,7 @@ def main():
     print(f"  Train patients : {n_train}  |  Val patients: {n_val}")
     print(f"  Data dir       : {args.data_dir}")
     print(f"  Output         : {out_dir}")
+    print(f"  Loss           : {loss_desc}")
     print(f"{'='*64}\n")
 
     model     = build_model(args.arch, device, args)
@@ -265,9 +381,6 @@ def main():
         cache_rate=args.cache_rate,
     )
 
-    loss_desc = "MSE"
-    if args.hu_bin_loss > 0.0:
-        loss_desc += f" + {args.hu_bin_loss} x HU-bin-bias({args.hu_bin_bins} bins)"
     print(f"Loss      : {loss_desc}")
     print(f"Optimizer : Adam(lr={args.lr:.2e})")
 
@@ -281,6 +394,8 @@ def main():
         iteration, train_loss = train_cycle(
             model, train_loader, optimizer, device,
             iteration, args.max_iterations,
+            ssim_weight=args.ssim_weight,
+            l1_weight=args.l1_weight,
             hu_bin_loss_weight=args.hu_bin_loss,
             hu_bin_bins=args.hu_bin_bins,
         )
@@ -297,6 +412,9 @@ def main():
             "mu_split":        eff_mu_split,
             "use_multi_res":   args.use_multi_res,
             "hu_bin_loss":     args.hu_bin_loss,
+            "ssim_weight":     args.ssim_weight,
+            "l1_weight":       args.l1_weight,
+            "mse_weight":      mse_w,
             "normalization":   "benchmark_meanstd",
             "pixel_mean":      BENCHMARK_PIXEL_MEAN,
             "pixel_std":       BENCHMARK_PIXEL_STD,
