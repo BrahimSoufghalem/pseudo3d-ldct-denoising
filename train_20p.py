@@ -9,13 +9,12 @@ Usage
 # L1 + SSIM loss (recommended, breaks MSE ceiling):
     ... --ssim-weight 0.5 --l1-weight 0.5
 
-# Only parallel multi-resolution branches:
-    ... --use-multi-res
+# L1 + SSIM + Gradient loss (best for Chest VIF):
+    ... --ssim-weight 0.5 --l1-weight 0.3 --grad-weight 0.2
 
-# All improvements + new loss:
-    ... --use-hu-gate --use-mu-mod --use-multi-res --use-dilation \\
-        --use-freq-boost --hu-bin-loss 0.1 \\
-        --ssim-weight 0.5 --l1-weight 0.5
+# Full recipe targeting Chest VIF=0.22+:
+    ... --use-multi-res --use-freq-boost \\
+        --ssim-weight 0.5 --l1-weight 0.3 --grad-weight 0.2
 
 # 20-patient Kaggle experiment:
     ... --split 20p
@@ -111,41 +110,90 @@ def parse_args():
     p.add_argument(
         "--ssim-weight", type=float, default=0.0, metavar="W",
         help="[7] Weight of SSIM loss component. 0.0 = disabled (pure MSE). "
-             "Example: --ssim-weight 0.5 --l1-weight 0.5 => pure L1+SSIM. "
+             "Remaining weight (1 - ssim_w - l1_w) goes to MSE. "
              "Requires: pip install pytorch-msssim",
     )
     p.add_argument(
         "--l1-weight", type=float, default=0.0, metavar="W",
         help="[8] Weight of L1 (MAE) loss component. 0.0 = disabled. "
-             "Can be combined with --ssim-weight. "
              "Remaining weight (1 - ssim_w - l1_w) goes to MSE.",
+    )
+    p.add_argument(
+        "--grad-weight", type=float, default=0.0, metavar="W",
+        help="[9] Gradient edge-preservation loss weight. 0.0 = disabled. "
+             "Computes L1(dx_pred-dx_target) + L1(dy_pred-dy_target) using "
+             "finite differences. Directly preserves vessel edges and bronchial "
+             "walls in lung regions, boosting Chest VIF and SSIM. "
+             "Added on top of MSE+L1+SSIM (not counted in sum-to-1). "
+             "No extra dependencies. Recommended: 0.1 to 0.2.",
     )
     return p.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────────────────
+def image_gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Gradient edge-preservation loss via finite differences.
+
+    Computes the L1 distance between the spatial gradients of pred and target
+    in both horizontal (x) and vertical (y) directions.
+
+    Why this helps Chest VIF
+    ------------------------
+    - VIF measures visual information fidelity in local image regions.
+    - In lung CT, the critical structures are thin vessels (~2-4px) and
+      bronchial walls against near-black background.
+    - MSE/L1 penalize absolute pixel error; they do NOT directly penalize
+      blurring of these thin edges.
+    - Gradient loss DOES penalize blurring: if an edge is smeared, the
+      gradient of pred is smaller than the gradient of target => loss is
+      nonzero even if the mean pixel value is correct.
+
+    Implementation
+    --------------
+    dx_pred = pred[:,:,:,1:] - pred[:,:,:,:-1]   # horizontal gradient
+    dy_pred = pred[:,:,1:,:] - pred[:,:,:-1,:]   # vertical gradient
+
+    loss = L1(dx_pred, dx_target) + L1(dy_pred, dy_target)
+
+    L1 (not L2) is used because edge magnitudes in CT vary widely;
+    L2 would be dominated by the largest edges (bone boundaries).
+
+    No extra dependencies (pure PyTorch finite differences).
+    """
+    dx_pred   = pred  [:, :, :, 1:] - pred  [:, :, :, :-1]
+    dx_target = target[:, :, :, 1:] - target[:, :, :, :-1]
+    dy_pred   = pred  [:, :, 1:, :] - pred  [:, :, :-1, :]
+    dy_target = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return F.l1_loss(dx_pred, dx_target) + F.l1_loss(dy_pred, dy_target)
+
+
 def compute_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     ssim_weight: float = 0.0,
     l1_weight: float = 0.0,
+    grad_weight: float = 0.0,
     hu_bin_loss_weight: float = 0.0,
     hu_bin_bins: int = 16,
 ) -> torch.Tensor:
-    """Combined loss: MSE + L1 + SSIM (+ optional HU-bin bias penalty).
+    """Combined loss: (MSE + L1 + SSIM) + grad + hu-bin.
 
-    Weights are automatically normalized so MSE+L1+SSIM components sum to 1:
+    MSE / L1 / SSIM weights are auto-normalized to sum to 1:
         mse_weight = max(0, 1.0 - ssim_weight - l1_weight)
+
+    Gradient loss (grad_weight) is additive on top — not part of the
+    sum-to-1 normalization — so it does not reduce MSE/L1/SSIM coverage.
 
     Examples
     --------
-    Pure MSE (default):       ssim_weight=0.0, l1_weight=0.0
-    Pure L1+SSIM (50/50):     ssim_weight=0.5, l1_weight=0.5
-    MSE+SSIM blend:           ssim_weight=0.3, l1_weight=0.0  (mse=0.7)
-    L1+SSIM dominant + HU:    ssim_weight=0.5, l1_weight=0.5, hu_bin_loss_weight=0.1
+    Pure MSE (default):           ssim=0.0, l1=0.0, grad=0.0
+    L1+SSIM no MSE:               ssim=0.5, l1=0.5, grad=0.0
+    Best for Chest VIF:           ssim=0.5, l1=0.3, grad=0.2
+    With HU-bin bias correction:  ssim=0.5, l1=0.3, grad=0.2, hu_bin=0.05
     """
     ssim_weight = float(ssim_weight)
     l1_weight   = float(l1_weight)
+    grad_weight = float(grad_weight)
     mse_weight  = max(0.0, 1.0 - ssim_weight - l1_weight)
 
     loss = pred.new_zeros(())
@@ -162,7 +210,6 @@ def compute_loss(
                 "pytorch-msssim is required for --ssim-weight > 0.\n"
                 "Install with: pip install pytorch-msssim"
             )
-        # Dynamic data_range from target batch for standardized HU inputs
         with torch.no_grad():
             data_range = float(
                 (target.max() - target.min()).clamp(min=1e-6).item()
@@ -174,6 +221,10 @@ def compute_loss(
             nonnegative_ssim=True,
         )
         loss = loss + ssim_weight * (1.0 - ssim_val)
+
+    # Gradient loss is additive (not part of sum-to-1)
+    if grad_weight > 0.0:
+        loss = loss + grad_weight * image_gradient_loss(pred, target)
 
     if hu_bin_loss_weight > 0.0:
         loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(
@@ -263,7 +314,7 @@ def validate(model, loader, device):
 
 def train_cycle(
     model, loader, optimizer, device, iteration, max_iter,
-    ssim_weight=0.0, l1_weight=0.0,
+    ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
     hu_bin_loss_weight=0.0, hu_bin_bins=16,
 ):
     model.train()
@@ -280,6 +331,7 @@ def train_cycle(
             pred, y,
             ssim_weight=ssim_weight,
             l1_weight=l1_weight,
+            grad_weight=grad_weight,
             hu_bin_loss_weight=hu_bin_loss_weight,
             hu_bin_bins=hu_bin_bins,
         )
@@ -302,8 +354,8 @@ def main():
         )
 
     # Validate loss weights
-    if args.ssim_weight < 0 or args.l1_weight < 0:
-        raise ValueError("--ssim-weight and --l1-weight must be >= 0")
+    if args.ssim_weight < 0 or args.l1_weight < 0 or args.grad_weight < 0:
+        raise ValueError("Loss weights must be >= 0")
     if args.ssim_weight + args.l1_weight > 1.0:
         raise ValueError(
             f"--ssim-weight ({args.ssim_weight}) + --l1-weight ({args.l1_weight}) "
@@ -325,9 +377,10 @@ def main():
     # ── Build loss description
     mse_w  = max(0.0, 1.0 - args.ssim_weight - args.l1_weight)
     loss_parts = []
-    if mse_w > 0.0:          loss_parts.append(f"{mse_w:.2f}*MSE")
-    if args.l1_weight > 0.0: loss_parts.append(f"{args.l1_weight:.2f}*L1")
-    if args.ssim_weight > 0.0: loss_parts.append(f"{args.ssim_weight:.2f}*SSIM")
+    if mse_w > 0.0:             loss_parts.append(f"{mse_w:.2f}*MSE")
+    if args.l1_weight > 0.0:    loss_parts.append(f"{args.l1_weight:.2f}*L1")
+    if args.ssim_weight > 0.0:  loss_parts.append(f"{args.ssim_weight:.2f}*SSIM")
+    if args.grad_weight > 0.0:  loss_parts.append(f"{args.grad_weight:.2f}*Grad")
     loss_desc = " + ".join(loss_parts) if loss_parts else "1.00*MSE"
     if args.hu_bin_loss > 0.0:
         loss_desc += f" + {args.hu_bin_loss}*HU-bin-bias({args.hu_bin_bins}bins)"
@@ -342,13 +395,13 @@ def main():
     if args.hu_bin_loss > 0.0: active.append(f"HU-bin(w={args.hu_bin_loss})")
     active_str = ", ".join(active) if active else "none (baseline)"
 
-    print(f"\n{'='*64}")
+    print(f"\n{'='*68}")
     print(f"  arch={args.arch.upper()} | split={args.split} | improvements: {active_str}")
     print(f"  Train patients : {n_train}  |  Val patients: {n_val}")
     print(f"  Data dir       : {args.data_dir}")
     print(f"  Output         : {out_dir}")
     print(f"  Loss           : {loss_desc}")
-    print(f"{'='*64}\n")
+    print(f"{'='*68}\n")
 
     model     = build_model(args.arch, device, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
@@ -396,6 +449,7 @@ def main():
             iteration, args.max_iterations,
             ssim_weight=args.ssim_weight,
             l1_weight=args.l1_weight,
+            grad_weight=args.grad_weight,
             hu_bin_loss_weight=args.hu_bin_loss,
             hu_bin_bins=args.hu_bin_bins,
         )
@@ -415,6 +469,7 @@ def main():
             "ssim_weight":     args.ssim_weight,
             "l1_weight":       args.l1_weight,
             "mse_weight":      mse_w,
+            "grad_weight":     args.grad_weight,
             "normalization":   "benchmark_meanstd",
             "pixel_mean":      BENCHMARK_PIXEL_MEAN,
             "pixel_std":       BENCHMARK_PIXEL_STD,
