@@ -62,22 +62,24 @@ def load_checkpoint(path: str, arch: str, device):
     elif arch == "resnet":
         model = ResNet().to(device)
     elif arch == "local_residual":
-        groups         = int(meta.get("groups",         1))
-        use_hu_gate    = bool(meta.get("use_hu_gate",    False))
-        use_freq_boost = bool(meta.get("use_freq_boost", False))
-        use_dilation   = bool(meta.get("use_dilation",   False))
-        use_mu_mod     = bool(meta.get("use_mu_mod",     False))
-        use_multi_res  = bool(meta.get("use_multi_res",  False))
-        mu_split       = meta.get("mu_split", None)
+        groups           = int(meta.get("groups",           1))
+        use_hu_gate      = bool(meta.get("use_hu_gate",     False))
+        use_freq_boost   = bool(meta.get("use_freq_boost",  False))
+        use_dilation     = bool(meta.get("use_dilation",    False))
+        use_mu_mod       = bool(meta.get("use_mu_mod",      False))
+        use_multi_res    = bool(meta.get("use_multi_res",   False))
+        use_unet_decode  = bool(meta.get("use_unet_decode", False))
+        mu_split         = meta.get("mu_split", None)
         if mu_split is not None:
             mu_split = int(mu_split)
 
         active = []
-        if use_hu_gate:   active.append("hu-gate")
-        if use_mu_mod:    active.append(f"mu-mod@{mu_split}")
-        if use_multi_res: active.append("multi-res")
-        if use_dilation:  active.append("dilation-2")
-        if use_freq_boost: active.append("freq-boost")
+        if use_hu_gate:     active.append("hu-gate")
+        if use_mu_mod:      active.append(f"mu-mod@{mu_split}")
+        if use_unet_decode: active.append("unet-decode")
+        elif use_multi_res: active.append("multi-res")
+        if use_dilation:    active.append("dilation-2")
+        if use_freq_boost:  active.append("freq-boost")
         tag = f" [{'+'.join(active)}]" if active else " [baseline]"
         print(f"  Rebuilding LocalResidualNet | groups={groups}{tag}")
 
@@ -92,6 +94,7 @@ def load_checkpoint(path: str, arch: str, device):
             use_mu_mod=use_mu_mod,
             mu_split=mu_split,
             use_multi_res=use_multi_res,
+            use_unet_decode=use_unet_decode,
         )
     else:
         raise ValueError(f"Unknown arch: {arch}")
@@ -157,7 +160,7 @@ def print_comparison(all_dfs: dict, split: str):
     n_label = "20" if split == "20p" else "100"
     print("\n" + "=" * 72)
     print(f"  {n_label}-PATIENT FAIR COMPARISON")
-    print("  (benchmark mean/std | same data | same protocol | MSE loss)")
+    print("  (benchmark mean/std | same data | same protocol)")
     print("=" * 72)
     metrics = ["PSNR", "SSIM", "RMSE_HU", "VIF"]
     header  = f"  {'Model':<24}" + "".join(f"{m:>11}" for m in metrics)
