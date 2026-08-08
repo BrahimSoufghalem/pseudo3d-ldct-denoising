@@ -17,6 +17,9 @@ checkpoints saved by train_20p.py store "n_blocks" in meta.
   - unet-decode          : n_blocks=20  (5 blocks per branch)
 This script reads that field so the rebuilt model always matches the
 saved weights.  Older checkpoints that lack the field fall back to 10.
+It also reads the newer meta fields "mu_mod_mode", "mu_local_window" and
+"unet_final_blocks" (see TRAINING_FIXES.md); old checkpoints fall back to
+the original defaults (global mu-mod, final=0 allocation).
 """
 
 import argparse
@@ -74,9 +77,9 @@ def load_checkpoint(path: str, arch: str, device):
         model = ResNet().to(device)
     elif arch == "local_residual":
         # ------------------------------------------------------------------ #
-        # Read n_blocks from meta.  train_20p.py writes this since the fix    #
-        # that bumped unet-decode to blocks=20.  Older checkpoints fall back  #
-        # to 10 so they continue to load correctly.                           #
+        # Read architecture settings from meta so the rebuilt model always    #
+        # matches the saved weights. Older checkpoints fall back to the       #
+        # legacy defaults and continue to load correctly.                     #
         # ------------------------------------------------------------------ #
         n_blocks         = int(meta.get("n_blocks",       _BLOCKS_LEGACY))
         groups           = int(meta.get("groups",          1))
@@ -89,11 +92,25 @@ def load_checkpoint(path: str, arch: str, device):
         mu_split         = meta.get("mu_split", None)
         if mu_split is not None:
             mu_split = int(mu_split)
+        mu_mod_mode      = str(meta.get("mu_mod_mode", "global"))
+        mu_local_window  = int(meta.get("mu_local_window", 64))
+        unet_final_blocks = meta.get("unet_final_blocks", None)
+        if unet_final_blocks is not None:
+            unet_final_blocks = int(unet_final_blocks)
 
         active = []
         if use_hu_gate:     active.append("hu-gate")
-        if use_mu_mod:      active.append(f"mu-mod@{mu_split}")
-        if use_unet_decode: active.append(f"unet-decode(blocks={n_blocks})")
+        if use_mu_mod:
+            mu_tag = f"mu-mod@{mu_split}"
+            if mu_mod_mode == "local":
+                mu_tag += f"(local,w={mu_local_window})"
+            active.append(mu_tag)
+        if use_unet_decode:
+            unet_tag = f"unet-decode(blocks={n_blocks}"
+            if unet_final_blocks is not None:
+                unet_tag += f",final={unet_final_blocks}"
+            unet_tag += ")"
+            active.append(unet_tag)
         elif use_multi_res: active.append("multi-res")
         if use_dilation:    active.append("dilation-2")
         if use_freq_boost:  active.append("freq-boost")
@@ -103,15 +120,18 @@ def load_checkpoint(path: str, arch: str, device):
         model = build_local_residual_model(
             device,
             channels=128,
-            blocks=n_blocks,        # <-- was hardcoded to 10 before this fix
+            blocks=n_blocks,
             groups=groups,
             use_hu_gate=use_hu_gate,
             use_freq_boost=use_freq_boost,
             use_dilation=use_dilation,
             use_mu_mod=use_mu_mod,
             mu_split=mu_split,
+            mu_mod_mode=mu_mod_mode,
+            mu_local_window=mu_local_window,
             use_multi_res=use_multi_res,
             use_unet_decode=use_unet_decode,
+            unet_final_blocks=unet_final_blocks,
         )
     else:
         raise ValueError(f"Unknown arch: {arch}")
