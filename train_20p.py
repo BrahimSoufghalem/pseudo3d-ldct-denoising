@@ -23,6 +23,11 @@ Usage
         --use-dilation --use-freq-boost --hu-bin-loss 0.1 \\
         --ssim-weight 0.3 --l1-weight 0.3 --grad-weight 0.2
 
+# Physics additions on a benchmark trunk (Option-1 contribution path,
+# see PHYSICS_CONTRIBUTION_PLAN.md; works with ANY --arch):
+    ... --arch redcnn --nps-weight 0.05 --hu-bin-loss 0.1 \\
+        --select-by chest_vif --val-vif
+
 # Chest-VIF-oriented checkpoint selection with cosine decay:
     ... --select-by chest_vif --val-vif --lr-schedule cosine --min-lr 1e-6
 
@@ -68,6 +73,7 @@ from metrics import (
     compute_psnr_windowed, compute_ssim_windowed, compute_rmse_hu,
     compute_vif_hu,
 )
+from physics_losses import BatchRadialNPSLoss
 from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
@@ -100,6 +106,17 @@ _SSIM_DATA_RANGE = float(cfg.EVAL_DATA_RANGE) / float(BENCHMARK_PIXEL_STD)
 _HU_BIN_BOUNDARIES_HU = (-1024.0, -500.0, -200.0, 200.0, 600.0, 1900.0)
 
 _SELECT_CHOICES = ("ssim", "psnr", "vif", "chest_ssim", "chest_vif")
+
+# Shared radial-NPS loss instance (no parameters; window tensors are created
+# on the input device, so a single lazily built module is safe).
+_NPS_LOSS = None
+
+
+def _get_nps_loss():
+    global _NPS_LOSS
+    if _NPS_LOSS is None:
+        _NPS_LOSS = BatchRadialNPSLoss()
+    return _NPS_LOSS
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -180,11 +197,19 @@ def parse_args():
     p.add_argument("--use-freq-boost", action="store_true",
                    help="[6] Laplacian high-freq boost per block.")
     p.add_argument("--hu-bin-loss",    type=float, default=0.0, metavar="W",
-                   help="[7] HU-bin bias penalty weight.")
+                   help="[7] HU-bin bias penalty weight. "
+                        "Architecture-independent (works with any --arch).")
     p.add_argument("--hu-bin-bins",    type=int, default=16,
                    help="DEPRECATED and ignored: bins are now the fixed "
                         "physical tissue boundaries "
                         "(-1024/-500/-200/200/600/1900 HU).")
+    p.add_argument("--nps-weight", type=float, default=0.0, metavar="W",
+                   help="[8] Radial noise-power-spectrum matching loss weight "
+                        "(physics_losses.BatchRadialNPSLoss). Matches the "
+                        "spectrum of the noise the model removes to the "
+                        "paired LDCT-NDCT residual, preserving noise "
+                        "texture. Additive on top of the base loss. "
+                        "Architecture-independent (works with --arch redcnn).")
 
     # ── Loss flags ─────────────────────────────────────────────────────────
     p.add_argument("--ssim-weight", type=float, default=0.0, metavar="W",
@@ -206,7 +231,8 @@ def image_gradient_loss(pred, target):
 
 
 def compute_loss(pred, target, ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
-                 hu_bin_loss_weight=0.0, hu_bin_bins=16):
+                 hu_bin_loss_weight=0.0, hu_bin_bins=16,
+                 input_img=None, nps_weight=0.0):
     mse_w = max(0.0, 1.0 - float(ssim_weight) - float(l1_weight))
     loss  = pred.new_zeros(())
     if mse_w > 0.0:
@@ -227,6 +253,14 @@ def compute_loss(pred, target, ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
         loss = loss + float(grad_weight) * image_gradient_loss(pred, target)
     if hu_bin_loss_weight > 0.0:
         loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(pred, target)
+    if nps_weight > 0.0:
+        if input_img is None:
+            raise ValueError("--nps-weight requires the network input image")
+        # Match the spectrum of what the model removed (input - pred) to the
+        # paired LDCT-NDCT residual (input - target): texture preservation.
+        loss = loss + float(nps_weight) * _get_nps_loss()(
+            input_img - pred, input_img - target
+        )
     return loss
 
 
@@ -395,6 +429,7 @@ def lr_at(iteration, base_lr, min_lr, max_iter, schedule):
 def train_cycle(model, loader, optimizer, device, iteration, max_iter,
                 ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
                 hu_bin_loss_weight=0.0, hu_bin_bins=16,
+                nps_weight=0.0,
                 base_lr=1e-4, min_lr=1e-6, lr_schedule="constant"):
     model.train()
     total = count = 0.0
@@ -412,7 +447,8 @@ def train_cycle(model, loader, optimizer, device, iteration, max_iter,
         loss = compute_loss(pred, y, ssim_weight=ssim_weight, l1_weight=l1_weight,
                             grad_weight=grad_weight,
                             hu_bin_loss_weight=hu_bin_loss_weight,
-                            hu_bin_bins=hu_bin_bins)
+                            hu_bin_bins=hu_bin_bins,
+                            input_img=x, nps_weight=nps_weight)
         loss.backward()
         optimizer.step()
         iteration += 1
@@ -436,6 +472,8 @@ def main():
         raise ValueError("--ssim-weight + --l1-weight must not exceed 1.0")
     if args.ssim_weight > 0 and not _HAS_MSSSIM:
         raise RuntimeError("pip install pytorch-msssim")
+    if args.nps_weight < 0.0:
+        raise ValueError("--nps-weight must be >= 0")
 
     n_train, n_val = apply_split(args.split)
     setup_reproducibility()
@@ -465,6 +503,8 @@ def main():
     loss_desc = " + ".join(loss_parts) if loss_parts else "1.00*MSE"
     if args.hu_bin_loss > 0.0:
         loss_desc += f" + {args.hu_bin_loss}*HU-bin"
+    if args.nps_weight > 0.0:
+        loss_desc += f" + {args.nps_weight}*NPS"
 
     n_blocks = _BLOCKS_UNET if args.use_unet_decode else _BLOCKS_DEFAULT
     active = []
@@ -479,6 +519,7 @@ def main():
     if args.use_dilation:      active.append("Dilation-2")
     if args.use_freq_boost:    active.append("Freq-boost")
     if args.hu_bin_loss > 0.0: active.append(f"HU-bin(w={args.hu_bin_loss})")
+    if args.nps_weight > 0.0:  active.append(f"NPS(w={args.nps_weight})")
     active_str = ", ".join(active) if active else "none (baseline)"
 
     print(f"\n{'='*68}")
@@ -549,6 +590,7 @@ def main():
             grad_weight=args.grad_weight,
             hu_bin_loss_weight=args.hu_bin_loss,
             hu_bin_bins=args.hu_bin_bins,
+            nps_weight=args.nps_weight,
             base_lr=args.lr,
             min_lr=args.min_lr,
             lr_schedule=args.lr_schedule,
@@ -572,6 +614,7 @@ def main():
             "use_unet_decode": args.use_unet_decode,
             "unet_final_blocks": args.unet_final_blocks,
             "hu_bin_loss":     args.hu_bin_loss,
+            "nps_weight":      args.nps_weight,
             "ssim_weight":     args.ssim_weight,
             "l1_weight":       args.l1_weight,
             "mse_weight":      mse_w,
