@@ -9,6 +9,14 @@ Usage
 # Reproduce the 20-patient Kaggle experiment (5 test patients):
     HU_RANGE_PRESET=benchmark python evaluate_20p.py \\
         --test-dir /path/to/test --runs-root runs_20p --output eval_20p --split 20p
+
+Note
+----
+checkpoints saved by train_20p.py store "n_blocks" in meta.
+  - baseline / multi-res : n_blocks=10
+  - unet-decode          : n_blocks=20  (5 blocks per branch)
+This script reads that field so the rebuilt model always matches the
+saved weights.  Older checkpoints that lack the field fall back to 10.
 """
 
 import argparse
@@ -41,6 +49,9 @@ ARCH_MAP = {
     "local_residual": "LocalResidual (Ours)",
 }
 
+# Default block count for checkpoints that pre-date the n_blocks meta field.
+_BLOCKS_LEGACY = 10
+
 
 def get_test_set(split: str) -> set:
     if split == "20p":
@@ -62,13 +73,19 @@ def load_checkpoint(path: str, arch: str, device):
     elif arch == "resnet":
         model = ResNet().to(device)
     elif arch == "local_residual":
-        groups           = int(meta.get("groups",           1))
-        use_hu_gate      = bool(meta.get("use_hu_gate",     False))
-        use_freq_boost   = bool(meta.get("use_freq_boost",  False))
-        use_dilation     = bool(meta.get("use_dilation",    False))
-        use_mu_mod       = bool(meta.get("use_mu_mod",      False))
-        use_multi_res    = bool(meta.get("use_multi_res",   False))
-        use_unet_decode  = bool(meta.get("use_unet_decode", False))
+        # ------------------------------------------------------------------ #
+        # Read n_blocks from meta.  train_20p.py writes this since the fix    #
+        # that bumped unet-decode to blocks=20.  Older checkpoints fall back  #
+        # to 10 so they continue to load correctly.                           #
+        # ------------------------------------------------------------------ #
+        n_blocks         = int(meta.get("n_blocks",       _BLOCKS_LEGACY))
+        groups           = int(meta.get("groups",          1))
+        use_hu_gate      = bool(meta.get("use_hu_gate",    False))
+        use_freq_boost   = bool(meta.get("use_freq_boost", False))
+        use_dilation     = bool(meta.get("use_dilation",   False))
+        use_mu_mod       = bool(meta.get("use_mu_mod",     False))
+        use_multi_res    = bool(meta.get("use_multi_res",  False))
+        use_unet_decode  = bool(meta.get("use_unet_decode",False))
         mu_split         = meta.get("mu_split", None)
         if mu_split is not None:
             mu_split = int(mu_split)
@@ -76,17 +93,17 @@ def load_checkpoint(path: str, arch: str, device):
         active = []
         if use_hu_gate:     active.append("hu-gate")
         if use_mu_mod:      active.append(f"mu-mod@{mu_split}")
-        if use_unet_decode: active.append("unet-decode")
+        if use_unet_decode: active.append(f"unet-decode(blocks={n_blocks})")
         elif use_multi_res: active.append("multi-res")
         if use_dilation:    active.append("dilation-2")
         if use_freq_boost:  active.append("freq-boost")
         tag = f" [{'+'.join(active)}]" if active else " [baseline]"
-        print(f"  Rebuilding LocalResidualNet | groups={groups}{tag}")
+        print(f"  Rebuilding LocalResidualNet | blocks={n_blocks} | groups={groups}{tag}")
 
         model = build_local_residual_model(
             device,
             channels=128,
-            blocks=10,
+            blocks=n_blocks,        # <-- was hardcoded to 10 before this fix
             groups=groups,
             use_hu_gate=use_hu_gate,
             use_freq_boost=use_freq_boost,
