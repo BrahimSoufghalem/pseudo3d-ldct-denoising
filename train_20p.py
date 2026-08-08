@@ -26,6 +26,15 @@ Usage
 
 Install (once on Kaggle):
     pip install pytorch-msssim   # required only when --ssim-weight > 0
+
+Block budget
+------------
+Baseline / multi-res  : blocks=10  (10 full-res blocks)
+U-Net decode          : blocks=20  (5 enc_full + 5 enc_half + 5 enc_qtr
+                                    + 5 dec_half + 0 final)
+  - With blocks=10 every branch had only 2 blocks -> too shallow to develop
+    hierarchical features -> zero measurable difference vs flat multi-res.
+  - With blocks=20 each branch has 5 blocks and the decoder gains real depth.
 """
 
 import argparse
@@ -52,6 +61,14 @@ try:
     _HAS_MSSSIM = True
 except ImportError:
     _HAS_MSSSIM = False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Block budget constants
+# ──────────────────────────────────────────────────────────────────────────
+_BLOCKS_DEFAULT    = 10   # sequential / flat multi-res
+_BLOCKS_UNET       = 20   # U-Net decode: 5 enc x3 + 5 dec_half = 20 blocks
+                          # (enc_n = 20//4 = 5  per branch, dec_n = 5, final = 0)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -85,10 +102,11 @@ def parse_args():
                    help="[3] Parallel multi-resolution branches.")
     p.add_argument(
         "--use-unet-decode", action="store_true",
-        help="[4] U-Net skip connections over multi-res (requires --use-multi-res). "
-             "Encoder enc_full/half/qtr (2 blocks each) + decoder with skip "
-             "connections: dec_half_merge->dec_half_blocks(2)->dec_full_merge->"
-             "final_seq(2). This is the structural advantage of RED-CNN.",
+        help="[4] U-Net skip-connection decoder over multi-res "
+             "(requires --use-multi-res). "
+             "Uses blocks=20 automatically: enc_n=5 per branch, dec_n=5, final=0. "
+             "With only 10 blocks (2 per branch) there is zero measurable "
+             "difference vs flat multi-res because the branches are too shallow.",
     )
     p.add_argument("--use-dilation",   action="store_true",
                    help="[5] Dilated depthwise conv per block.")
@@ -98,7 +116,7 @@ def parse_args():
                    help="[7] HU-bin bias penalty weight.")
     p.add_argument("--hu-bin-bins",    type=int, default=16)
 
-    # ── Loss flags ─────────────────────────────────────────────────────
+    # ── Loss flags ─────────────────────────────────────────────────────────
     p.add_argument("--ssim-weight", type=float, default=0.0, metavar="W",
                    help="SSIM loss weight (requires pytorch-msssim).")
     p.add_argument("--l1-weight",   type=float, default=0.0, metavar="W",
@@ -169,11 +187,24 @@ def apply_split(split):
     return len(cfg.EXPECTED_TRAIN), len(cfg.EXPECTED_VAL)
 
 
+def _unet_block_desc(n_blocks):
+    """Return a human-readable block allocation string for unet-decode mode."""
+    enc_n   = max(1, n_blocks // 4)
+    dec_n   = max(1, n_blocks // 4)
+    final_n = max(0, n_blocks - 3 * enc_n - dec_n)
+    return f"UNet-Decode(enc={enc_n},dec={dec_n},final={final_n})"
+
+
 def build_model(arch, device, args):
     if arch == "local_residual":
+        # U-Net decode needs more blocks so each branch has real depth.
+        # With blocks=10 every branch gets only enc_n=2 blocks, which is
+        # identical in practice to flat multi-res -> zero measurable gain.
+        # blocks=20 gives enc_n=5 per branch, dec_n=5, final_n=0.
+        n_blocks = _BLOCKS_UNET if args.use_unet_decode else _BLOCKS_DEFAULT
         return build_local_residual_model(
             device,
-            channels=128, blocks=10, groups=args.groups,
+            channels=128, blocks=n_blocks, groups=args.groups,
             use_hu_gate=args.use_hu_gate,
             use_freq_boost=args.use_freq_boost,
             use_dilation=args.use_dilation,
@@ -272,10 +303,11 @@ def main():
     if args.hu_bin_loss > 0.0:
         loss_desc += f" + {args.hu_bin_loss}*HU-bin"
 
+    n_blocks = _BLOCKS_UNET if args.use_unet_decode else _BLOCKS_DEFAULT
     active = []
     if args.use_hu_gate:       active.append("HU-gate")
     if args.use_mu_mod:        active.append(f"mu-mod@{args.mu_split or 'auto'}")
-    if args.use_unet_decode:   active.append("UNet-Decode(enc=2,dec=2,final=2)")
+    if args.use_unet_decode:   active.append(_unet_block_desc(n_blocks))
     elif args.use_multi_res:   active.append("Multi-Res(3+3+3|1)")
     if args.use_dilation:      active.append("Dilation-2")
     if args.use_freq_boost:    active.append("Freq-boost")
@@ -283,7 +315,8 @@ def main():
     active_str = ", ".join(active) if active else "none (baseline)"
 
     print(f"\n{'='*68}")
-    print(f"  arch={args.arch.upper()} | split={args.split} | improvements: {active_str}")
+    print(f"  arch={args.arch.upper()} | split={args.split} | blocks={n_blocks}")
+    print(f"  improvements: {active_str}")
     print(f"  Train patients : {n_train}  |  Val patients: {n_val}")
     print(f"  Data dir       : {args.data_dir}")
     print(f"  Output         : {out_dir}")
@@ -326,7 +359,7 @@ def main():
 
     start = time.time()
     cycle = iteration // args.iterations_before_val
-    eff_mu_split = args.mu_split if args.mu_split is not None else 10 // 2
+    eff_mu_split = args.mu_split if args.mu_split is not None else n_blocks // 2
 
     while iteration < args.max_iterations:
         cycle += 1
@@ -346,6 +379,7 @@ def main():
             "architecture":    args.arch,
             "split":           args.split,
             "groups":          args.groups,
+            "n_blocks":        n_blocks,
             "use_hu_gate":     args.use_hu_gate,
             "use_freq_boost":  args.use_freq_boost,
             "use_dilation":    args.use_dilation,
