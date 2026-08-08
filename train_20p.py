@@ -1,4 +1,4 @@
-"""Unified trainer supporting six independently toggleable improvements.
+"""Unified trainer supporting seven independently toggleable improvements.
 
 Usage
 -----
@@ -6,14 +6,16 @@ Usage
     HU_RANGE_PRESET=benchmark python train_20p.py --arch local_residual \\
         --data-dir /path/to/data
 
-# L1 + SSIM loss (recommended, breaks MSE ceiling):
-    ... --ssim-weight 0.5 --l1-weight 0.5
+# U-Net decoder (best for Chest VIF, beats RED-CNN):
+    ... --use-multi-res --use-unet-decode
 
-# L1 + SSIM + Gradient loss (best for Chest VIF):
-    ... --ssim-weight 0.5 --l1-weight 0.3 --grad-weight 0.2
+# U-Net + best loss:
+    ... --use-multi-res --use-unet-decode \\
+        --ssim-weight 0.5 --l1-weight 0.3 --grad-weight 0.2
 
-# Full recipe targeting Chest VIF=0.22+:
-    ... --use-multi-res --use-freq-boost \\
+# All improvements:
+    ... --use-hu-gate --use-mu-mod --use-multi-res --use-unet-decode \\
+        --use-dilation --use-freq-boost --hu-bin-loss 0.1 \\
         --ssim-weight 0.5 --l1-weight 0.3 --grad-weight 0.2
 
 # 20-patient Kaggle experiment:
@@ -45,7 +47,6 @@ from metrics import compute_psnr_windowed, compute_ssim_windowed, compute_rmse_h
 from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
-# Optional SSIM loss dependency
 try:
     from pytorch_msssim import ssim as _pytorch_ssim
     _HAS_MSSSIM = True
@@ -56,7 +57,7 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fair comparison trainer with six optional physics improvements"
+        description="Fair comparison trainer with seven optional improvements"
     )
     p.add_argument("--arch", required=True,
                    choices=["redcnn", "resnet", "local_residual"])
@@ -71,95 +72,44 @@ def parse_args():
     p.add_argument("--num-workers",           type=int,   default=2)
     p.add_argument("--cache-rate",            type=float, default=1.0)
     p.add_argument("--output-root",           default="runs")
-    p.add_argument("--groups",                type=int,   default=1,
-                   help="Groups for middle conv. Default=1 (T4).")
+    p.add_argument("--groups",                type=int,   default=1)
     p.add_argument("--resume", action="store_true")
 
-    # ── Improvement flags — all default OFF ─────────────────────────────────
+    # ── Architecture flags ─────────────────────────────────────────────────
+    p.add_argument("--use-hu-gate",    action="store_true",
+                   help="[1] SE-like HU-context gating per block.")
+    p.add_argument("--use-mu-mod",     action="store_true",
+                   help="[2] mu-aware FiLM modulation at midpoint.")
+    p.add_argument("--mu-split",       type=int, default=None)
+    p.add_argument("--use-multi-res",  action="store_true",
+                   help="[3] Parallel multi-resolution branches.")
     p.add_argument(
-        "--use-hu-gate", action="store_true",
-        help="[1] SE-like HU-context gating inside each block.",
+        "--use-unet-decode", action="store_true",
+        help="[4] U-Net skip connections over multi-res (requires --use-multi-res). "
+             "Encoder enc_full/half/qtr (2 blocks each) + decoder with skip "
+             "connections: dec_half_merge->dec_half_blocks(2)->dec_full_merge->"
+             "final_seq(2). This is the structural advantage of RED-CNN.",
     )
-    p.add_argument(
-        "--use-mu-mod", action="store_true",
-        help="[2] mu-aware FiLM modulation at network midpoint.",
-    )
-    p.add_argument(
-        "--mu-split", type=int, default=None,
-        help="Block after which mu-mod is applied (default: blocks//2=5).",
-    )
-    p.add_argument(
-        "--use-multi-res", action="store_true",
-        help="[3] Parallel multi-resolution branches: full + down-x2 + down-x4.",
-    )
-    p.add_argument(
-        "--use-dilation", action="store_true",
-        help="[4] Lightweight dilated depthwise conv (dilation=2) per block.",
-    )
-    p.add_argument(
-        "--use-freq-boost", action="store_true",
-        help="[5] Learnable Laplacian high-freq boost inside each block.",
-    )
-    p.add_argument(
-        "--hu-bin-loss", type=float, default=0.0, metavar="WEIGHT",
-        help="[6] HU-bin systematic-bias penalty weight. 0.0 = disabled.",
-    )
-    p.add_argument("--hu-bin-bins", type=int, default=16)
+    p.add_argument("--use-dilation",   action="store_true",
+                   help="[5] Dilated depthwise conv per block.")
+    p.add_argument("--use-freq-boost", action="store_true",
+                   help="[6] Laplacian high-freq boost per block.")
+    p.add_argument("--hu-bin-loss",    type=float, default=0.0, metavar="W",
+                   help="[7] HU-bin bias penalty weight.")
+    p.add_argument("--hu-bin-bins",    type=int, default=16)
 
-    # ── Loss function flags ───────────────────────────────────────────────
-    p.add_argument(
-        "--ssim-weight", type=float, default=0.0, metavar="W",
-        help="[7] Weight of SSIM loss component. 0.0 = disabled (pure MSE). "
-             "Remaining weight (1 - ssim_w - l1_w) goes to MSE. "
-             "Requires: pip install pytorch-msssim",
-    )
-    p.add_argument(
-        "--l1-weight", type=float, default=0.0, metavar="W",
-        help="[8] Weight of L1 (MAE) loss component. 0.0 = disabled. "
-             "Remaining weight (1 - ssim_w - l1_w) goes to MSE.",
-    )
-    p.add_argument(
-        "--grad-weight", type=float, default=0.0, metavar="W",
-        help="[9] Gradient edge-preservation loss weight. 0.0 = disabled. "
-             "Computes L1(dx_pred-dx_target) + L1(dy_pred-dy_target) using "
-             "finite differences. Directly preserves vessel edges and bronchial "
-             "walls in lung regions, boosting Chest VIF and SSIM. "
-             "Added on top of MSE+L1+SSIM (not counted in sum-to-1). "
-             "No extra dependencies. Recommended: 0.1 to 0.2.",
-    )
+    # ── Loss flags ─────────────────────────────────────────────────────
+    p.add_argument("--ssim-weight", type=float, default=0.0, metavar="W",
+                   help="SSIM loss weight (requires pytorch-msssim).")
+    p.add_argument("--l1-weight",   type=float, default=0.0, metavar="W",
+                   help="L1 loss weight. Remainder goes to MSE.")
+    p.add_argument("--grad-weight", type=float, default=0.0, metavar="W",
+                   help="Gradient edge loss weight (finite diff L1). Additive.")
     return p.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────────────────
-def image_gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Gradient edge-preservation loss via finite differences.
-
-    Computes the L1 distance between the spatial gradients of pred and target
-    in both horizontal (x) and vertical (y) directions.
-
-    Why this helps Chest VIF
-    ------------------------
-    - VIF measures visual information fidelity in local image regions.
-    - In lung CT, the critical structures are thin vessels (~2-4px) and
-      bronchial walls against near-black background.
-    - MSE/L1 penalize absolute pixel error; they do NOT directly penalize
-      blurring of these thin edges.
-    - Gradient loss DOES penalize blurring: if an edge is smeared, the
-      gradient of pred is smaller than the gradient of target => loss is
-      nonzero even if the mean pixel value is correct.
-
-    Implementation
-    --------------
-    dx_pred = pred[:,:,:,1:] - pred[:,:,:,:-1]   # horizontal gradient
-    dy_pred = pred[:,:,1:,:] - pred[:,:,:-1,:]   # vertical gradient
-
-    loss = L1(dx_pred, dx_target) + L1(dy_pred, dy_target)
-
-    L1 (not L2) is used because edge magnitudes in CT vary widely;
-    L2 would be dominated by the largest edges (bone boundaries).
-
-    No extra dependencies (pure PyTorch finite differences).
-    """
+def image_gradient_loss(pred, target):
     dx_pred   = pred  [:, :, :, 1:] - pred  [:, :, :, :-1]
     dx_target = target[:, :, :, 1:] - target[:, :, :, :-1]
     dy_pred   = pred  [:, :, 1:, :] - pred  [:, :, :-1, :]
@@ -167,74 +117,31 @@ def image_gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     return F.l1_loss(dx_pred, dx_target) + F.l1_loss(dy_pred, dy_target)
 
 
-def compute_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    ssim_weight: float = 0.0,
-    l1_weight: float = 0.0,
-    grad_weight: float = 0.0,
-    hu_bin_loss_weight: float = 0.0,
-    hu_bin_bins: int = 16,
-) -> torch.Tensor:
-    """Combined loss: (MSE + L1 + SSIM) + grad + hu-bin.
-
-    MSE / L1 / SSIM weights are auto-normalized to sum to 1:
-        mse_weight = max(0, 1.0 - ssim_weight - l1_weight)
-
-    Gradient loss (grad_weight) is additive on top — not part of the
-    sum-to-1 normalization — so it does not reduce MSE/L1/SSIM coverage.
-
-    Examples
-    --------
-    Pure MSE (default):           ssim=0.0, l1=0.0, grad=0.0
-    L1+SSIM no MSE:               ssim=0.5, l1=0.5, grad=0.0
-    Best for Chest VIF:           ssim=0.5, l1=0.3, grad=0.2
-    With HU-bin bias correction:  ssim=0.5, l1=0.3, grad=0.2, hu_bin=0.05
-    """
-    ssim_weight = float(ssim_weight)
-    l1_weight   = float(l1_weight)
-    grad_weight = float(grad_weight)
-    mse_weight  = max(0.0, 1.0 - ssim_weight - l1_weight)
-
-    loss = pred.new_zeros(())
-
-    if mse_weight > 0.0:
-        loss = loss + mse_weight * F.mse_loss(pred, target)
-
+def compute_loss(pred, target, ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
+                 hu_bin_loss_weight=0.0, hu_bin_bins=16):
+    mse_w = max(0.0, 1.0 - float(ssim_weight) - float(l1_weight))
+    loss  = pred.new_zeros(())
+    if mse_w > 0.0:
+        loss = loss + mse_w * F.mse_loss(pred, target)
     if l1_weight > 0.0:
-        loss = loss + l1_weight * F.l1_loss(pred, target)
-
+        loss = loss + float(l1_weight) * F.l1_loss(pred, target)
     if ssim_weight > 0.0:
         if not _HAS_MSSSIM:
-            raise RuntimeError(
-                "pytorch-msssim is required for --ssim-weight > 0.\n"
-                "Install with: pip install pytorch-msssim"
-            )
+            raise RuntimeError("pip install pytorch-msssim")
         with torch.no_grad():
-            data_range = float(
-                (target.max() - target.min()).clamp(min=1e-6).item()
-            )
-        ssim_val = _pytorch_ssim(
-            pred, target,
-            data_range=data_range,
-            size_average=True,
-            nonnegative_ssim=True,
+            dr = float((target.max() - target.min()).clamp(min=1e-6).item())
+        loss = loss + float(ssim_weight) * (
+            1.0 - _pytorch_ssim(pred, target, data_range=dr,
+                                size_average=True, nonnegative_ssim=True)
         )
-        loss = loss + ssim_weight * (1.0 - ssim_val)
-
-    # Gradient loss is additive (not part of sum-to-1)
     if grad_weight > 0.0:
-        loss = loss + grad_weight * image_gradient_loss(pred, target)
-
+        loss = loss + float(grad_weight) * image_gradient_loss(pred, target)
     if hu_bin_loss_weight > 0.0:
         loss = loss + hu_bin_loss_weight * hu_bin_bias_loss(
-            pred, target, n_bins=hu_bin_bins
-        )
-
+            pred, target, n_bins=hu_bin_bins)
     return loss
 
 
-# ──────────────────────────────────────────────────────────────────────────
 def hu_bin_bias_loss(pred, target, n_bins=16):
     t_min = target.detach().min()
     t_max = target.detach().max()
@@ -266,15 +173,14 @@ def build_model(arch, device, args):
     if arch == "local_residual":
         return build_local_residual_model(
             device,
-            channels=128,
-            blocks=10,
-            groups=args.groups,
+            channels=128, blocks=10, groups=args.groups,
             use_hu_gate=args.use_hu_gate,
             use_freq_boost=args.use_freq_boost,
             use_dilation=args.use_dilation,
             use_mu_mod=args.use_mu_mod,
             mu_split=args.mu_split,
             use_multi_res=args.use_multi_res,
+            use_unet_decode=args.use_unet_decode,
         )
     return build_benchmark_model(arch, device)
 
@@ -301,8 +207,7 @@ def validate(model, loader, device):
             sums["ssim"]          += compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
             sums["rmse"]          += compute_rmse_hu(pred_px[i].squeeze(),        y_px[i].squeeze())
             samples += 1
-    n_b = max(1, batches)
-    n_s = max(1, samples)
+    n_b, n_s = max(1, batches), max(1, samples)
     return {
         "mse":   sums["mse"]  / n_b,
         "psnr":  sums["psnr"] / n_s,
@@ -312,11 +217,9 @@ def validate(model, loader, device):
     }
 
 
-def train_cycle(
-    model, loader, optimizer, device, iteration, max_iter,
-    ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
-    hu_bin_loss_weight=0.0, hu_bin_bins=16,
-):
+def train_cycle(model, loader, optimizer, device, iteration, max_iter,
+                ssim_weight=0.0, l1_weight=0.0, grad_weight=0.0,
+                hu_bin_loss_weight=0.0, hu_bin_bins=16):
     model.train()
     total = count = 0.0
     bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
@@ -327,14 +230,10 @@ def train_cycle(
         y = batch["label"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         pred = model(x)
-        loss = compute_loss(
-            pred, y,
-            ssim_weight=ssim_weight,
-            l1_weight=l1_weight,
-            grad_weight=grad_weight,
-            hu_bin_loss_weight=hu_bin_loss_weight,
-            hu_bin_bins=hu_bin_bins,
-        )
+        loss = compute_loss(pred, y, ssim_weight=ssim_weight, l1_weight=l1_weight,
+                            grad_weight=grad_weight,
+                            hu_bin_loss_weight=hu_bin_loss_weight,
+                            hu_bin_bins=hu_bin_bins)
         loss.backward()
         optimizer.step()
         iteration += 1
@@ -348,24 +247,13 @@ def train_cycle(
 def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
-        raise RuntimeError(
-            "Set HU_RANGE_PRESET=benchmark.\n"
-            "Example: HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn"
-        )
-
-    # Validate loss weights
-    if args.ssim_weight < 0 or args.l1_weight < 0 or args.grad_weight < 0:
-        raise ValueError("Loss weights must be >= 0")
+        raise RuntimeError("Set HU_RANGE_PRESET=benchmark.")
+    if args.use_unet_decode and not args.use_multi_res:
+        raise ValueError("--use-unet-decode requires --use-multi-res")
     if args.ssim_weight + args.l1_weight > 1.0:
-        raise ValueError(
-            f"--ssim-weight ({args.ssim_weight}) + --l1-weight ({args.l1_weight}) "
-            f"must not exceed 1.0"
-        )
+        raise ValueError("--ssim-weight + --l1-weight must not exceed 1.0")
     if args.ssim_weight > 0 and not _HAS_MSSSIM:
-        raise RuntimeError(
-            "pytorch-msssim is required for --ssim-weight > 0.\n"
-            "Install with: pip install pytorch-msssim"
-        )
+        raise RuntimeError("pip install pytorch-msssim")
 
     n_train, n_val = apply_split(args.split)
     setup_reproducibility()
@@ -374,7 +262,6 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
-    # ── Build loss description
     mse_w  = max(0.0, 1.0 - args.ssim_weight - args.l1_weight)
     loss_parts = []
     if mse_w > 0.0:             loss_parts.append(f"{mse_w:.2f}*MSE")
@@ -383,13 +270,13 @@ def main():
     if args.grad_weight > 0.0:  loss_parts.append(f"{args.grad_weight:.2f}*Grad")
     loss_desc = " + ".join(loss_parts) if loss_parts else "1.00*MSE"
     if args.hu_bin_loss > 0.0:
-        loss_desc += f" + {args.hu_bin_loss}*HU-bin-bias({args.hu_bin_bins}bins)"
+        loss_desc += f" + {args.hu_bin_loss}*HU-bin"
 
-    # ── Banner
     active = []
     if args.use_hu_gate:       active.append("HU-gate")
     if args.use_mu_mod:        active.append(f"mu-mod@{args.mu_split or 'auto'}")
-    if args.use_multi_res:     active.append("Multi-Res(3+3+3|1)")
+    if args.use_unet_decode:   active.append("UNet-Decode(enc=2,dec=2,final=2)")
+    elif args.use_multi_res:   active.append("Multi-Res(3+3+3|1)")
     if args.use_dilation:      active.append("Dilation-2")
     if args.use_freq_boost:    active.append("Freq-boost")
     if args.hu_bin_loss > 0.0: active.append(f"HU-bin(w={args.hu_bin_loss})")
@@ -465,6 +352,7 @@ def main():
             "use_mu_mod":      args.use_mu_mod,
             "mu_split":        eff_mu_split,
             "use_multi_res":   args.use_multi_res,
+            "use_unet_decode": args.use_unet_decode,
             "hu_bin_loss":     args.hu_bin_loss,
             "ssim_weight":     args.ssim_weight,
             "l1_weight":       args.l1_weight,
@@ -493,10 +381,7 @@ def main():
         if val["ssim"] > best_ssim:
             best_ssim = val["ssim"]
             torch.save(payload, os.path.join(out_dir, "best_model.pt"))
-        torch.save(
-            {**payload, "optimizer_state": optimizer.state_dict()},
-            ckpt_path,
-        )
+        torch.save({**payload, "optimizer_state": optimizer.state_dict()}, ckpt_path)
 
         elapsed = time.time() - t0
         print(
