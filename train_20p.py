@@ -11,6 +11,19 @@ Usage
     HU_RANGE_PRESET=benchmark python train_20p.py --arch local_residual \\
         --data-dir /path/to/data
 
+# EXACT ldct-benchmark paper protocol for RED-CNN.
+# Hyperparameters are the official configs/redcnn.yaml of
+# github.com/eeulig/ldct-benchmark (found by their hpopt), and the
+# checkpoint criterion (--select-by bench_ssim) replicates
+# ldctbench/methods/base.py save_checkpoint(to_optimize=\"SSIM\"):
+# best OVERALL validation SSIM computed WITHOUT clinical windowing.
+    HU_RANGE_PRESET=benchmark python train_20p.py --arch redcnn \\
+        --data-dir /path/to/data --split 100p \\
+        --max-iterations 92994 --iterations-before-val 1000 \\
+        --batch-size 73 --patch-size 128 --val-patch-size 128 \\
+        --lr 9.583417460320728e-05 --lr-schedule constant \\
+        --select-by bench_ssim
+
 # U-Net decoder (best for Chest VIF, beats RED-CNN):
     ... --use-multi-res --use-unet-decode
 
@@ -26,7 +39,7 @@ Usage
 # Physics additions on a benchmark trunk (Option-1 contribution path,
 # see PHYSICS_CONTRIBUTION_PLAN.md; works with ANY --arch):
     ... --arch redcnn --nps-weight 0.05 --hu-bin-loss 0.1 \\
-        --select-by chest_vif --val-vif
+        --select-by bench_ssim
 
 # Chest-VIF-oriented checkpoint selection with cosine decay:
     ... --select-by chest_vif --val-vif --lr-schedule cosine --min-lr 1e-6
@@ -60,6 +73,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+from skimage.metrics import structural_similarity as _sk_ssim
 from tqdm import tqdm
 
 import config as cfg
@@ -105,7 +119,8 @@ _SSIM_DATA_RANGE = float(cfg.EVAL_DATA_RANGE) / float(BENCHMARK_PIXEL_STD)
 # on every step.
 _HU_BIN_BOUNDARIES_HU = (-1024.0, -500.0, -200.0, 200.0, 600.0, 1900.0)
 
-_SELECT_CHOICES = ("ssim", "psnr", "vif", "chest_ssim", "chest_vif")
+_SELECT_CHOICES = ("ssim", "psnr", "vif", "chest_ssim", "chest_vif",
+                   "bench_ssim")
 
 # Shared radial-NPS loss instance (no parameters; window tensors are created
 # on the input device, so a single lazily built module is safe).
@@ -138,7 +153,8 @@ def parse_args():
                    default="constant",
                    help="LR schedule. 'cosine' decays from --lr to --min-lr "
                         "over --max-iterations (resume-safe: LR is a pure "
-                        "function of the iteration counter).")
+                        "function of the iteration counter). The ldct-benchmark "
+                        "paper uses 'constant'.")
     p.add_argument("--min-lr", type=float, default=1e-6,
                    help="Final LR for --lr-schedule cosine.")
     p.add_argument("--num-workers",           type=int,   default=2)
@@ -151,6 +167,15 @@ def parse_args():
     p.add_argument("--select-by", choices=list(_SELECT_CHOICES),
                    default="ssim",
                    help="Validation metric used to select best_model.pt. "
+                        "'bench_ssim' replicates the ldct-benchmark paper "
+                        "saving criterion EXACTLY: overall validation SSIM "
+                        "computed WITHOUT clinical windowing "
+                        "(skimage structural_similarity, data_range=2924, on "
+                        "denormalized images clipped to [0, 2924]), as in "
+                        "ldctbench/methods/base.py "
+                        "save_checkpoint(to_optimize='SSIM'). "
+                        "'ssim'/'psnr' use clinically WINDOWED metrics and "
+                        "are therefore NOT the paper criterion. "
                         "'chest_*' options fall back to the overall metric "
                         "when the validation set has no chest slices. "
                         "Default 'ssim' reproduces the old behavior.")
@@ -348,10 +373,15 @@ def validate(model, loader, device, with_vif=False):
     FIX: the previous version only reported the overall mean, which is
     dominated by abdomen slices; the chest gap was invisible during training
     and best_model.pt was selected on a metric that hides it.
+
+    ``bench_ssim`` is the ldct-benchmark paper metric: overall SSIM computed
+    WITHOUT clinical windowing, exactly as in ldctbench/utils/metrics.py
+    (skimage structural_similarity(target, pred, data_range=2924) on
+    denormalized images clipped to [0, 2924]).
     """
     model.eval()
     sums    = dict(mse=0.0, psnr=0.0, ssim=0.0, rmse=0.0,
-                   baseline_psnr=0.0, vif=0.0)
+                   baseline_psnr=0.0, vif=0.0, bench_ssim=0.0)
     region  = {
         "Chest":   dict(psnr=0.0, ssim=0.0, vif=0.0, n=0),
         "Abdomen": dict(psnr=0.0, ssim=0.0, vif=0.0, n=0),
@@ -372,9 +402,16 @@ def validate(model, loader, device, with_vif=False):
             ps = compute_psnr_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
             ss = compute_ssim_windowed(pred_px[i].squeeze(), y_px[i].squeeze(), bt)
             vf = compute_vif_hu(pred_px[i].squeeze(), y_px[i].squeeze()) if with_vif else 0.0
+            # ldct-benchmark paper SSIM: unwindowed, data_range = 2924, on
+            # denormalized clipped images (see ldctbench/utils/metrics.py).
+            t_np = y_px[i].squeeze().detach().cpu().numpy()
+            p_np = pred_px[i].squeeze().detach().cpu().numpy()
+            bss  = float(_sk_ssim(t_np, p_np,
+                                  data_range=float(cfg.EVAL_DATA_RANGE)))
             sums["psnr"]          += ps
             sums["ssim"]          += ss
             sums["vif"]           += vf
+            sums["bench_ssim"]    += bss
             sums["baseline_psnr"] += compute_psnr_windowed(x_px[i].squeeze(), y_px[i].squeeze(), bt)
             sums["rmse"]          += compute_rmse_hu(pred_px[i].squeeze(), y_px[i].squeeze())
             r = region[bt]
@@ -385,12 +422,13 @@ def validate(model, loader, device, with_vif=False):
             samples += 1
     n_b, n_s = max(1, batches), max(1, samples)
     out = {
-        "mse":   sums["mse"]  / n_b,
-        "psnr":  sums["psnr"] / n_s,
-        "dpsnr": (sums["psnr"] - sums["baseline_psnr"]) / n_s,
-        "ssim":  sums["ssim"] / n_s,
-        "rmse":  sums["rmse"] / n_s,
-        "vif":   sums["vif"]  / n_s,
+        "mse":        sums["mse"]  / n_b,
+        "psnr":       sums["psnr"] / n_s,
+        "dpsnr":      (sums["psnr"] - sums["baseline_psnr"]) / n_s,
+        "ssim":       sums["ssim"] / n_s,
+        "rmse":       sums["rmse"] / n_s,
+        "vif":        sums["vif"]  / n_s,
+        "bench_ssim": sums["bench_ssim"] / n_s,
     }
     for name, r in region.items():
         key = name.lower()
@@ -404,13 +442,16 @@ def validate(model, loader, device, with_vif=False):
 
 def selection_score(val, select_by):
     """Score used to pick best_model.pt. chest_* falls back to overall when
-    the validation set contains no chest slices."""
+    the validation set contains no chest slices. 'bench_ssim' is the exact
+    ldct-benchmark paper criterion (overall unwindowed SSIM)."""
     if select_by == "ssim":
         return val["ssim"]
     if select_by == "psnr":
         return val["psnr"]
     if select_by == "vif":
         return val["vif"]
+    if select_by == "bench_ssim":
+        return val["bench_ssim"]
     if select_by == "chest_ssim":
         return val["chest_ssim"] if val["chest_n"] > 0 else val["ssim"]
     if select_by == "chest_vif":
@@ -533,6 +574,7 @@ def main():
           + (f" -> {args.min_lr:.2e}" if args.lr_schedule == "cosine" else "")
           + ")")
     print(f"  Select best by : {args.select_by}"
+          + (" [ldct-benchmark paper criterion]" if args.select_by == "bench_ssim" else "")
           + (" (+VIF in val)" if with_vif else ""))
     print(f"{'='*68}\n")
 
@@ -666,7 +708,8 @@ def main():
             f"Cycle {cycle:02d} | Iter {iteration:06d}/{args.max_iterations} | "
             f"Loss {train_loss:.6f} | Val MSE {val['mse']:.6f} | "
             f"PSNR {val['psnr']:.3f} | dPSNR {val['dpsnr']:+.3f} | "
-            f"SSIM {val['ssim']:.5f} | RMSE {val['rmse']:.2f}"
+            f"SSIM {val['ssim']:.5f} | bSSIM {val['bench_ssim']:.5f} | "
+            f"RMSE {val['rmse']:.2f}"
             f"{vif_str} | {args.select_by} {score:.5f}"
             f"{(' | ' + region_str) if region_str else ''} | "
             f"{elapsed:.1f}s"
