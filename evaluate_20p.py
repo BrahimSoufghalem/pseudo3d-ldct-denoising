@@ -17,9 +17,10 @@ checkpoints saved by train_20p.py store "n_blocks" in meta.
   - unet-decode          : n_blocks=20  (5 blocks per branch)
 This script reads that field so the rebuilt model always matches the
 saved weights.  Older checkpoints that lack the field fall back to 10.
-It also reads the newer meta fields "mu_mod_mode", "mu_local_window" and
-"unet_final_blocks" (see TRAINING_FIXES.md); old checkpoints fall back to
-the original defaults (global mu-mod, final=0 allocation).
+It also reads the newer meta fields "mu_mod_mode", "mu_local_window",
+"unet_final_blocks" (see TRAINING_FIXES.md) and "use_spectral_head" /
+"spectral_bins" (see spectral_head.py); old checkpoints fall back to
+the original defaults (global mu-mod, final=0 allocation, no head).
 """
 
 import argparse
@@ -42,6 +43,7 @@ from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
     compute_rmse_hu, compute_vif_hu,
 )
+from spectral_head import SpectralResidualModel
 from twenty_patient_split import TEST_20P
 from utils import setup_reproducibility, get_device, sort_by_instance_number
 
@@ -135,6 +137,13 @@ def load_checkpoint(path: str, arch: str, device):
         )
     else:
         raise ValueError(f"Unknown arch: {arch}")
+
+    # Physics-informed spectral residual head (spectral_head.py). Wrap the
+    # base model exactly as train_20p.py did so state_dict keys match.
+    if bool(meta.get("use_spectral_head", False)):
+        n_bins = int(meta.get("spectral_bins", 32))
+        print(f"  Wrapping with SpectralResidualHead ({n_bins} radial gain knots)")
+        model = SpectralResidualModel(model, n_bins=n_bins).to(device)
 
     weights = state.get("model_state_dict", state)
     model.load_state_dict(weights, strict=True)
@@ -288,3 +297,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+}

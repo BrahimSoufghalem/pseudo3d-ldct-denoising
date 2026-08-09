@@ -24,6 +24,11 @@ Usage
         --lr 9.583417460320728e-05 --lr-schedule constant \\
         --select-by bench_ssim
 
+# Physics-informed spectral residual head (Option A: ARCHITECTURAL physics
+# addition, see spectral_head.py). Works with ANY --arch; the wrapped model
+# starts EXACTLY equal to the base model (G == 1 at init):
+    ... --arch redcnn --use-spectral-head --select-by bench_ssim
+
 # U-Net decoder (best for Chest VIF, beats RED-CNN):
     ... --use-multi-res --use-unet-decode
 
@@ -88,6 +93,7 @@ from metrics import (
     compute_vif_hu,
 )
 from physics_losses import BatchRadialNPSLoss
+from spectral_head import SpectralResidualModel
 from twenty_patient_split import TRAIN_20P, VAL_20P
 from utils import setup_reproducibility, get_device, get_state_dict
 
@@ -186,6 +192,17 @@ def parse_args():
                         "remains the ground truth.")
 
     # ── Architecture flags ─────────────────────────────────────────────────
+    p.add_argument("--use-spectral-head", action="store_true",
+                   help="[9] Physics-informed spectral residual head "
+                        "(spectral_head.py): a learnable RADIAL gain G(|f|) "
+                        "applied in the Fourier domain to the noise the base "
+                        "model removes. The radial-only constraint mirrors "
+                        "FBP noise physics (isotropic NPS); G is initialized "
+                        "to 1 so training starts exactly at the base model. "
+                        "ARCHITECTURAL addition: works with any --arch, "
+                        "including redcnn.")
+    p.add_argument("--spectral-bins", type=int, default=32,
+                   help="Number of radial gain knots for --use-spectral-head.")
     p.add_argument("--use-hu-gate",    action="store_true",
                    help="[1] SE-like HU-context gating per block.")
     p.add_argument("--use-mu-mod",     action="store_true",
@@ -234,7 +251,10 @@ def parse_args():
                         "spectrum of the noise the model removes to the "
                         "paired LDCT-NDCT residual, preserving noise "
                         "texture. Additive on top of the base loss. "
-                        "Architecture-independent (works with --arch redcnn).")
+                        "Architecture-independent (works with --arch redcnn). "
+                        "Pairs naturally with --use-spectral-head: the head "
+                        "provides the mechanism, this loss provides the "
+                        "training signal.")
 
     # ── Loss flags ─────────────────────────────────────────────────────────
     p.add_argument("--ssim-weight", type=float, default=0.0, metavar="W",
@@ -349,7 +369,7 @@ def build_model(arch, device, args):
     if arch == "local_residual":
         # U-Net decode needs more blocks so each branch has real depth.
         n_blocks = _BLOCKS_UNET if args.use_unet_decode else _BLOCKS_DEFAULT
-        return build_local_residual_model(
+        model = build_local_residual_model(
             device,
             channels=128, blocks=n_blocks, groups=args.groups,
             use_hu_gate=args.use_hu_gate,
@@ -363,7 +383,13 @@ def build_model(arch, device, args):
             use_unet_decode=args.use_unet_decode,
             unet_final_blocks=args.unet_final_blocks,
         )
-    return build_benchmark_model(arch, device)
+    else:
+        model = build_benchmark_model(arch, device)
+    if args.use_spectral_head:
+        model = SpectralResidualModel(model, n_bins=args.spectral_bins).to(device)
+        print(f"  Spectral head : ON ({args.spectral_bins} radial gain knots, "
+              f"init G=1 -> starts exactly at the base model)")
+    return model
 
 
 @torch.no_grad()
@@ -515,6 +541,8 @@ def main():
         raise RuntimeError("pip install pytorch-msssim")
     if args.nps_weight < 0.0:
         raise ValueError("--nps-weight must be >= 0")
+    if args.spectral_bins < 2:
+        raise ValueError("--spectral-bins must be >= 2")
 
     n_train, n_val = apply_split(args.split)
     setup_reproducibility()
@@ -549,6 +577,8 @@ def main():
 
     n_blocks = _BLOCKS_UNET if args.use_unet_decode else _BLOCKS_DEFAULT
     active = []
+    if args.use_spectral_head:
+        active.append(f"Spectral-Head(bins={args.spectral_bins})")
     if args.use_hu_gate:       active.append("HU-gate")
     if args.use_mu_mod:
         mu_tag = f"mu-mod@{args.mu_split or 'auto'}"
@@ -645,6 +675,8 @@ def main():
             "split":           args.split,
             "groups":          args.groups,
             "n_blocks":        n_blocks,
+            "use_spectral_head": args.use_spectral_head,
+            "spectral_bins":   args.spectral_bins,
             "use_hu_gate":     args.use_hu_gate,
             "use_freq_boost":  args.use_freq_boost,
             "use_dilation":    args.use_dilation,
