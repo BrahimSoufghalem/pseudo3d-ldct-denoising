@@ -8,6 +8,18 @@ Seven independently switchable improvements (all OFF by default):
   --use-multi-res   : parallel multi-resolution branches (full + down-x2 + down-x4)
   --use-unet-decode : U-Net skip connections over multi-res (requires --use-multi-res)
   --hu-bin-loss W   : HU-bin systematic-bias penalty (controlled in train_20p.py)
+
+Fixes (see TRAINING_FIXES.md):
+  - MuAwareModulation supports mode="local": the original global
+    AdaptiveAvgPool2d(1) computes FiLM parameters from a 128-px patch mean at
+    train time but from a 512-px full-slice mean at test time (distribution
+    shift). Local mode pools over fixed-size windows so both see statistics
+    of the same physical extent. Default remains "global" so existing
+    checkpoints load unchanged.
+  - U-Net decode supports unet_final_blocks: the default allocation for
+    blocks=20 is enc 5+5+5 / dec 5 / final 0, leaving no full-resolution
+    blocks after the decoder. unet_final_blocks=4 gives enc 4+4+4 / dec 4 /
+    final 4 within the same budget.
 """
 
 import torch
@@ -22,22 +34,54 @@ class MuAwareModulation(nn.Module):
     HU values encode X-ray attenuation mu. Different tissues (lung ~-900,
     soft tissue ~50, bone ~+400) have distinct noise characteristics.
     Initialized to identity (gamma=1, beta=0). ~4K params.
+
+    mode="global" (default): original behavior, a single image-wide context
+      vector via AdaptiveAvgPool2d(1). NOTE: this creates a train/test
+      mismatch when training on patches and testing on full slices.
+    mode="local": context is pooled over fixed ``local_window``-pixel windows
+      (stride window/2) and the resulting FiLM parameter map is bilinearly
+      upsampled to the feature size. Train patches and full slices then see
+      statistics with the same physical extent.
     """
 
-    def __init__(self, channels: int, reduction: int = 8):
+    def __init__(self, channels: int, reduction: int = 8,
+                 mode: str = "global", local_window: int = 64):
         super().__init__()
+        if mode not in ("global", "local"):
+            raise ValueError(f"mode must be 'global' or 'local', got {mode!r}")
+        self.mode         = mode
+        self.local_window = int(local_window)
         mid = max(1, channels // reduction)
-        self.encoder = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(1, mid, 1, bias=False),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(mid, channels * 2, 1, bias=True),
-        )
+        if mode == "global":
+            # Keep the exact original Sequential layout (pool at index 0) so
+            # existing checkpoints load without key remapping.
+            self.encoder = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(1, mid, 1, bias=False),
+                nn.ReLU(inplace=False),
+                nn.Conv2d(mid, channels * 2, 1, bias=True),
+            )
+        else:
+            self.encoder = nn.Sequential(
+                nn.Conv2d(1, mid, 1, bias=False),
+                nn.ReLU(inplace=False),
+                nn.Conv2d(mid, channels * 2, 1, bias=True),
+            )
         nn.init.zeros_(self.encoder[-1].weight)
         nn.init.zeros_(self.encoder[-1].bias)
 
     def forward(self, z: torch.Tensor, x_input: torch.Tensor) -> torch.Tensor:
-        params      = self.encoder(x_input)
+        if self.mode == "global":
+            params = self.encoder(x_input)
+        else:
+            h, w   = x_input.shape[-2:]
+            k      = min(self.local_window, h, w)
+            stride = max(1, k // 2)
+            ctx    = F.avg_pool2d(x_input, kernel_size=k, stride=stride)
+            params = self.encoder(ctx)
+            params = F.interpolate(
+                params, size=z.shape[-2:], mode="bilinear", align_corners=False
+            )
         gamma, beta = params.chunk(2, dim=1)
         return (gamma + 1.0) * z + beta
 
@@ -192,7 +236,7 @@ class LocalResidualNet(nn.Module):
     2. Parallel Multi-Res (--use-multi-res):
        in_conv -> [Full | Down×2 | Down×4] -> Fusion(3C->C) -> final -> out_conv
 
-    3. U-Net Decoder (--use-multi-res --use-unet-decode):  <-- beats RED-CNN
+    3. U-Net Decoder (--use-multi-res --use-unet-decode):
 
        in_conv
             |
@@ -213,25 +257,16 @@ class LocalResidualNet(nn.Module):
               |
            out_conv
 
-    Block allocation for n_blocks=10:
-       E=enc_n = n_blocks//4 = 2   (per encoder branch)
-       D=dec_n = n_blocks//4 = 2   (decoder half-res)
-       F=final = n_blocks - 3*E - D = 2
-       Total: 2+2+2 (enc) + 2 (dec_half) + 2 (final) = 10  ✓
+    Default block allocation for n_blocks=20 (unet_final_blocks=None):
+       E=enc_n = n_blocks//4 = 5   (per encoder branch)
+       D=dec_n = n_blocks//4 = 5   (decoder half-res)
+       F=final = n_blocks - 3*E - D = 0
 
-    Why U-Net decode beats flat multi-res
-    --------------------------------------
-    The flat multi-res fuses all three independently-processed branches at
-    the very end. Information from the qtr-res branch can only influence
-    the full-res output through the 1x1 fusion conv, which has no depth
-    to refine the features.
-
-    U-Net decode creates a hierarchical information flow:
-      qtr-res features first refine half-res (via SkipMerge + dec_half_blocks),
-      then the refined half-res features refine full-res (via SkipMerge).
-    This two-stage decoder lets the network progressively inject context from
-    coarse to fine, which is the structural reason RED-CNN outperforms flat
-    residual networks on Chest CT.
+    With unet_final_blocks=f, the remaining budget (n_blocks - f) is split
+    enc/enc/enc/dec and f blocks run at full resolution after the decoder,
+    e.g. n_blocks=20, f=4 -> enc 4+4+4 / dec 4 / final 4. High-frequency
+    (chest/lung) noise is mostly representable only at full resolution, so
+    reserving final blocks matters for chest VIF.
     """
 
     def __init__(
@@ -244,8 +279,11 @@ class LocalResidualNet(nn.Module):
         use_dilation: bool = False,
         use_mu_mod: bool = False,
         mu_split: int = None,
+        mu_mod_mode: str = "global",
+        mu_local_window: int = 64,
         use_multi_res: bool = False,
         use_unet_decode: bool = False,
+        unet_final_blocks: int = None,
         verbose: bool = True,
     ):
         super().__init__()
@@ -256,14 +294,21 @@ class LocalResidualNet(nn.Module):
         self.use_freq_boost  = bool(use_freq_boost)
         self.use_dilation    = bool(use_dilation)
         self.use_mu_mod      = bool(use_mu_mod)
+        self.mu_mod_mode     = str(mu_mod_mode)
+        self.mu_local_window = int(mu_local_window)
         self.use_multi_res   = bool(use_multi_res)
         self.use_unet_decode = bool(use_unet_decode)
+        self.unet_final_blocks = (
+            int(unet_final_blocks) if unet_final_blocks is not None else None
+        )
         self.mu_split = int(mu_split) if mu_split is not None else self.n_blocks // 2
 
         if self.n_blocks < 1:
             raise ValueError("blocks must be >= 1")
         if use_unet_decode and not use_multi_res:
             raise ValueError("--use-unet-decode requires --use-multi-res")
+        if self.unet_final_blocks is not None and not use_unet_decode:
+            raise ValueError("unet_final_blocks requires use_unet_decode")
         if use_mu_mod and not use_multi_res and not (1 <= self.mu_split < self.n_blocks):
             raise ValueError(
                 f"mu_split must be in [1, blocks-1], got {self.mu_split}"
@@ -283,9 +328,22 @@ class LocalResidualNet(nn.Module):
 
         if use_unet_decode:
             # ── U-Net encoder-decoder ──────────────────────────────────────
-            self.enc_n  = max(1, self.n_blocks // 4)       # 2 for n=10
-            self.dec_n  = max(1, self.n_blocks // 4)       # 2 for n=10
-            self.final_n = max(0, self.n_blocks - 3 * self.enc_n - self.dec_n)  # 2
+            if self.unet_final_blocks is None:
+                # Original allocation (backward compatible).
+                self.enc_n   = max(1, self.n_blocks // 4)
+                self.dec_n   = max(1, self.n_blocks // 4)
+                self.final_n = max(0, self.n_blocks - 3 * self.enc_n - self.dec_n)
+            else:
+                f   = self.unet_final_blocks
+                rem = self.n_blocks - f
+                if f < 0 or rem < 4:
+                    raise ValueError(
+                        f"unet_final_blocks must be in [0, {self.n_blocks - 4}], "
+                        f"got {f}"
+                    )
+                self.enc_n   = max(1, rem // 4)
+                self.dec_n   = max(1, rem - 3 * self.enc_n)
+                self.final_n = f
 
             # Encoder
             self.branch_full = nn.ModuleList([_blk() for _ in range(self.enc_n)])
@@ -321,7 +379,9 @@ class LocalResidualNet(nn.Module):
             self.blocks = nn.ModuleList([_blk() for _ in range(self.n_blocks)])
 
         if use_mu_mod:
-            self.mu_mod = MuAwareModulation(C)
+            self.mu_mod = MuAwareModulation(
+                C, mode=self.mu_mod_mode, local_window=self.mu_local_window
+            )
 
         if verbose:
             extras = []
@@ -335,7 +395,11 @@ class LocalResidualNet(nn.Module):
                     f"multi-res({self.branch_n}+{self.branch_n}+{self.branch_n}"
                     f"|{self.final_n})"
                 )
-            if self.use_mu_mod:      extras.append("mu-mod")
+            if self.use_mu_mod:
+                mu_tag = "mu-mod"
+                if self.mu_mod_mode == "local":
+                    mu_tag += f"(local,w={self.mu_local_window})"
+                extras.append(mu_tag)
             if self.use_dilation:    extras.append("dilation-2")
             if self.use_freq_boost:  extras.append("freq-boost")
             tag = " | " + "+".join(extras) if extras else ""
@@ -358,8 +422,11 @@ class LocalResidualNet(nn.Module):
             "use_dilation":    self.use_dilation,
             "use_mu_mod":      self.use_mu_mod,
             "mu_split":        self.mu_split,
+            "mu_mod_mode":     self.mu_mod_mode,
+            "mu_local_window": self.mu_local_window,
             "use_multi_res":   self.use_multi_res,
             "use_unet_decode": self.use_unet_decode,
+            "unet_final_blocks": self.unet_final_blocks,
             "output_mode":     "noise_subtraction",
         }
 
