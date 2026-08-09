@@ -15,7 +15,8 @@ noise a base denoiser wants to remove::
 
     y_hat  = base(x)                       # any denoiser (e.g. RED-CNN)
     n_hat  = x - y_hat                     # noise the base wants to remove
-    n'     = IFFT2( G(|f|) * FFT2(n_hat) ) # physics-shaped noise
+    m      = mean(n_hat)                   # per-image DC (HU calibration)
+    n'     = IFFT2( G(|f|) * FFT2(n_hat - m) ) + m
     output = x - n'
 
 Structural constraints (what a plain CNN cannot bypass):
@@ -23,6 +24,11 @@ Structural constraints (what a plain CNN cannot bypass):
 * ``G`` depends only on the radial frequency ``|f|`` -- the same rotational
   symmetry that FBP physics imposes on the NPS. The head cannot build a
   directional or spatially varying filter.
+* DC-PRESERVING (v2): the per-image mean of the removed noise passes
+  through UNCHANGED. HU calibration is a zero-frequency property; the head
+  shapes noise TEXTURE only. (In v1 the gain multiplied the DC component
+  too; under pure MSE it drifted and introduced a soft-tissue HU bias of a
+  few HU. Found experimentally with evaluate_physics.py.)
 * ``G`` is parameterized by ``n_bins`` (~32) interpolated log-gain knots and
   initialized to ``G == 1``, so the wrapped model starts EXACTLY equal to
   the base model (safe start; cannot begin worse than the trunk).
@@ -35,6 +41,10 @@ Interpretability: after training, plot the learned curve with
 of the energy the trunk wanted to remove there (protects detail /
 noise-texture); ``G > 1`` means it removes more.
 
+Compatibility: v1 checkpoints load into v2 (identical parameters), but the
+forward pass differs (DC preservation); re-train or at least re-evaluate
+before comparing numbers across versions.
+
 Limitations: the radial-symmetry constraint is exact for FBP
 reconstructions (our benchmark data); for iterative/deep reconstructions
 the NPS is less isotropic and a low-parameter 2-D gain would be the natural
@@ -46,7 +56,7 @@ import torch.nn as nn
 
 
 class SpectralResidualHead(nn.Module):
-    """Learnable radial gain applied in the Fourier domain.
+    """Learnable radial gain applied in the Fourier domain (DC-preserving).
 
     Parameters
     ----------
@@ -94,13 +104,21 @@ class SpectralResidualHead(nn.Module):
         return cached
 
     def forward(self, noise: torch.Tensor) -> torch.Tensor:
-        """Shape the spectrum of ``noise`` (B, C, H, W) with G(|f|)."""
+        """Shape the spectrum of ``noise`` (B, C, H, W) with G(|f|).
+
+        DC-preserving: the per-image spatial mean of ``noise`` is removed
+        before shaping and added back unchanged, so the head cannot alter
+        HU calibration (zero-frequency content).
+        """
         h, w = noise.shape[-2], noise.shape[-1]
+        dc = noise.mean(dim=(-2, -1), keepdim=True)
+        ac = noise - dc
         idx0, idx1, frac = self._interp_grid(h, w, noise.device)
         g = self.gain_curve()
         gain2d = (1.0 - frac) * g[idx0] + frac * g[idx1]  # (H, W//2+1)
-        spec = torch.fft.rfft2(noise, norm="ortho")
-        return torch.fft.irfft2(spec * gain2d, s=(h, w), norm="ortho")
+        spec = torch.fft.rfft2(ac, norm="ortho")
+        shaped = torch.fft.irfft2(spec * gain2d, s=(h, w), norm="ortho")
+        return shaped + dc
 
 
 class SpectralResidualModel(nn.Module):
