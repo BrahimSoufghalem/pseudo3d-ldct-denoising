@@ -90,6 +90,33 @@ def _val_transform(patch_size):
     ])
 
 
+def _limit_patients(patients, max_n, label):
+    """Deterministic chest/abdomen-balanced subset of a sorted patient list.
+
+    PILOT MODE helper: alternates chest ('C*') and abdomen ('L*') patients in
+    sorted order until ``max_n`` are picked, so a small subset keeps both body
+    regions represented. Deterministic: same input list -> same subset, which
+    keeps different pilot configs comparable.
+    """
+    if max_n is None or int(max_n) <= 0 or int(max_n) >= len(patients):
+        return patients
+    max_n = int(max_n)
+    chest = [p for p in patients if p.lower().startswith("c")]
+    abd = [p for p in patients if not p.lower().startswith("c")]
+    picked = []
+    i = 0
+    while len(picked) < max_n and (i < len(chest) or i < len(abd)):
+        if i < len(chest):
+            picked.append(chest[i])
+        if len(picked) < max_n and i < len(abd):
+            picked.append(abd[i])
+        i += 1
+    picked = sorted(picked)
+    print(f"PILOT: limiting {label} patients to {len(picked)}/{len(patients)}: "
+          f"{picked}")
+    return picked
+
+
 def prepare_local_residual_data(
     in_dir=cfg.DATA_DIR,
     train_patch_size=64,
@@ -100,6 +127,8 @@ def prepare_local_residual_data(
     num_workers=cfg.NUM_WORKERS,
     cache=True,
     cache_rate=1.0,
+    max_train_patients=None,
+    max_val_patients=None,
 ):
     """Create patient-balanced train batches and deterministic validation crops.
 
@@ -107,6 +136,10 @@ def prepare_local_residual_data(
     in ldct-benchmark. Every patient has equal total sampling mass regardless of
     slice count. Validation remains deterministic and visits every validation
     slice, which is more stable than randomly resampling validation patients.
+
+    ``max_train_patients`` / ``max_val_patients`` enable PILOT MODE: a
+    deterministic chest/abdomen-balanced subset for fast config screening.
+    Pilot results rank configurations; they are NOT reportable numbers.
     """
     set_determinism(seed=cfg.SEED)
     random.seed(cfg.SEED)
@@ -122,6 +155,8 @@ def prepare_local_residual_data(
             "The benchmark-aligned control requires the explicit patient split "
             "from config.py; train or validation patients were not found."
         )
+    train_patients = _limit_patients(train_patients, max_train_patients, "train")
+    val_patients = _limit_patients(val_patients, max_val_patients, "val")
 
     train_files = collect_files(train_patients, in_dir, input_mode="2d")
     val_files = collect_files(val_patients, in_dir, input_mode="2d")

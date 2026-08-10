@@ -24,6 +24,11 @@ Usage
         --lr 9.583417460320728e-05 --lr-schedule constant \\
         --select-by bench_ssim
 
+# PILOT MODE: fast config screening on a small deterministic patient subset
+# (chest/abdomen balanced). Ranking only -- NOT reportable numbers. See also
+# run_pilot.py to sweep several configs sequentially with a summary table:
+    ... --train-patients 8 --val-patients 4 --max-iterations 8000
+
 # Physics-informed spectral residual head (Option A: ARCHITECTURAL physics
 # addition, see spectral_head.py). Works with ANY --arch; the wrapped model
 # starts EXACTLY equal to the base model (G == 1 at init):
@@ -104,9 +109,9 @@ except ImportError:
     _HAS_MSSSIM = False
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # Block budget constants
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 _BLOCKS_DEFAULT    = 10   # sequential / flat multi-res
 _BLOCKS_UNET       = 20   # U-Net decode: 5 enc x3 + 5 dec_half = 20 blocks
                           # (enc_n = 20//4 = 5  per branch, dec_n = 5, final = 0)
@@ -140,7 +145,7 @@ def _get_nps_loss():
     return _NPS_LOSS
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
         description="Fair comparison trainer with seven optional improvements"
@@ -168,6 +173,19 @@ def parse_args():
     p.add_argument("--output-root",           default="runs")
     p.add_argument("--groups",                type=int,   default=1)
     p.add_argument("--resume", action="store_true")
+
+    # ── Pilot mode ────────────────────────────────────────────────────────
+    p.add_argument("--train-patients", type=int, default=None, metavar="N",
+                   help="PILOT MODE: train on only N patients (deterministic "
+                        "chest/abdomen-balanced subset). For fast config "
+                        "screening: the RANKING of configs is meaningful, "
+                        "the absolute numbers are NOT reportable. Retrain "
+                        "the winning config on the full split before "
+                        "reporting.")
+    p.add_argument("--val-patients", type=int, default=None, metavar="N",
+                   help="PILOT MODE: validate on only N patients "
+                        "(deterministic chest/abdomen-balanced subset). "
+                        "Speeds up the per-cycle validation pass.")
 
     # ── Checkpoint selection ──────────────────────────────────────────────
     p.add_argument("--select-by", choices=list(_SELECT_CHOICES),
@@ -256,7 +274,7 @@ def parse_args():
                         "provides the mechanism, this loss provides the "
                         "training signal.")
 
-    # ── Loss flags ─────────────────────────────────────────────────────────
+    # ── Loss flags ─────────────────────────────────────────────────────────────
     p.add_argument("--ssim-weight", type=float, default=0.0, metavar="W",
                    help="SSIM loss weight (requires pytorch-msssim).")
     p.add_argument("--l1-weight",   type=float, default=0.0, metavar="W",
@@ -266,7 +284,7 @@ def parse_args():
     return p.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 def image_gradient_loss(pred, target):
     dx_pred   = pred  [:, :, :, 1:] - pred  [:, :, :, :-1]
     dx_target = target[:, :, :, 1:] - target[:, :, :, :-1]
@@ -526,7 +544,7 @@ def train_cycle(model, loader, optimizer, device, iteration, max_iter,
     return iteration, total / max(1, count)
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
@@ -543,8 +561,17 @@ def main():
         raise ValueError("--nps-weight must be >= 0")
     if args.spectral_bins < 2:
         raise ValueError("--spectral-bins must be >= 2")
+    if args.train_patients is not None and args.train_patients < 1:
+        raise ValueError("--train-patients must be >= 1")
+    if args.val_patients is not None and args.val_patients < 1:
+        raise ValueError("--val-patients must be >= 1")
 
     n_train, n_val = apply_split(args.split)
+    if args.train_patients is not None:
+        n_train = min(n_train, args.train_patients)
+    if args.val_patients is not None:
+        n_val = min(n_val, args.val_patients)
+    pilot = args.train_patients is not None or args.val_patients is not None
     setup_reproducibility()
     device    = get_device()
     out_dir   = os.path.join(args.output_root, args.arch)
@@ -606,6 +633,10 @@ def main():
     print(f"  Select best by : {args.select_by}"
           + (" [ldct-benchmark paper criterion]" if args.select_by == "bench_ssim" else "")
           + (" (+VIF in val)" if with_vif else ""))
+    if pilot:
+        print("  *** PILOT MODE : reduced patient subset. Use for config "
+              "screening/ranking ONLY -- retrain the winner on the full "
+              "split before reporting numbers. ***")
     print(f"{'='*68}\n")
 
     model     = build_model(args.arch, device, args)
@@ -642,6 +673,8 @@ def main():
         iterations_before_val=args.iterations_before_val,
         num_workers=args.num_workers,
         cache_rate=args.cache_rate,
+        max_train_patients=args.train_patients,
+        max_val_patients=args.val_patients,
     )
 
     print(f"Loss      : {loss_desc}")
@@ -707,6 +740,9 @@ def main():
             "input_mode":      "2d",
             "n_train_patients": n_train,
             "n_val_patients":   n_val,
+            "max_train_patients": args.train_patients,
+            "max_val_patients":   args.val_patients,
+            "pilot_mode":      pilot,
         }
         payload = {
             "model_state_dict": get_state_dict(model),
@@ -751,6 +787,11 @@ def main():
     print(f"\nDone [{args.arch.upper()}] in {total} | "
           f"best {args.select_by}={best_score:.5f}")
     print(f"Checkpoint -> {os.path.join(out_dir, 'best_model.pt')}")
+
+    if pilot:
+        print("\nPILOT MODE reminder: these numbers are for config "
+              "ranking only. Retrain the winning config on the full "
+              "split with the paper budget before reporting.")
 
 
 if __name__ == "__main__":
