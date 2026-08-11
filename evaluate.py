@@ -1,22 +1,43 @@
 """
-LDCT Project — Evaluation Script (Full Image Resolution & ldct-benchmark Physics Standard)
-==========================================================================================
-All parameters, paths, clinical windows, and evaluation settings are imported from `config.py`.
-Runs the trained model on the `test/` folder using FULL original resolution
-without any cropping or padding.
+LDCT Project - Evaluation Script (full resolution, ldct-benchmark physics)
+=========================================================================
+Runs a trained model over the `test/` folder at FULL original resolution
+(no cropping, no padding loss - the model pads internally and crops back).
 
-Calculates physically & clinically accurate metrics using the exact ldct-benchmark standard:
-- RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
-- PSNR & SSIM: Measured on Clinical Diagnostic Windows (Lung Window for Chest, Soft Tissue Window for Abdomen).
-- VIF: Measured on physical HU scale.
+Metrics (ldct-benchmark standard):
+- RMSE       : physical HU, clipped to [0, A_MAX + 1024] (see config).
+- PSNR/SSIM  : on clinical diagnostic windows (lung for chest, soft tissue for abdomen).
+- VIF        : on the physical HU scale.
+
+Every metric is reported THREE ways: for the denoised output, for the raw LDCT
+input (the baseline), and as the delta between them. The baseline columns exist
+because VIF counts noise as information, so a denoiser can gain 9 dB of PSNR
+while losing VIF against its own input. A negative Delta_VIF means the model is
+destroying visual information, which is a different disease from simply being
+weak, and it needs a different cure.
+
+OPERATING-POINT SWEEP (--blend)
+-------------------------------
+`--blend a1,a2,...` evaluates alpha * prediction + (1 - alpha) * ldct_input for
+each alpha, reusing a single forward pass and a single baseline pass per slice.
+Because the network is residual, this is exactly a denoising-strength knob:
+
+    alpha * (x + r) + (1 - alpha) * x  =  x + alpha * r
+
+alpha < 1 holds part of the input back (weaker denoising); alpha > 1 "over-
+applies" the predicted residual (stronger denoising). The sweep measures the
+model's own trade-off curve without retraining. If VIF peaks below alpha = 1
+the model is over-smoothing; if it peaks above 1 the residual is systematically
+under-applied; if it peaks exactly at 1 the operating point is already optimal
+and the deficit lies elsewhere.
 
 Usage:
-    python evaluate.py
-    python evaluate.py --model FinalCT_2.5D-UNET-DATASET/best_model.pt 
-    python evaluate.py --save-images
+    python evaluate.py --input-mode 2.5d --mamba-mode full
+    python evaluate.py --model runs/25d_full/best_model.pt --save-images
+    python evaluate.py --model runs_charb/2d_basic/best_model.pt --no-amp \\
+        --blend 1.0,1.1,1.2,1.35 --output eval_blend_hi
 """
 
-import os
 import argparse
 from pathlib import Path
 from glob import glob
@@ -26,14 +47,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from torch.cuda.amp import autocast
 from tqdm import tqdm
 
-from config import (
-    TEST_DIR, BEST_MODEL_PATH, EVAL_OUTPUT_DIR,
-    A_MIN, A_MAX, B_MIN, B_MAX,
+import config as cfg
+from config import TEST_DIR, EVAL_OUTPUT_DIR, A_MIN, A_MAX
+from utils import (
+    setup_reproducibility, get_device, sort_by_instance_number,
+    build_model_input, extract_centre_slice, load_state_into,
 )
-from utils import setup_reproducibility, get_device, sort_by_instance_number, build_pseudo3d_input
 from model import build_model
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
@@ -44,6 +65,12 @@ from metrics import (
 import pydicom
 
 
+# Upper bound for --blend. Values above 1.0 over-apply the residual, which is a
+# legitimate thing to measure; values much above ~1.5 are meaningless because
+# the output saturates against the [0, 1] clamp.
+MAX_BLEND = 2.0
+
+
 # ═══════════════════════════════════════════
 # DICOM LOADER & NORMALIZATION
 # ═══════════════════════════════════════════
@@ -51,30 +78,55 @@ def load_dicom_tensor(path):
     """Read one DICOM file and return a float32 tensor in HU."""
     ds = pydicom.dcmread(path)
     arr = ds.pixel_array.astype(np.float32)
-
-    # Apply RescaleSlope / RescaleIntercept if available
     slope = float(getattr(ds, "RescaleSlope", 1.0))
     intercept = float(getattr(ds, "RescaleIntercept", 0.0))
     arr = arr * slope + intercept
-
     return torch.from_numpy(arr)
 
 
 def normalize(tensor, a_min=A_MIN, a_max=A_MAX):
-    """Clip and scale HU → [0, 1]."""
-    tensor = tensor.clamp(a_min, a_max)
-    tensor = (tensor - a_min) / (a_max - a_min)
-    return tensor
+    """Clip and scale HU -> [0, 1]."""
+    return (tensor.clamp(a_min, a_max) - a_min) / (a_max - a_min)
+
+
+def parse_blends(raw):
+    """Parse the --blend argument into a validated, ordered list of alphas."""
+    values = []
+    for part in str(raw).replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            a = float(part)
+        except ValueError:
+            raise ValueError(f"--blend expects comma-separated floats, got '{raw}'") from None
+        if not 0.0 <= a <= MAX_BLEND:
+            raise ValueError(f"--blend values must lie in [0, {MAX_BLEND:g}], got {a}")
+        if a not in values:
+            values.append(a)
+    if not values:
+        raise ValueError("--blend needs at least one value")
+    return values
 
 
 # ═══════════════════════════════════════════
 # PATIENT EVALUATION
 # ═══════════════════════════════════════════
 @torch.no_grad()
-def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_dir=None):
-    """
-    Evaluate one patient — runs the model on every slice using FULL resolution
-    and returns a dict with average benchmark-aligned metrics.
+def evaluate_patient(pid, patient_dir, model, device, input_mode="2.5d",
+                     save_images=False, output_dir=None, use_amp=True,
+                     blends=(1.0,)):
+    """Evaluate every slice of one patient at full resolution.
+
+    Each metric is computed twice per slice: once for the prediction and once
+    for the unprocessed LDCT centre slice. The baseline pass is what makes
+    Delta_VIF available, and Delta_VIF is the number that decides whether the
+    remaining gap is a capacity problem or an objective-function problem.
+
+    When several `blends` are given, the model runs ONCE per slice and the
+    residual is rescaled at each alpha, so the sweep is almost free relative to
+    a single evaluation.
+
+    Returns one result row per alpha.
     """
     low_dir = patient_dir / "Low_Dose"
     full_dir = patient_dir / "Full_Dose"
@@ -87,235 +139,388 @@ def evaluate_patient(pid, patient_dir, model, device, save_images=False, output_
 
     n = len(low_imgs)
     body_type = "Chest" if pid[0].upper() == "C" else "Abdomen"
+    blends = list(blends)
 
-    psnr_scores, ssim_scores, rmse_scores, vif_scores = [], [], [], []
-    baseline_psnr_scores = []
+    # Per-alpha accumulators; the baseline is shared across alphas.
+    scores = {a: {"psnr": [], "ssim": [], "rmse": [], "vif": []} for a in blends}
+    base_psnr_scores, base_ssim_scores, base_rmse_scores, base_vif_scores = [], [], [], []
 
-    # Save one visualization per patient (middle slice)
     viz_slice_idx = n // 2
     viz_triplet = None
+
+    amp_enabled = use_amp and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if (amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
 
     for i in tqdm(range(n), desc=f"  [{pid}]", leave=False, unit="slice"):
         prev_i = max(i - 1, 0)
         next_i = min(i + 1, n - 1)
 
-        # Load raw HU tensors
         raw_prev = load_dicom_tensor(low_imgs[prev_i])
         raw_curr = load_dicom_tensor(low_imgs[i])
         raw_next = load_dicom_tensor(low_imgs[next_i])
         raw_full = load_dicom_tensor(full_imgs[i])
 
-        # Build 3-channel Pseudo-3D input [1, 3, H, W]
-        inp = build_pseudo3d_input(
-            raw_prev, raw_curr, raw_next,
-            a_min=A_MIN, a_max=A_MAX
-        ).to(device)
-
+        # [1, C, H, W] with C = 1 (2d) or 3 (2.5d); HU limits come from config
+        inp = build_model_input(raw_prev, raw_curr, raw_next, input_mode=input_mode).to(device)
         lbl = normalize(raw_full).unsqueeze(0).unsqueeze(0).to(device)
-        mid = inp[:, 1:2, :, :]                              # current low-dose slice in full HU range [0, 1]
+        mid = extract_centre_slice(inp)
 
-        with autocast():
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             pred_res = model(inp)
-            pred = torch.clamp(mid + pred_res, 0.0, 1.0)
 
-        # ── 1. Convert tensors to HU + 1024 offset domain (ldct-benchmark standard) ──
-        pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
-        lbl_hu_offset  = denormalize_to_hu_offset(lbl.squeeze(),  A_MIN, A_MAX)
-        mid_hu_offset  = denormalize_to_hu_offset(mid.squeeze(),  A_MIN, A_MAX)
+        mid_f = mid.float()
+        res_f = pred_res.float()
 
-        # ── 2. Compute ldct-benchmark metrics ──
-        p_val = compute_psnr_windowed(pred_hu_offset, lbl_hu_offset, body_type)
-        b_val = compute_psnr_windowed(mid_hu_offset,  lbl_hu_offset, body_type)
-        s_val = compute_ssim_windowed(pred_hu_offset, lbl_hu_offset, body_type)
-        r_val = compute_rmse_hu(pred_hu_offset, lbl_hu_offset)
-        v_val = compute_vif_hu(pred_hu_offset, lbl_hu_offset)
+        lbl_hu_offset = denormalize_to_hu_offset(lbl.squeeze(), A_MIN, A_MAX)
+        mid_hu_offset = denormalize_to_hu_offset(mid_f.squeeze(), A_MIN, A_MAX)
 
-        psnr_scores.append(p_val)
-        ssim_scores.append(s_val)
-        rmse_scores.append(r_val)
-        vif_scores.append(v_val)
-        baseline_psnr_scores.append(b_val)
+        # Unprocessed LDCT input vs ground truth - identical for every alpha
+        base_psnr_scores.append(compute_psnr_windowed(mid_hu_offset, lbl_hu_offset, body_type))
+        base_ssim_scores.append(compute_ssim_windowed(mid_hu_offset, lbl_hu_offset, body_type))
+        base_rmse_scores.append(compute_rmse_hu(mid_hu_offset, lbl_hu_offset))
+        base_vif_scores.append(compute_vif_hu(mid_hu_offset, lbl_hu_offset))
 
-        if i == viz_slice_idx:
-            center, width = CW.get(body_type, CW["Abdomen"])
-            viz_triplet = (
-                apply_center_width(mid_hu_offset, center, width),
-                apply_center_width(lbl_hu_offset, center, width),
-                apply_center_width(pred_hu_offset, center, width),
-            )
+        for a in blends:
+            # alpha * prediction + (1 - alpha) * input, which for a residual
+            # model is simply a scaled residual.
+            pred = torch.clamp(mid_f + a * res_f, 0.0, 1.0)
+            pred_hu_offset = denormalize_to_hu_offset(pred.squeeze(), A_MIN, A_MAX)
 
-    avg = lambda lst: sum(lst) / max(len(lst), 1)
+            scores[a]["psnr"].append(compute_psnr_windowed(pred_hu_offset, lbl_hu_offset, body_type))
+            scores[a]["ssim"].append(compute_ssim_windowed(pred_hu_offset, lbl_hu_offset, body_type))
+            scores[a]["rmse"].append(compute_rmse_hu(pred_hu_offset, lbl_hu_offset))
+            scores[a]["vif"].append(compute_vif_hu(pred_hu_offset, lbl_hu_offset))
 
-    result = {
-        "PatientID":      pid,
-        "BodyType":       body_type,
-        "NumSlices":      n,
-        "PSNR":           round(avg(psnr_scores), 4),
-        "Baseline_PSNR":  round(avg(baseline_psnr_scores), 4),
-        "Delta_PSNR":     round(avg(psnr_scores) - avg(baseline_psnr_scores), 4),
-        "SSIM":           round(avg(ssim_scores), 4),
-        "RMSE_HU":        round(avg(rmse_scores), 4),
-        "VIF":            round(avg(vif_scores), 4),
-    }
+            if i == viz_slice_idx and a == blends[0]:
+                center, width = CW.get(body_type, CW["Abdomen"])
+                viz_triplet = (
+                    apply_center_width(mid_hu_offset, center, width),
+                    apply_center_width(lbl_hu_offset, center, width),
+                    apply_center_width(pred_hu_offset, center, width),
+                )
 
-    # Save visualization
+    def avg(lst):
+        return sum(lst) / max(len(lst), 1)
+
+    b_psnr, b_ssim, b_rmse, b_vif = (
+        avg(base_psnr_scores), avg(base_ssim_scores), avg(base_rmse_scores), avg(base_vif_scores)
+    )
+
+    results = []
+    for a in blends:
+        m_psnr = avg(scores[a]["psnr"])
+        m_ssim = avg(scores[a]["ssim"])
+        m_rmse = avg(scores[a]["rmse"])
+        m_vif = avg(scores[a]["vif"])
+
+        results.append({
+            "PatientID": pid,
+            "BodyType": body_type,
+            "NumSlices": n,
+            "Blend": a,
+
+            "PSNR": round(m_psnr, 4),
+            "Baseline_PSNR": round(b_psnr, 4),
+            "Delta_PSNR": round(m_psnr - b_psnr, 4),
+
+            "SSIM": round(m_ssim, 4),
+            "Baseline_SSIM": round(b_ssim, 4),
+            "Delta_SSIM": round(m_ssim - b_ssim, 4),
+
+            "RMSE_HU": round(m_rmse, 4),
+            "Baseline_RMSE_HU": round(b_rmse, 4),
+            # baseline minus prediction, so positive always means "better"
+            "Delta_RMSE_HU": round(b_rmse - m_rmse, 4),
+
+            "VIF": round(m_vif, 4),
+            "Baseline_VIF": round(b_vif, 4),
+            "Delta_VIF": round(m_vif - b_vif, 4),
+        })
+
     if save_images and viz_triplet is not None and output_dir is not None:
-        save_patient_viz(pid, body_type, viz_triplet, result, output_dir)
+        save_patient_viz(pid, body_type, viz_triplet, results[0], output_dir)
 
-    return result
+    return results
 
 
 # ═══════════════════════════════════════════
-# VISUALIZATION HELPER
+# VISUALIZATION
 # ═══════════════════════════════════════════
 def save_patient_viz(pid, body_type, viz_triplet, metrics, output_dir):
-    """Save a side-by-side triplet: LDCT | NDCT | Denoised (using clinical window)."""
+    """Save a side-by-side triplet: LDCT | NDCT | Denoised (clinical window)."""
     ldct, ndct, denoised = viz_triplet
     fig = plt.figure(figsize=(15, 5))
     gs = gridspec.GridSpec(1, 3, wspace=0.05)
 
     window_name = "Lung Window (C=-600, W=1500)" if body_type == "Chest" else "Soft Tissue Window (C=50, W=400)"
-
     titles = [
-        f"LDCT (Input)\nBaseline PSNR: {metrics['Baseline_PSNR']:.2f} dB",
+        f"LDCT (Input)\nPSNR: {metrics['Baseline_PSNR']:.2f} dB | VIF: {metrics['Baseline_VIF']:.4f}",
         f"NDCT (Ground Truth)\n{window_name}",
-        f"Denoised (Output)\nPSNR: {metrics['PSNR']:.2f} dB | SSIM: {metrics['SSIM']:.4f} | RMSE: {metrics['RMSE_HU']:.2f} HU",
+        f"Denoised (Output)\nPSNR: {metrics['PSNR']:.2f} dB | SSIM: {metrics['SSIM']:.4f} | VIF: {metrics['VIF']:.4f}",
     ]
-    imgs = [ldct, ndct, denoised]
-    cmap = "gray"
 
-    for j, (img, title) in enumerate(zip(imgs, titles)):
+    for j, (img, title) in enumerate(zip([ldct, ndct, denoised], titles)):
         ax = fig.add_subplot(gs[j])
-        ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
+        ax.imshow(img, cmap="gray", vmin=0, vmax=1)
         ax.set_title(title, fontsize=10)
         ax.axis("off")
 
     fig.suptitle(f"Patient: {pid} | Type: {body_type}", fontsize=12, fontweight="bold")
-    out_path = output_dir / f"{pid}_viz.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.savefig(output_dir / f"{pid}_viz.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 # ═══════════════════════════════════════════
-# PRINT SUMMARY TABLE
+# SUMMARY
 # ═══════════════════════════════════════════
-def print_summary(df):
-    """Print per-body-type and overall average metrics."""
-    print("\n" + "=" * 75)
-    print("📊  EVALUATION RESULTS (ldct-benchmark Physical Standard)")
-    print("=" * 75)
-    print(f"\n{'Patient':<14} {'Type':<9} {'Slices':>6}  {'ΔPSNR':>8}  {'PSNR':>8}  {'SSIM':>8}  {'RMSE(HU)':>10}  {'VIF':>8}")
-    print("-" * 75)
+def print_summary(df, title=None, verdict=True):
+    """Print per-patient rows, then per-region model / input / delta triplets."""
+    print("\n" + "=" * 92)
+    print(title or "EVALUATION RESULTS (ldct-benchmark physical standard)")
+    print("=" * 92)
+    print(
+        f"\n{'Patient':<10} {'Type':<9} {'Slices':>6}  {'dPSNR':>7}  {'PSNR':>7}  "
+        f"{'SSIM':>7}  {'RMSE(HU)':>9}  {'VIF':>7}  {'dVIF':>8}"
+    )
+    print("-" * 92)
 
     for _, row in df.iterrows():
         print(
-            f"{row['PatientID']:<14} {row['BodyType']:<9} {row['NumSlices']:>6}  "
-            f"{row['Delta_PSNR']:>+8.2f}  {row['PSNR']:>8.2f}  "
-            f"{row['SSIM']:>8.4f}  {row['RMSE_HU']:>10.2f}  {row['VIF']:>8.4f}"
+            f"{row['PatientID']:<10} {row['BodyType']:<9} {row['NumSlices']:>6}  "
+            f"{row['Delta_PSNR']:>+7.2f}  {row['PSNR']:>7.2f}  "
+            f"{row['SSIM']:>7.4f}  {row['RMSE_HU']:>9.2f}  {row['VIF']:>7.4f}  {row['Delta_VIF']:>+8.4f}"
         )
 
-    print("=" * 75)
+    print("=" * 92)
+
+    overall_delta_vif = None
 
     for body_type in ["Chest", "Abdomen", "Overall"]:
         sub = df if body_type == "Overall" else df[df["BodyType"] == body_type]
         if sub.empty:
             continue
-        label = f"  {body_type} avg " if body_type != "Overall" else "  Overall avg"
+
+        m = (sub["PSNR"].mean(), sub["SSIM"].mean(), sub["RMSE_HU"].mean(), sub["VIF"].mean())
+        b = (sub["Baseline_PSNR"].mean(), sub["Baseline_SSIM"].mean(),
+             sub["Baseline_RMSE_HU"].mean(), sub["Baseline_VIF"].mean())
+        d = (m[0] - b[0], m[1] - b[1], b[2] - m[2], m[3] - b[3])
+
+        if body_type == "Overall":
+            overall_delta_vif = d[3]
+
+        print(f"\n  {body_type}")
+        print(f"    Denoised  :  PSNR {m[0]:>7.2f} dB  |  SSIM {m[1]:>7.4f}  |  "
+              f"RMSE {m[2]:>7.2f} HU  |  VIF {m[3]:>7.4f}")
+        print(f"    LDCT input:  PSNR {b[0]:>7.2f} dB  |  SSIM {b[1]:>7.4f}  |  "
+              f"RMSE {b[2]:>7.2f} HU  |  VIF {b[3]:>7.4f}")
+        print(f"    Delta     :       {d[0]:>+7.2f} dB  |       {d[1]:>+7.4f}  |  "
+              f"     {d[2]:>+7.2f} HU  |      {d[3]:>+7.4f}")
+
+    print("\n" + "=" * 92)
+
+    if verdict and overall_delta_vif is not None:
+        if overall_delta_vif < 0:
+            print(
+                "VERDICT: Delta_VIF is NEGATIVE. The model removes more visual information than\n"
+                "         it restores. This is an objective-function problem, not a capacity one:\n"
+                "         Charbonnier, SSIM and Sobel are all pointwise distances whose optimum is\n"
+                "         the posterior mean, i.e. blur wherever texture and quantum noise share a\n"
+                "         frequency band. Reweighting them cannot fix it. Changing the objective\n"
+                "         class (adversarial / perceptual) or the input (true 2.5D) can."
+            )
+        else:
+            print(
+                "VERDICT: Delta_VIF is positive. The model adds visual information; the gap to the\n"
+                "         benchmark is a matter of degree."
+            )
+        print("=" * 92)
+
+
+def print_blend_curve(df, blends):
+    """Print the PSNR/VIF trade-off curve across blend factors.
+
+    Read the VIF columns first. A peak below alpha = 1 means the model is
+    over-smoothing; a peak above 1 means the residual is under-applied; a peak
+    exactly at 1 means the operating point is already optimal and the deficit
+    is not a filtering-strength problem at all.
+    """
+    print("\n" + "=" * 92)
+    print("BLEND SWEEP: alpha * prediction + (1 - alpha) * LDCT input  ==  x + alpha * residual")
+    print("=" * 92)
+    print(
+        f"\n{'alpha':>6} | {'PSNR C':>8} {'SSIM C':>8} {'VIF C':>8} | "
+        f"{'PSNR A':>8} {'SSIM A':>8} {'VIF A':>8}"
+    )
+    print("-" * 92)
+
+    best = {}
+    for a in blends:
+        sub = df[df["Blend"] == a]
+        chest = sub[sub["BodyType"] == "Chest"]
+        abdo = sub[sub["BodyType"] == "Abdomen"]
+
+        row = {
+            "psnr_c": chest["PSNR"].mean(), "ssim_c": chest["SSIM"].mean(),
+            "vif_c": chest["VIF"].mean(),
+            "psnr_a": abdo["PSNR"].mean(), "ssim_a": abdo["SSIM"].mean(),
+            "vif_a": abdo["VIF"].mean(),
+        }
+        best[a] = row
         print(
-            f"\n{label:<20} "
-            f"ΔPSNR: {sub['Delta_PSNR'].mean():>+6.2f} dB  |  "
-            f"PSNR: {sub['PSNR'].mean():>6.2f} dB  |  "
-            f"SSIM: {sub['SSIM'].mean():>6.4f}  |  "
-            f"RMSE: {sub['RMSE_HU'].mean():>6.2f} HU  |  "
-            f"VIF: {sub['VIF'].mean():>6.4f}"
+            f"{a:>6.2f} | {row['psnr_c']:>8.2f} {row['ssim_c']:>8.4f} {row['vif_c']:>8.4f} | "
+            f"{row['psnr_a']:>8.2f} {row['ssim_a']:>8.4f} {row['vif_a']:>8.4f}"
         )
 
-    print("=" * 75)
+    print("-" * 92)
+
+    a_vif_c = max(blends, key=lambda a: best[a]["vif_c"])
+    a_vif_a = max(blends, key=lambda a: best[a]["vif_a"])
+    a_psnr_c = max(blends, key=lambda a: best[a]["psnr_c"])
+    lo, hi = min(blends), max(blends)
+
+    print(f"\n  VIF peaks at   alpha = {a_vif_c:.2f} (chest), {a_vif_a:.2f} (abdomen)")
+    print(f"  PSNR peaks at  alpha = {a_psnr_c:.2f} (chest)")
+
+    peak = max(a_vif_c, a_vif_a)
+
+    if peak < 1.0:
+        print(
+            "\n  READING: VIF is maximised by holding some of the input back, so the model is\n"
+            "  OVER-SMOOTHING. The constraint is the operating point, not the architecture.\n"
+            "  Reducing denoising strength - or training towards a lower one - costs no\n"
+            "  parameters."
+        )
+    elif peak > 1.0:
+        print(
+            "\n  READING: VIF is maximised ABOVE alpha = 1, so the model systematically\n"
+            "  UNDER-APPLIES its own residual. Rescaling the output is free; check the SSIM\n"
+            "  and PSNR columns at the same alpha before adopting it, since the three metrics\n"
+            "  do not have to peak together."
+        )
+    else:
+        print(
+            "\n  READING: VIF is highest at exactly alpha = 1, so the model is neither over-\n"
+            "  smoothing nor under-applying its residual. The operating point is already\n"
+            "  optimal and the deficit is genuinely about how much information the model\n"
+            "  recovers, not about how hard it filters."
+        )
+
+    if peak >= hi and hi < MAX_BLEND:
+        print(
+            f"\n  NOTE: the optimum sits at the top of the swept range ({hi:g}). The peak may lie\n"
+            f"  beyond it - extend the sweep before concluding."
+        )
+    if peak <= lo and lo > 0.0:
+        print(
+            f"\n  NOTE: the optimum sits at the bottom of the swept range ({lo:g}). Extend the\n"
+            f"  sweep downwards before concluding."
+        )
+
+    print("=" * 92)
 
 
 # ═══════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate LDCT denoising model on test set using ldct-benchmark physical metrics.")
-    parser.add_argument("--model", type=str, default=BEST_MODEL_PATH,
-                        help="Path to the trained model weights (.pt file)")
-    parser.add_argument("--test-dir", type=str, default=TEST_DIR,
-                        help="Path to test patients directory")
-    parser.add_argument("--save-images", action="store_true",
-                        help="Save sample LDCT/NDCT/Denoised triplet images")
-    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR,
-                        help="Output folder for CSV report and images")
+    parser = argparse.ArgumentParser(description="Evaluate the LDCT denoising model with ldct-benchmark metrics.")
+    parser.add_argument("--input-mode", default=cfg.INPUT_MODE, choices=list(cfg.VALID_INPUT_MODES))
+    parser.add_argument("--mamba-mode", default=cfg.MAMBA_MODE, choices=list(cfg.VALID_MAMBA_MODES))
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to trained weights (.pt). Defaults to the run folder for the chosen modes.")
+    parser.add_argument("--test-dir", type=str, default=TEST_DIR)
+    parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--output", type=str, default=EVAL_OUTPUT_DIR)
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--blend", type=str, default="1.0",
+        help=f"Comma-separated blend factors alpha in [0, {MAX_BLEND:g}]: output = x + alpha * residual, "
+             "i.e. alpha * prediction + (1 - alpha) * LDCT input. Values above 1 over-apply the "
+             "residual. Several alphas share one forward pass. Default 1.0."
+    )
     args = parser.parse_args()
 
-    # ── Setup ──
+    input_mode = cfg.normalize_input_mode(args.input_mode)
+    mamba_mode = cfg.normalize_mamba_mode(args.mamba_mode)
+    model_path = args.model or cfg.run_paths(mamba_mode=mamba_mode, input_mode=input_mode)["best_model"]
+    blends = parse_blends(args.blend)
+    sweeping = len(blends) > 1 or blends != [1.0]
+
     setup_reproducibility()
     device = get_device()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load model ──
-    print(f"\n📂  Loading model from: {args.model}")
-    model = build_model(device)
-    state = torch.load(args.model, map_location=device)
+    print(f"\nLoading model: {model_path}")
+    print(f"input_mode={input_mode} | mamba_mode={mamba_mode} | HU range [{A_MIN}, {A_MAX}] "
+          f"(preset '{cfg.HU_RANGE_PRESET}')")
+    if sweeping:
+        print(f"Blend sweep: {', '.join(f'{a:g}' for a in blends)}")
+    model = build_model(device, mamba_mode=mamba_mode, input_mode=input_mode, data_parallel=False)
 
-    # Handle DataParallel wrapper
-    if isinstance(state, dict) and "module." in list(state.keys())[0]:
-        state = {k.replace("module.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+    try:
+        state = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(model_path, map_location=device)
+    load_state_into(model, state)      # handles "module." prefixes and wrapped dicts
     model.eval()
-    print("✅  Model loaded successfully.\n")
+    print("Model loaded successfully.\n")
 
-    # ── Discover test patients ──
     test_path = Path(args.test_dir)
     patients = sorted([
         p for p in test_path.iterdir()
-        if p.is_dir()
-        and (p / "Low_Dose").exists()
-        and (p / "Full_Dose").exists()
+        if p.is_dir() and (p / "Low_Dose").exists() and (p / "Full_Dose").exists()
     ])
 
     if not patients:
-        print(f"❌  No valid patients found in '{args.test_dir}'. "
-              "Each patient folder must contain 'Low_Dose/' and 'Full_Dose/' subdirectories.")
+        print(f"No valid patients found in '{args.test_dir}'. "
+              "Each patient folder must contain 'Low_Dose/' and 'Full_Dose/'.")
         return
 
-    chest_patients  = [p for p in patients if p.name[0].upper() == "C"]
+    chest_patients = [p for p in patients if p.name[0].upper() == "C"]
     abdomen_patients = [p for p in patients if p.name[0].upper() == "L"]
+    print(f"Found {len(patients)} patients: {len(chest_patients)} Chest, {len(abdomen_patients)} Abdomen")
+    print("Baseline metrics are computed too, so expect roughly 2x the usual runtime.\n")
 
-    print(f"🔍  Found {len(patients)} patients: "
-          f"{len(chest_patients)} Chest, {len(abdomen_patients)} Abdomen\n")
-
-    # ── Evaluate ──
     all_results = []
     for patient_dir in patients:
         pid = patient_dir.name
-        print(f"⚙️   Evaluating [{pid}] ({'Chest' if pid[0].upper() == 'C' else 'Abdomen'}) ...")
+        print(f"Evaluating [{pid}] ({'Chest' if pid[0].upper() == 'C' else 'Abdomen'}) ...")
         try:
-            result = evaluate_patient(
+            all_results.extend(evaluate_patient(
                 pid, patient_dir, model, device,
+                input_mode=input_mode,
                 save_images=args.save_images,
                 output_dir=output_dir,
-            )
-            all_results.append(result)
+                use_amp=not args.no_amp,
+                blends=blends,
+            ))
         except Exception as e:
-            print(f"  ❌ Failed: {e}")
+            print(f"  Failed: {e}")
 
     if not all_results:
-        print("❌  No results collected.")
+        print("No results collected.")
         return
 
-    # ── Report ──
-    df = pd.DataFrame(all_results)
-    df = df.sort_values(["BodyType", "PatientID"])
-
-    csv_path = output_dir / "evaluation_report.csv"
+    df = pd.DataFrame(all_results).sort_values(["Blend", "BodyType", "PatientID"])
+    suffix = "_blend" if sweeping else ""
+    csv_path = output_dir / f"evaluation_report_{cfg.run_name(mamba_mode, input_mode)}{suffix}.csv"
     df.to_csv(csv_path, index=False)
 
-    print_summary(df)
-    print(f"\n📄  Full report saved → {csv_path}")
+    if sweeping:
+        for a in blends:
+            print_summary(
+                df[df["Blend"] == a],
+                title=f"EVALUATION RESULTS  |  blend alpha = {a:g}",
+                verdict=False,
+            )
+        print_blend_curve(df, blends)
+    else:
+        print_summary(df)
+
+    print(f"\nFull report saved -> {csv_path}")
     if args.save_images:
-        print(f"🖼️   Images saved     → {output_dir}/")
+        print(f"Images saved      -> {output_dir}/")
 
 
 if __name__ == "__main__":

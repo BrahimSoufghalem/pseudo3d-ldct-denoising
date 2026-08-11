@@ -1,10 +1,16 @@
 """
-LDCT Project — Physically Accurate Benchmark Evaluation Metrics (ldct-benchmark Standard)
-========================================================================================
-All constants, diagnostic windows, and evaluation settings are imported directly from `config.py`.
-- RMSE: Measured in physical Hounsfield Units (HU) clipped to [0, 2924] (HU + 1024 offset).
-- PSNR & SSIM: Measured after applying Clinical Diagnostic Windowing (Chest: Lung Window, Abdomen: Soft Tissue Window).
-- VIF: Measured on physical HU scale.
+LDCT Project - Physically Accurate Benchmark Metrics (ldct-benchmark standard)
+=============================================================================
+All constants, diagnostic windows and evaluation settings come from `config.py`.
+
+- RMSE : physical Hounsfield Units, clipped to [0, HU_OFFSET_MAX] (HU + 1024 domain).
+- PSNR / SSIM : computed after clinical diagnostic windowing
+                (Chest = lung window, Abdomen = soft-tissue window).
+- VIF  : computed on the physical HU scale.
+
+NOTE: the clip bound is now DERIVED from config (A_MAX + HU_OFFSET) instead of a
+hardcoded 2924. With HU_RANGE_PRESET="wide" it is 4096; with "legacy" it is 1624.
+The previous docstring said [0, 2924] while the code actually clipped to 1600.
 """
 
 import numpy as np
@@ -12,20 +18,19 @@ import torch
 from skimage.metrics import mean_squared_error, structural_similarity
 from torchmetrics.functional.image import visual_information_fidelity
 
-from config import EVAL_DATA_RANGE, CLINICAL_WINDOWS, A_MIN, A_MAX
+from config import (
+    EVAL_DATA_RANGE, CLINICAL_WINDOWS, A_MIN, A_MAX,
+    HU_OFFSET, HU_OFFSET_MAX,
+)
 
 # ═══════════════════════════════════════════
-# CONSTANTS & CLINICAL WINDOW DEFINITIONS FROM CONFIG
-# ═══════════════════════════════════════════
-DATA_RANGE = EVAL_DATA_RANGE
+DATA_RANGE = EVAL_DATA_RANGE      # == HU_OFFSET_MAX
+CLIP_MAX = HU_OFFSET_MAX
 CW = CLINICAL_WINDOWS
 
 
 def apply_center_width(x: np.ndarray, center: float, width: float, out_range=(0.0, 1.0)) -> np.ndarray:
-    """
-    Apply clinical center and width windowing to a 2D numpy array (in HU + 1024 domain).
-    Clips and scales pixel values to out_range [0.0, 1.0].
-    """
+    """Apply clinical center/width windowing to an array in the HU+1024 domain."""
     center = float(center)
     width = float(width)
     lower = center - 0.5 - (width - 1.0) / 2.0
@@ -39,22 +44,18 @@ def apply_center_width(x: np.ndarray, center: float, width: float, out_range=(0.
 
 
 def denormalize_to_hu_offset(norm_tensor, a_min=A_MIN, a_max=A_MAX):
-    """
-    Convert model output normalized in [0, 1] back to HU + 1024 offset domain (float32 numpy).
-    """
+    """Map a normalized [0, 1] prediction back to the HU + 1024 domain (float32 numpy)."""
     if isinstance(norm_tensor, torch.Tensor):
         norm_tensor = norm_tensor.detach().cpu().numpy()
     hu = norm_tensor * (a_max - a_min) + a_min
-    return (hu + 1024.0).astype(np.float32)
+    return (hu + HU_OFFSET).astype(np.float32)
 
 
 # ═══════════════════════════════════════════
-# METRIC COMPUTATION FUNCTIONS (ldct-benchmark)
+# METRICS
 # ═══════════════════════════════════════════
-def compute_psnr_windowed(pred_hu_offset: np.ndarray, target_hu_offset: np.ndarray, body_type: str = "Abdomen") -> float:
-    """
-    Peak Signal-to-Noise Ratio (dB) calculated after applying clinical diagnostic windowing.
-    """
+def compute_psnr_windowed(pred_hu_offset, target_hu_offset, body_type: str = "Abdomen") -> float:
+    """PSNR (dB) after clinical diagnostic windowing."""
     center, width = CW.get(body_type, CW["Abdomen"])
     t_win = apply_center_width(target_hu_offset, center, width)
     p_win = apply_center_width(pred_hu_offset, center, width)
@@ -64,10 +65,8 @@ def compute_psnr_windowed(pred_hu_offset: np.ndarray, target_hu_offset: np.ndarr
     return float(10.0 * np.log10(1.0 / mse))
 
 
-def compute_ssim_windowed(pred_hu_offset: np.ndarray, target_hu_offset: np.ndarray, body_type: str = "Abdomen") -> float:
-    """
-    Structural Similarity Index (SSIM) calculated after applying clinical diagnostic windowing (data_range=1.0).
-    """
+def compute_ssim_windowed(pred_hu_offset, target_hu_offset, body_type: str = "Abdomen") -> float:
+    """SSIM after clinical diagnostic windowing (data_range = 1.0)."""
     center, width = CW.get(body_type, CW["Abdomen"])
     t_win = apply_center_width(target_hu_offset, center, width)
     p_win = apply_center_width(pred_hu_offset, center, width)
@@ -75,7 +74,7 @@ def compute_ssim_windowed(pred_hu_offset: np.ndarray, target_hu_offset: np.ndarr
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> torch.Tensor:
-    """Compute PSNR for PyTorch tensors in range [0, 1]."""
+    """PSNR for tensors already in [0, 1]."""
     mse = torch.mean((pred - target) ** 2)
     if mse == 0:
         return torch.tensor(float('inf'), device=pred.device)
@@ -83,40 +82,36 @@ def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> t
 
 
 def rmse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute RMSE for PyTorch tensors."""
+    """RMSE for tensors."""
     return torch.sqrt(torch.mean((pred - target) ** 2))
 
 
 def compute_rmse_hu(pred_hu_offset, target_hu_offset) -> float:
-    """
-    Root Mean Squared Error directly in physical Hounsfield Units (HU) clipped to [0, 2924].
-    """
+    """RMSE in physical HU, clipped to [0, CLIP_MAX] in the HU+1024 domain."""
     if isinstance(pred_hu_offset, torch.Tensor):
         pred_hu_offset = pred_hu_offset.detach().cpu().numpy()
     if isinstance(target_hu_offset, torch.Tensor):
         target_hu_offset = target_hu_offset.detach().cpu().numpy()
 
-    t_clip = np.clip(target_hu_offset, 0.0, DATA_RANGE)
-    p_clip = np.clip(pred_hu_offset, 0.0, DATA_RANGE)
+    t_clip = np.clip(target_hu_offset, 0.0, CLIP_MAX)
+    p_clip = np.clip(pred_hu_offset, 0.0, CLIP_MAX)
     return float(np.sqrt(mean_squared_error(t_clip, p_clip)))
 
 
 def compute_vif_hu(pred_hu_offset, target_hu_offset) -> float:
-    """
-    Visual Information Fidelity (VIF) on physical HU scale clipped to [0, 2924].
-    """
+    """Visual Information Fidelity on the physical HU scale."""
     if isinstance(pred_hu_offset, torch.Tensor):
         pred_hu_offset = pred_hu_offset.detach().cpu().numpy()
     if isinstance(target_hu_offset, torch.Tensor):
         target_hu_offset = target_hu_offset.detach().cpu().numpy()
 
-    # Convert normalized [0, 1] inputs to HU + 1024 offset if needed
+    # Accept normalized [0, 1] inputs as well
     if pred_hu_offset.max() <= 1.5 and pred_hu_offset.min() >= -0.5:
-        pred_hu_offset = (pred_hu_offset * (A_MAX - A_MIN) + A_MIN + 1024.0).astype(np.float32)
-        target_hu_offset = (target_hu_offset * (A_MAX - A_MIN) + A_MIN + 1024.0).astype(np.float32)
+        pred_hu_offset = (pred_hu_offset * (A_MAX - A_MIN) + A_MIN + HU_OFFSET).astype(np.float32)
+        target_hu_offset = (target_hu_offset * (A_MAX - A_MIN) + A_MIN + HU_OFFSET).astype(np.float32)
 
-    t_clip = np.clip(target_hu_offset, 0.0, DATA_RANGE)
-    p_clip = np.clip(pred_hu_offset, 0.0, DATA_RANGE)
+    t_clip = np.clip(target_hu_offset, 0.0, CLIP_MAX)
+    p_clip = np.clip(pred_hu_offset, 0.0, CLIP_MAX)
 
     t_tensor = torch.from_numpy(t_clip)
     p_tensor = torch.from_numpy(p_clip)
@@ -134,16 +129,14 @@ def compute_vif_hu(pred_hu_offset, target_hu_offset) -> float:
 
 
 class VIFMetric:
-    """
-    VIF metric accumulator class for evaluating slice batches.
-    """
+    """VIF accumulator for slice batches."""
+
     def __init__(self, device='cpu'):
         self.device = device
         self._scores = []
 
     def update(self, pred_hu_offset, target_hu_offset):
-        score = compute_vif_hu(pred_hu_offset, target_hu_offset)
-        self._scores.append(score)
+        self._scores.append(compute_vif_hu(pred_hu_offset, target_hu_offset))
 
     def aggregate(self):
         if not self._scores:
@@ -152,4 +145,3 @@ class VIFMetric:
 
     def reset(self):
         self._scores = []
-
