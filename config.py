@@ -21,22 +21,21 @@ LOGS_DIR = os.path.join(MODEL_DIR, "logs")
 # ═══════════════════════════════════════════
 # TRAINING HYPERPARAMETERS
 # ═══════════════════════════════════════════
-TOTAL_EPOCHS = 50
-LEARNING_RATE = 2e-4
-WEIGHT_DECAY = 1e-4
-TRAIN_BATCH_SIZE = 16
-VAL_BATCH_SIZE = 32
+TOTAL_EPOCHS = 70
+LEARNING_RATE = 5e-5
+WEIGHT_DECAY = 5e-6
+TRAIN_BATCH_SIZE = 32
+VAL_BATCH_SIZE = 64
 NUM_WORKERS = 8
-PATIENCE = 15
+PATIENCE = 10
 GRAD_CLIP_MAX_NORM = 1.0
-WARMUP_EPOCHS = 5
 
 # ═══════════════════════════════════════════
 # DATA / PREPROCESSING
 # ═══════════════════════════════════════════
 SPATIAL_SIZE = (256, 256)
-A_MIN = -1000  # HU window min
-A_MAX = 600    # HU window max
+A_MIN = -1024  # HU window min
+A_MAX = 1600   # HU window max
 B_MIN = 0.0
 B_MAX = 1.0
 CACHE_DATA = True
@@ -44,7 +43,7 @@ CACHE_DATA = True
 # ═══════════════════════════════════════════
 # EVALUATION & BENCHMARK METRICS CONFIG (ldct-benchmark standard)
 # ═══════════════════════════════════════════
-EVAL_DATA_RANGE = 1600.0  # Physical HU span: A_MAX - A_MIN = 600 - (-1000) = 1600.0
+EVAL_DATA_RANGE = 2924.0  # Maximum HU of bone (1900) + DICOM offset (1024) -> 2924
 
 # Clinical Diagnostic Windows in (HU + 1024 offset) domain
 CLINICAL_WINDOWS = {
@@ -59,21 +58,26 @@ BENCHMARK_MODELS_LIST = ["redcnn", "wganvgg", "dugan", "transct", "qae", "resnet
 # ═══════════════════════════════════════════
 IN_CHANNELS = 3       # Standard Pseudo-3D (2.5D): (prev, curr, next)
 OUT_CHANNELS = 1
-
-# Ablation Study Flag: "basic" | "residual" | "multiscale" | "full"
-MAMBA_MODE = "full"
+CHANNELS = (32, 64, 128, 256, 512)
+STRIDES = (2, 2, 2, 2)
+NUM_RES_UNITS = 2
+DROPOUT = 0.1
 
 # ═══════════════════════════════════════════
 # LOSS WEIGHTS
 # ═══════════════════════════════════════════
 LAMBDA_L1 = 1.0
-LAMBDA_SSIM = 0.6
-LAMBDA_EDGE = 0.2
+LAMBDA_SSIM = 0.5
+LAMBDA_PERC = 0.2
+LAMBDA_EDGE = 0.1
 
 # ═══════════════════════════════════════════
-# SCHEDULER (Cosine Annealing with Linear Warmup)
+# SCHEDULER
 # ═══════════════════════════════════════════
-SCHEDULER_MIN_LR = 5e-5
+SCHEDULER_MODE = "max"
+SCHEDULER_FACTOR = 0.5
+SCHEDULER_PATIENCE = 5
+SCHEDULER_MIN_LR = 1e-7
 
 # ═══════════════════════════════════════════
 # REPRODUCIBILITY
